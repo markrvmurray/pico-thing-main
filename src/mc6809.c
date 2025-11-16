@@ -27,7 +27,7 @@
 #define DEBUG
 
 //#define CFG_TUD_CDC 2
-//#include "bsp/board_api.h"
+#include "bsp/board_api.h"
 #include "tusb.h"
 
 #include "mc6809.h"
@@ -181,6 +181,7 @@ static volatile struct processor MC6809_state = {
 	.busy_lic_avma = { .byte = 0x00u },
 	.task = 0u,
 	.task_stack_ptr = 0u,
+	.vma = false,
 	.guest_e_freq = GUEST_CLK_DEFAULT
 };
 
@@ -195,73 +196,6 @@ WRITE_ADDR(const uint16_t addr)
 {
 	return (uint8_t *)(uintptr_t)&write_registers[REGISTER_INDEX(addr)];
 }
-
-#if 0
-static uint8_t
-BYTE(const uint16_t addr)
-{
-	return read_registers[REGISTER_INDEX(addr)];
-}
-
-static uint8_t
-SHADOW_BYTE(const uint16_t addr)
-{
-	return write_registers[REGISTER_INDEX(addr)];
-}
-
-static void
-BYTE_SET(const uint16_t addr, const uint8_t value)
-{
-	read_registers[REGISTER_INDEX(addr)] = value;
-}
-
-static void
-SHADOW_BYTE_SET(const uint16_t addr, const uint8_t value)
-{
-	write_registers[REGISTER_INDEX(addr)] = value;
-}
-
-union addr_cast {
-	volatile uint8_t *ui8;
-	volatile uint16_t *ui16;
-};
-
-static uint16_t
-WORD(const uint16_t addr)
-{
-	volatile union addr_cast vu;
-	vu.ui8 = read_registers + REGISTER_INDEX(addr);
-	// MC6809 is big-endian
-	return __builtin_bswap16(*vu.ui16);
-}
-
-static uint16_t
-SHADOW_WORD(const uint16_t addr)
-{
-	volatile union addr_cast vu;
-	vu.ui8 = write_registers + REGISTER_INDEX(addr);
-	// MC6809 is big-endian
-	return __builtin_bswap16(*vu.ui16);
-}
-
-static void
-WORD_SET(const uint16_t addr, const uint16_t value)
-{
-	volatile union addr_cast vu;
-	vu.ui8 = read_registers + REGISTER_INDEX(addr);
-	// MC6809 is big-endian
-	*vu.ui16 = __builtin_bswap16(value);
-}
-
-static void
-SHADOW_WORD_SET(const uint16_t addr, const uint16_t value)
-{
-	volatile union addr_cast vu;
-	vu.ui8 = write_registers + REGISTER_INDEX(addr);
-	// MC6809 is big-endian
-	*vu.ui16 = __builtin_bswap16(value);
-}
-#endif
 
 static float set_e_frequency(float target_mhz);
 
@@ -292,10 +226,11 @@ guest_setup(enum run_state rs)
 	MC6809_state.busy_lic_avma.byte = 0x00u;
 	MC6809_state.task = 0u;
 	MC6809_state.task_stack_ptr = 0u;
+	MC6809_state.vma = false;
 #ifdef DEBUG
 	MC6809_state.count_lic = 0u;
 #endif
-	task_initialise(&MC6809_state);
+	task_initialise(&MC6809_state, read_registers);
 }
 
 static void
@@ -366,7 +301,7 @@ start_guest_with_timeout(const uint timeout_ms)
 	if (verbose) {
 		printf("MC6809 run took %u iterations\n", i);
 #ifdef DEBUG
-		printf("%u LICs were counted\n", MC6809_state.count_lic - lic_start);
+		printf("%lu LICs were counted\n", MC6809_state.count_lic - lic_start);
 #endif
 		if (i == 1000u*timeout_ms)
 			printf("Stopped due to timeout\n");
@@ -412,6 +347,8 @@ dump_registers(void)
 
 #ifdef DEBUG
 #define TRACE_SIZE 1024u
+#define TRACE_READ 0x00000000u
+#define TRACE_WRITE 0x10000000u
 static const unsigned trace_size = TRACE_SIZE;
 static volatile unsigned trace_pos = 0u;
 static volatile uint32_t trace[TRACE_SIZE][4u];
@@ -457,6 +394,7 @@ __time_critical_func(gpio_clock_eq_irq_handler)(void)
 		union ba_bs_u new_bus_state;
 		new_bus_state.byte = ((bus_pins >> GPIO_BS) & 0b00000011u);
 		new_bus_state.bit.RESET = RESET_IS_ASSERTED;
+		MC6809_state.vma = (bool)MC6809_state.busy_lic_avma.bit.AVMA; // Previous cycle's AVMA!
 		if (MC6809_state.bus_state.state != new_bus_state.state) {
 			MC6809_state.old_bus_state.state = MC6809_state.bus_state.state;
 			MC6809_state.bus_state.state = new_bus_state.state;
@@ -470,6 +408,7 @@ __time_critical_func(gpio_clock_eq_irq_handler)(void)
 //	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 	} else {
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
+		// These 3 signals are all predictive; they indicate the status of the _next_ memory access
 		MC6809_state.busy_lic_avma.byte = (uint8_t)((gpio_get_all() >> GPIO_BUSY) & 0b00000111);
 	}
 	gpio_put(GPIO_TRACE_C, false); // OINQUE DEBUG to time this function on the scope
@@ -488,24 +427,24 @@ static void __isr
 __time_critical_func(dma_bus_read_irq_handler(void))
 {
 	gpio_put(GPIO_TRACE_D, true); // OINQUE DEBUG to time this function on the scope
-//	if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
+	// if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 		dma_channel_acknowledge_irq0(piodma_read.data_channel);
-		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
-		read_location = read_addr & 0x0000003Fu;
-		read_irq_received = true;
+		if (!MC6809_state.bus_state.bit.RESET && MC6809_state.vma) {
+			const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
+			read_location = read_addr & 0x0000003Fu;
+			read_irq_received = true;
 #ifdef DEBUG
-	MC6809_state.count_lic += MC6809_state.busy_lic_avma.bit.LIC;
-	if (!MC6809_state.bus_state.bit.RESET && !MC6809_state.bus_state.bit.BA && trace_pos < trace_size - 1) {
-			if ((read_location != 0x3Fu) || MC6809_state.bus_state.bit.BS) {
+			MC6809_state.count_lic += MC6809_state.busy_lic_avma.bit.LIC;
+			if (trace_pos < trace_size - 1) {
 				trace[trace_pos][0] = read_location;
 				trace[trace_pos][1] = *(uint8_t *)read_addr;
-				trace[trace_pos][2] = 0x00000000u | (MC6809_state.busy_lic_avma.byte << 8) | (MC6809_state.bus_state.byte << 4) | MC6809_state.run_state;
+				trace[trace_pos][2] = TRACE_READ | (MC6809_state.busy_lic_avma.byte << 8) | (MC6809_state.bus_state.byte << 4) | MC6809_state.run_state;
 				trace[trace_pos][3] = 0u;
 				trace_pos++;
 			}
 		}
 #endif
-//	}
+	//}
 	gpio_put(GPIO_TRACE_D, false); // OINQUE DEBUG to time this function on the scope
 }
 
@@ -522,22 +461,24 @@ static void __isr
 __time_critical_func(dma_bus_write_irq_handler(void))
 {
 	gpio_put(GPIO_TRACE_E, true); // OINQUE DEBUG to time this function on the scope
-//	if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
+	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 		dma_channel_acknowledge_irq1(piodma_write.data_channel);
-		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
-		write_location = written_addr & 0x0000003Fu;
-		write_irq_received = true;
+		if (!MC6809_state.bus_state.bit.RESET && MC6809_state.vma) {
+			const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
+			write_location = written_addr & 0x0000003Fu;
+			write_irq_received = true;
 #ifdef DEBUG
-	MC6809_state.count_lic += MC6809_state.busy_lic_avma.bit.LIC;
-	if (!MC6809_state.bus_state.bit.RESET && trace_pos < trace_size - 1) {
-			trace[trace_pos][0] = write_location;
-			trace[trace_pos][1] = *(uint8_t *)written_addr;
-			trace[trace_pos][2] = 0x10000000u | (MC6809_state.busy_lic_avma.byte << 8) | (MC6809_state.bus_state.byte << 4) | MC6809_state.run_state;
-			trace[trace_pos][3] = 0u;
-			trace_pos++;
-		}
+			MC6809_state.count_lic += MC6809_state.busy_lic_avma.bit.LIC;
+			if (trace_pos < trace_size - 1) {
+				trace[trace_pos][0] = write_location;
+				trace[trace_pos][1] = *(uint8_t *)written_addr;
+				trace[trace_pos][2] = TRACE_WRITE | (MC6809_state.busy_lic_avma.byte << 8) | (MC6809_state.bus_state.byte << 4) | MC6809_state.run_state;
+				trace[trace_pos][3] = 0u;
+				trace_pos++;
+			}
 #endif
-//	}
+		}
+	// }
 	gpio_put(GPIO_TRACE_E, false); // OINQUE DEBUG to time this function on the scope
 }
 
@@ -706,6 +647,124 @@ sysreq_process(void)
 	}
 }
 
+// echo to either Serial0 or Serial1
+// with Serial0 as all lower case, Serial1 as all upper case
+static void
+echo_serial_port(uint8_t itf, uint8_t buf[], uint32_t count)
+{
+	uint8_t const case_diff = 'a' - 'A';
+
+	for (uint32_t i = 0; i < count; i++) {
+		if (itf == 0) {
+			// echo back 1st port as lower case
+			if (isupper(buf[i]))
+				buf[i] += case_diff;
+		} else {
+			// echo back 2nd port as upper case
+			if (islower(buf[i]))
+				buf[i] -= case_diff;
+		}
+		tud_cdc_n_write_char(itf, buf[i]);
+	}
+	tud_cdc_n_write_flush(itf);
+}
+
+//--------------------------------------------------------------------+
+// USB CDC
+//--------------------------------------------------------------------+
+static void
+cdc_task(void)
+{
+	static uint8_t buf[64];
+	for (uint itf = 0; itf < CFG_TUD_CDC; itf++) {
+		if (tud_cdc_n_connected(itf) && tud_cdc_n_available(itf)) {
+			uint32_t count = tud_cdc_n_read(itf, buf, sizeof(buf));
+			for (uint i = 0; i < count; i++)
+				if (isprint(buf[i]))
+					buf[i] = toupper(buf[i]);
+			tud_cdc_n_write(itf, buf, count);
+			tud_cdc_n_write_flush(itf);
+		}
+	}
+#if 0
+	uint8_t itf;
+
+	for (itf = 0; itf < CFG_TUD_CDC; itf++) {
+		// connected() check for DTR bit
+		// Most but not all terminal client set this when making connection
+		if ( tud_cdc_n_connected(itf) ) {
+			if (tud_cdc_n_available(itf)) {
+				uint8_t buf[64];
+
+				uint32_t count = tud_cdc_n_read(itf, buf, sizeof(buf));
+
+				// echo back to both serial ports
+				echo_serial_port(0, buf, count);
+				echo_serial_port(1, buf, count);
+			}
+		}
+	}
+#endif
+}
+
+// call this from main loop (core0) periodically
+void
+debug_cdc_status(void) {
+	// print connection and availability state
+	//printf("CDC0 conn=%d avail=%d  CDC1 conn=%d avail=%d\n",
+	//    tud_cdc_n_connected(0), tud_cdc_n_write_available(0),
+	//    tud_cdc_n_connected(1), tud_cdc_n_write_available(1));
+
+	if (tud_cdc_n_connected(0) && tud_cdc_n_available(0)) {
+		uint8_t buf[64];
+		uint32_t count = tud_cdc_n_read(0, buf, sizeof(buf));
+		tud_cdc_n_write(0, buf, count);
+		tud_cdc_n_write_flush(0);
+	}
+	if (tud_cdc_n_connected(1) && tud_cdc_n_available(1)) {
+		uint8_t buf[64];
+		uint32_t count = tud_cdc_n_read(1, buf, sizeof(buf));
+		tud_cdc_n_write(1, buf, count);
+		tud_cdc_n_write_flush(1);
+	}
+#if 0
+	// Attempt a test write to each port in a careful way
+	if (tud_cdc_n_connected(0) && tud_cdc_n_write_available(0) > 0) {
+		const char *m0 = "X";
+		int w0 = tud_cdc_n_write(0, (const uint8_t*)m0, 1);
+		tud_cdc_n_write_flush(0);
+		// printf("W0=%d\n", w0);
+	}
+	if (tud_cdc_n_connected(1) && tud_cdc_n_write_available(1) > 0) {
+		const char *m1 = "Y";
+		int w1 = tud_cdc_n_write(1, (const uint8_t*)m1, 1);
+		tud_cdc_n_write_flush(1);
+		// printf("W1=%d\n", w1);
+	}
+#endif
+}
+
+// Invoked when cdc when line state changed e.g connected/disconnected
+// Use to reset to DFU when disconnect with 1200 bps
+void
+tud_cdc_line_state_cb(uint8_t instance, bool dtr, bool rts)
+{
+	(void)rts;
+
+	// DTR = false is counted as disconnected
+	if (!dtr) {
+		// touch 1200 only with first CDC instance (Serial)
+		if (instance == 0) {
+			cdc_line_coding_t coding;
+			tud_cdc_get_line_coding(&coding);
+			if (coding.bit_rate == 1200) {
+				if (board_reset_to_bootloader)
+					board_reset_to_bootloader();
+			}
+		}
+	}
+}
+
 static struct emulated_uart *console;
 
 static bool
@@ -743,7 +802,8 @@ guest_try_loop(void)
 		// Keep cranking the USB handle
 		// Run TinyUSB service task every 1 ms (non-blocking)
 		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			tud_task();  // handles USB events
+			tud_task();
+			cdc_task();
 			next_usb = make_timeout_time_ms(1u);
 		}
 		uart_task(console, &write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
@@ -866,7 +926,8 @@ process_command(char *buf)
 			// Keep cranking the USB handle
 			// Run TinyUSB service task every 1 ms (non-blocking)
 			if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-				tud_task();  // handles USB events
+				tud_task();
+				cdc_task();
 				next_usb = make_timeout_time_ms(1u);
 			}
 			sysreq_process();
@@ -911,19 +972,20 @@ process_command(char *buf)
 			printf("Usage:\n\n> stat\n\n");
 			return;
 		}
-		printf("          Run state: %u = %s\n", MC6809_state.run_state, run_state_string[MC6809_state.run_state]);
-		printf("         Bus State = %u = %s\t(previous is %u = %s)\n",
+		printf("Run state: %u = %s\n", MC6809_state.run_state, run_state_string[MC6809_state.run_state]);
+		printf("Bus State: %u = %s\t(previous is %u = %s)\n",
 			MC6809_state.bus_state.state, ba_bs_string[MC6809_state.bus_state.state],
 			MC6809_state.old_bus_state.state, ba_bs_string[MC6809_state.old_bus_state.state]);
-		printf("POWER pin: %s\n", POWER_IS_ASSERTED ? "HIGH" : "LOW");
-		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "HIGH" : "LOW");
-		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "HIGH" : "LOW");
+		printf("Task: %u\n", MC6809_state.task);
 		printf("Interrupt task history:");
 		for (uint i = 0; i < MC6809_state.task_stack_ptr; i++)
 			printf(" %u", task_stack[i]);
 		printf("\n");
+		printf("POWER pin: %s\n", POWER_IS_ASSERTED ? "HIGH" : "LOW");
+		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "HIGH" : "LOW");
+		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "HIGH" : "LOW");
 #ifdef DEBUG
-		printf("LIC count: %u\n", MC6809_state.count_lic);
+		printf("LIC count: %lu\n", MC6809_state.count_lic);
 		if (MC6809_state.count_lic == 0u && (MC6809_state.run_state == RS_STARTED || MC6809_state.run_state == RS_HEADLESS_STARTED))
 			printf("WARNING: LIC count is zero, but the run state is %s\n", run_state_string[MC6809_state.run_state]);
 #endif
@@ -933,11 +995,11 @@ process_command(char *buf)
 		printf("UART: TxQueue: %u\n", uart_recv_level(console));
 		printf("UART: RxQueue: %u\n", uart_send_level(console));
 #ifdef DEBUG
-		printf("UART: Control: %5u  Tx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
-		printf("UART: Status:  %5u  Rx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
+		printf("UART: Control: %5u\tTx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
+		printf("UART: Status:  %5u\tRx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
 #endif
 	} else if (strcasecmp(tokenlist[0], "snippet") == 0) {
-		if (tokencount > 17u) {
+		if (tokencount > 17u || tokencount < 2u) {
 			printf("Usage:\n\n> snippet <byte> [ <byte> ... ]\n\n");
 			return;
 		}
@@ -955,6 +1017,7 @@ process_command(char *buf)
 			printf(" %02X", read_registers[REGISTER_SNIPPET_OFFSET + i]);
 		}
 		printf("\n");
+		read_registers16[REGISTER_VECTOR_RESET_OFFSET/2] = reverse_bytes(REGISTER_SNIPPET);
 	} else if (strcasecmp(tokenlist[0], "vec") == 0) {
 		uint16_t temp[8];
 		if (tokencount != 9u) {
@@ -1094,7 +1157,7 @@ process_command(char *buf)
 			}
 		} else if (tokencount == 3u) {
 			if (strcasecmp(tokenlist[1], "h") != 0) {
-				printf("Usage:\n\n> g [ h ] [ <start> ]\n\n");
+				printf("Usage:\n\n> go [ h ] [ <start> ]\n\n");
 				return;
 			}
 			headless = true;
@@ -1110,6 +1173,22 @@ process_command(char *buf)
 			start_guest_headless();
 		else
 			start_guest();
+	} else if (strcasecmp(tokenlist[0], "task") == 0) {
+		uint8_t task = MC6809_state.task;
+		if (tokencount > 2u) {
+			printf("Usage:\n\n> task [ <tasknum> ]\n\n");
+			return;
+		}
+		if (tokencount == 2u) {
+			const uint hexnum = hex(tokenlist[1], 0);
+			if (hexnum > 15u) {
+				printf("Invalid hex task number '%s'\n", tokenlist[1]);
+				return;
+			}
+			task = hexnum;
+			task = task_change(&MC6809_state, task);
+		}
+		printf("Task = %u\n", task);
 	} else if (strcasecmp(tokenlist[0], "irq") == 0) {
 		if (tokencount != 2u) {
 			printf("Usage:\n\n> irq 1|2|3|4|5\n\n");
@@ -1203,15 +1282,15 @@ process_command(char *buf)
 		if (len > 0)
 			for (uint i = 0; i < len; i++) {
 				union BLA bla = { .byte = trace[i][2] >> 8 };
-				printf("%04X %s %02X %s %s %s %1u %1u %04X\n",
+				printf("%04X %s %02X %s %s %s %12s %12s %04X\n",
 					trace[i][0] + 0xFFC0u,
-					(trace[i][2] & 0x10000000) ? "W" : " ",
+					(trace[i][2] & TRACE_WRITE) ? "W" : " ",
 					trace[i][1],
 					bla.bit.AVMA ? "AVMA" : "    ",
 					bla.bit.LIC ? "LIC " : "    ",
 					bla.bit.BUSY ? "BUSY" : "    ",
-					((trace[i][2] >> 4) & 0x0F),
-					trace[i][2] & 0x0F,
+					ba_bs_string[(trace[i][2] >> 4) & 0x0F],
+					run_state_string[trace[i][2] & 0x0F],
 					trace[i][3]);
 			}
 #endif
@@ -1348,18 +1427,6 @@ poll_console_and_bus(void)
 	absolute_time_t next_usb = get_absolute_time();
 
 	for (;;) {
-#ifdef NOT_YET_USB
-		if ( tud_vendor_available() ) {
-			uint8_t buf[64];
-			uint32_t count = tud_vendor_read(buf, sizeof(buf));
-			process_vendor_command(buf, count);
-		}
-
-		if ( have_data_to_send ) {
-			tud_vendor_write(data, len);
-			tud_vendor_flush();   // optional but ensures TX starts quickly
-		}
-#endif
 		// The MC6809 might be running, so don't do the command processing,
 		// instead hand over the console to the MC6809 observer.
 		if (guest_try_loop()) {
@@ -1373,31 +1440,33 @@ poll_console_and_bus(void)
 			prompted = true;
 		}
 		const int ch = getchar_timeout_us(0);
-		if (ch == PICO_ERROR_TIMEOUT)
-			continue;
-		if (ch == '\r' || ch == '\n') {
-			putchar('\n');
-			buf[idx] = '\0';
-			process_command(buf);
-			idx = 0;
-			prompted = false;
-		} else if (ch == '\b') {
-			if (idx > 0) {
-				putchar('\b');
-				putchar(' ');
-				putchar('\b');
-				buf[idx--] = '\0';
-			}
-		} else if (idx < COMMAND_BUFFER_LEN - 1) {
-			if (ch >= ' ' && ch < 0x7F) {
-				putchar(ch);
-				buf[idx++] = (char)ch;
+		if (ch != PICO_ERROR_TIMEOUT) {
+			if (ch == '\r' || ch == '\n') {
+				putchar('\n');
+				buf[idx] = '\0';
+				process_command(buf);
+				idx = 0;
+				prompted = false;
+			} else if (ch == '\b') {
+				if (idx > 0) {
+					putchar('\b');
+					putchar(' ');
+					putchar('\b');
+					buf[idx--] = '\0';
+				}
+			} else if (idx < COMMAND_BUFFER_LEN - 1) {
+				if (ch >= ' ' && ch < 0x7F) {
+					putchar(ch);
+					buf[idx++] = (char)ch;
+				}
 			}
 		}
-		// Keep cranking the task handle
+
+		// Keep cranking the USB handle
 		// Run TinyUSB service task every 1 ms (non-blocking)
 		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			tud_task();  // handles USB events
+			tud_task();
+			cdc_task();
 			next_usb = make_timeout_time_ms(1u);
 		}
 		uart_task(console, &write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
@@ -1405,7 +1474,7 @@ poll_console_and_bus(void)
 	}
 }
 
-static void
+void
 init_pins_range(const uint base, const uint count)
 {
 	for (uint i = 0; i < count; ++i)
@@ -1416,13 +1485,19 @@ static uint16_t tick_timer[2] = {0u, 0u};
 static bool tick_enabled[2] = {false, false};
 static bool tick_irq[2] = {false, false};
 
-#if 0
-static inline uint16_t
-reverse_bytes(const uint16_t word)
+void
+tick_initialise(void)
 {
-	return __builtin_bswap16(word); // This had better be a single instruction in reality!
+	read_registers[SYSTEM_TIMER_STATUS] = 0u;
+	tick_timer[0] = 0u;
+	read_registers16[SYSTEM_TIMER_COUNTERS/2 + 0] = reverse_bytes(tick_timer[0]);
+	tick_timer[1] = 0u;
+	read_registers16[SYSTEM_TIMER_COUNTERS/2 + 1] = reverse_bytes(tick_timer[1]);
+	tick_enabled[0] = false;
+	tick_enabled[1] = false;
+	tick_irq[0] = false;
+	tick_irq[1] = false;
 }
-#endif
 
 void
 tick_task(void)
@@ -1456,10 +1531,12 @@ __no_inline_not_in_flash_func(main_core1)(void)
 
 	init_pins_range(GPIO_TRACE_G, 5);	// OINQUE DEBUG trace pins - isr set
 	gpio_set_dir_out_masked64(0b11111LLu << GPIO_TRACE_G);
-	init_pins_range(GPIO_TASK_BASE, 5);
-	gpio_set_dir_out_masked64(0b11111LLu << GPIO_TASK_BASE); // 4 pins for the DAT task register, and one for the address decoder
+
+	guest_init();
+	printf("Pico2 MC6809E guest initialised\n");
 
 	console = uart_initialise(&read_registers[CONSOLE_STATUS]);
+	printf("Pico2 MC6809E console initialised\n");
 
 	pio_sm_set_enabled(pio_clock.pio, pio_clock.sm, true);
 	printf("Pico2 MC6809E E/Q clocks started\n");
@@ -1494,6 +1571,7 @@ __no_inline_not_in_flash_func(main_core1)(void)
 	       PIO_NUM(piodma_read.pio), piodma_read.sm, PIO_NUM(piodma_write.pio), piodma_write.sm);
 
 	sysreq_initialise();
+	tick_initialise();
 	absolute_time_t next_tick = get_absolute_time();
 
 	printf("Pico2 MC6809E core1 process started\n");
@@ -1551,6 +1629,7 @@ __no_inline_not_in_flash_func(main_core1)(void)
 					break;
 
 				case SYSTEM_TASK: // Task register for DAT/MMU
+					// TODO: MarkM - Don't allow tasks other than zero to do this!
 					read_registers[SYSTEM_TASK] = task_change(&MC6809_state, written_byte);
 					break;
 
@@ -1893,10 +1972,11 @@ bus_pio_dma_init(void)
 	printf("Pico2 MC6809E DMA write_address channel configured\n");
 }
 
+#if 0
 static void
 handle_private_packet(const uint8_t *data, uint32_t len)
 {
-	// Example: echo uppercased
+	// Example: echo upper-cased
 	uint8_t reply[64];
 	for (uint32_t i = 0; i < len; i++)
 		reply[i] = (data[i] >= 'a' && data[i] <= 'z') ? data[i] - 32 : data[i];
@@ -1911,12 +1991,14 @@ tud_cdc_rx_cb(uint8_t itf)
 	uint8_t buf[64];
 	uint32_t count = tud_cdc_n_read(itf, buf, sizeof(buf));
 
-	if (itf == 1) {
+	if (itf == 0) {
 		handle_private_packet(buf, count);
-	} else if (itf == 0) {
+	} else if (itf == 1) {
+		handle_private_packet(buf, count);
 		// Optional: handle CDC0 input
 	}
 }
+#endif
 
 #if 0
 static void
@@ -1944,7 +2026,6 @@ measure_freqs(void) {
 #endif
 	// Can't measure clk_ref / xosc as it is the ref
 }
-#endif
 
 static void
 clock_code_blue(void)
@@ -1953,26 +2034,21 @@ clock_code_blue(void)
 	clocks_init();
 	//measure_freqs();
 }
+#endif
 
 int
 main(void)
 {
-	board_init();
-
 	vreg_set_voltage(VREG_VOLTAGE_1_50);
-	sleep_ms(1);
+	sleep_ms(5);
 
 	stdio_init_all();
-	sleep_ms(5);
 
 	printf("\n\nPico2 MC6809E bus supervisor %s\n", DEVICE_VERSION);
 	printf("Pico2 MC6809E built on %s %s\n", __DATE__, __TIME__);
 #ifdef DEBUG
 	printf("Pico2 MC6809E build with DEBUG defined\n");
 #endif
-
-	clocks_enable_resus(clock_code_blue);
-	// measure_freqs();
 
 	printf("Pico2 MC6809E raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
 	if (set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
@@ -1987,6 +2063,30 @@ main(void)
 		printf("successful!\n");
 	}
 	printf("Pico2 MC6809E console baudrate set to %d\n", CONSOLE_BAUDRATE);
+
+	sleep_ms(100); // give macOS time to notice “device disappeared”
+	reset_block(RESETS_RESET_USBCTRL_BITS);
+	unreset_block(RESETS_RESET_USBCTRL_BITS);
+	board_init();
+	sleep_ms(200); // give macOS time to notice “device disappeared”
+	// Init USB device stack on configured roothub port
+	tusb_rhport_init_t dev_init = {
+		.role = TUSB_ROLE_DEVICE,
+		.speed = TUSB_SPEED_AUTO
+	};
+	tusb_init(BOARD_TUD_RHPORT, &dev_init);
+
+	if (board_init_after_tusb)
+		board_init_after_tusb();
+
+	sleep_ms(100);
+	tud_disconnect();   // force clean re-enumeration
+	sleep_ms(100);
+	tud_connect();
+	printf("Pico2 MC6809E initialised USB\n");
+
+	// clocks_enable_resus(clock_code_blue);
+	// measure_freqs();
 
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
@@ -2020,23 +2120,25 @@ main(void)
 	peripheral_clear(true);
 	printf("Pico2 MC6809E emulated RAM and read_registers initialised\n");
 
-	guest_init();
-	printf("Pico2 MC6809E guest initialised\n");
-
 	multicore_launch_core1(main_core1);
 	sleep_ms(100);
 
 	printf("Pico2 MC6809E ready!\n");
-
-	// Initialize TinyUSB
-	sleep_ms(100);
-	tusb_init();
 
 	struct tm tm = build_time_tm();
 	aon_timer_stop();
 	aon_timer_start_calendar(&tm);
 
 	print_time();
+
+#if 0
+	while (1) { // OINQUE!!!
+		tud_task(); // TinyUSB device task
+		cdc_task();
+		sleep_ms(1);
+		// debug_cdc_status();
+	}
+#endif
 
 	poll_console_and_bus();
 }

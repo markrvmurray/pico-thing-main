@@ -41,6 +41,22 @@ l@0	LDA	,X+
 	BNE	l@0
 	SYNC
 
+DATInit	ORG	START
+	LDX	#DATRAM
+	CLRA
+D@0	STA	,X+
+	INCA
+	BNE	D@0
+	SYNC
+
+DATRead	ORG	START
+D@0	LDX	#DATRAM
+	CLRA
+D@1	LDB	,X+
+	INCA
+	BNE	D@1
+	BRA	D@0
+
 * Instant stop. Proves that bus BS_SYNC is detected and acted upon.
 	ORG	START
 Sync	SYNC
@@ -78,16 +94,14 @@ Reads	LDA	>SHARED
 
 * Looks good on the oscilloscope if the Pico2's PIO SM and DMA ISR are instrumented.
 	ORG	START
-Writes	LDX	#SHARED
-	CLRA
-	CLRB
-w@1	ANDA	#%00001111
-	STB	A,X
+Writes	CLRA
+w@0	LDB	#16
+	LDX	#SHARED
+w@1	STA	,X+
 	INCA
-	INCB
-	BRA	w@1
-	SYNC
-	SYNC
+	DECB
+	BNE	w@1
+	BRA	w@0
 	SYNC
 
 	ORG	START
@@ -269,6 +283,10 @@ Cont	NOP
 	FCC	"COPY_IN"
 	FCB	' '
 	FCC	"COPY_OUT"
+	FCB	' '
+	FCC	"DAT_INIT"
+	FCB	' '
+	FCC	"DAT_READ"
 	FCB	' '
 	FCC	"SYNC"
 	FCB	' '

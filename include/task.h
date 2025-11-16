@@ -9,7 +9,7 @@
 
 struct processor;
 
-void task_initialise(volatile struct processor *guest);
+void task_initialise(volatile struct processor *guest, volatile uint8_t read_registers[]);
 uint8_t task_change(volatile struct processor *guest, uint8_t new_task);
 
 #endif // PICO_EXAMPLES_PIO_MC6809_TASK_H

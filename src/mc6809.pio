@@ -55,7 +55,7 @@ mc6809_clock_program_init(PIO pio, uint sm, uint offset)
 ; to D7-0 after Q trailing edge. The output is cleared at E trailing edge
 ; (plus a bit).
 ;
-; IN  pins:    (7) R/!W + A5-0
+; IN  pins:    (7) A5-0, R/!W
 ; OUT pins:    (8) D7-0
 ; JMP pin:     !CS
 .program	mc6809_bus_read
@@ -113,7 +113,7 @@ mc6809_bus_read_program_init(PIO pio, uint sm, uint offset)
 ; DMA chain as soon as Q goes high. As soon as E goes high, we grab D7-0
 ; and send this back to the DMA chain for storage at the given address.
 ;
-; IN pins: (7) R/!W + A5-0
+; IN pins: (7) A5-0, R/!W
 ; IN pins: (8) D7-0
 ; JMP pin: !CS
 .program	mc6809_bus_write

@@ -51,7 +51,7 @@ enum {
 
 	// Slow - guest instruction-level timing
 	GPIO_TASK_BASE = 31,
-	GPIO_TASK_0 = 35,
+	GPIO_TASK_0 = 36,
 
 	// Slow - set at a leisurely pace at human-user speeds
 	GPIO_POWER = 40,	// [Y] [o]  External power enable
@@ -137,11 +137,14 @@ struct processor {
 	union BLA busy_lic_avma;
 	uint8_t task;
 	uint task_stack_ptr;
+	bool vma;
 #ifdef DEBUG
 	uint32_t count_lic;
 #endif
 	float guest_e_freq;
 };
+
+void init_pins_range(const uint base, const uint count);
 
 // === Device addresses ===
 #define REGISTER_BASE 0xFFC0u
@@ -182,7 +185,8 @@ struct processor {
 #define SYSTEM_TIMER_STATUS	0x03u
 #define SYSTEM_TIMER_COUNTERS	0x04u // 4/5 and 6/7 are used
 // Task register bits
-#define	TASK_PINS_MASK		0b1111u
+#define NUM_TASK_PINS		5
+#define	TASK_PINS_MASK		0b00011111u
 // System request opcodes
 #define	REQUEST_NULL		0x00u
 #define REQUEST_TIME		'T'
