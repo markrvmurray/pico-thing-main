@@ -29,6 +29,9 @@
 //#define CFG_TUD_CDC 2
 #include "bsp/board_api.h"
 #include "tusb.h"
+#include "optional_usb.h"
+#include "vendor_if.h"
+
 
 #include "mc6809.h"
 #include "srec.h"
@@ -185,6 +188,15 @@ static volatile struct processor MC6809_state = {
 	.guest_e_freq = GUEST_CLK_DEFAULT
 };
 
+#ifdef DEBUG
+#define TRACE_SIZE 1024u
+#define TRACE_READ 0x00000000u
+#define TRACE_WRITE 0x10000000u
+static const unsigned trace_size = TRACE_SIZE;
+static volatile unsigned trace_pos = 0u;
+static volatile uint32_t trace[TRACE_SIZE][4u];
+#endif
+
 static uint8_t *
 READ_ADDR(const uint16_t addr)
 {
@@ -229,6 +241,7 @@ guest_setup(enum run_state rs)
 	MC6809_state.vma = false;
 #ifdef DEBUG
 	MC6809_state.count_lic = 0u;
+	trace_pos = 0u;
 #endif
 	task_initialise(&MC6809_state, read_registers);
 }
@@ -328,7 +341,7 @@ dump_registers(void)
 		printf("%04X:", REGISTER_BASE + i*16u);
 		for (uint j = 0u; j < 16u; j++) {
 			printf(" %02X", printables[j]);
-			printables[j] = isprint((uint)printables[j]) ? printables[j] : '.';
+			printables[j] = isprint((uint)(printables[j] & 0b01111111)) ? (printables[j] & 0b01111111) : '.';
 		}
 		printf(" |%.16s|\n", printables);
 	}
@@ -338,21 +351,12 @@ dump_registers(void)
 		printf("%04X:", REGISTER_BASE + i*16u);
 		for (uint j = 0u; j < 16u; j++) {
 			printf(" %02X", printables[j]);
-			printables[j] = isprint((uint)printables[j]) ? printables[j] : '.';
+			printables[j] = isprint((uint)(printables[j] & 0b01111111)) ? (printables[j] & 0b01111111) : '.';
 		}
 		printf(" |%.16s|\n", printables);
 	}
 	printf("--\n");
 }
-
-#ifdef DEBUG
-#define TRACE_SIZE 1024u
-#define TRACE_READ 0x00000000u
-#define TRACE_WRITE 0x10000000u
-static const unsigned trace_size = TRACE_SIZE;
-static volatile unsigned trace_pos = 0u;
-static volatile uint32_t trace[TRACE_SIZE][4u];
-#endif
 
 static void
 halt_guest(void)
@@ -647,124 +651,6 @@ sysreq_process(void)
 	}
 }
 
-// echo to either Serial0 or Serial1
-// with Serial0 as all lower case, Serial1 as all upper case
-static void
-echo_serial_port(uint8_t itf, uint8_t buf[], uint32_t count)
-{
-	uint8_t const case_diff = 'a' - 'A';
-
-	for (uint32_t i = 0; i < count; i++) {
-		if (itf == 0) {
-			// echo back 1st port as lower case
-			if (isupper(buf[i]))
-				buf[i] += case_diff;
-		} else {
-			// echo back 2nd port as upper case
-			if (islower(buf[i]))
-				buf[i] -= case_diff;
-		}
-		tud_cdc_n_write_char(itf, buf[i]);
-	}
-	tud_cdc_n_write_flush(itf);
-}
-
-//--------------------------------------------------------------------+
-// USB CDC
-//--------------------------------------------------------------------+
-static void
-cdc_task(void)
-{
-	static uint8_t buf[64];
-	for (uint itf = 0; itf < CFG_TUD_CDC; itf++) {
-		if (tud_cdc_n_connected(itf) && tud_cdc_n_available(itf)) {
-			uint32_t count = tud_cdc_n_read(itf, buf, sizeof(buf));
-			for (uint i = 0; i < count; i++)
-				if (isprint(buf[i]))
-					buf[i] = toupper(buf[i]);
-			tud_cdc_n_write(itf, buf, count);
-			tud_cdc_n_write_flush(itf);
-		}
-	}
-#if 0
-	uint8_t itf;
-
-	for (itf = 0; itf < CFG_TUD_CDC; itf++) {
-		// connected() check for DTR bit
-		// Most but not all terminal client set this when making connection
-		if ( tud_cdc_n_connected(itf) ) {
-			if (tud_cdc_n_available(itf)) {
-				uint8_t buf[64];
-
-				uint32_t count = tud_cdc_n_read(itf, buf, sizeof(buf));
-
-				// echo back to both serial ports
-				echo_serial_port(0, buf, count);
-				echo_serial_port(1, buf, count);
-			}
-		}
-	}
-#endif
-}
-
-// call this from main loop (core0) periodically
-void
-debug_cdc_status(void) {
-	// print connection and availability state
-	//printf("CDC0 conn=%d avail=%d  CDC1 conn=%d avail=%d\n",
-	//    tud_cdc_n_connected(0), tud_cdc_n_write_available(0),
-	//    tud_cdc_n_connected(1), tud_cdc_n_write_available(1));
-
-	if (tud_cdc_n_connected(0) && tud_cdc_n_available(0)) {
-		uint8_t buf[64];
-		uint32_t count = tud_cdc_n_read(0, buf, sizeof(buf));
-		tud_cdc_n_write(0, buf, count);
-		tud_cdc_n_write_flush(0);
-	}
-	if (tud_cdc_n_connected(1) && tud_cdc_n_available(1)) {
-		uint8_t buf[64];
-		uint32_t count = tud_cdc_n_read(1, buf, sizeof(buf));
-		tud_cdc_n_write(1, buf, count);
-		tud_cdc_n_write_flush(1);
-	}
-#if 0
-	// Attempt a test write to each port in a careful way
-	if (tud_cdc_n_connected(0) && tud_cdc_n_write_available(0) > 0) {
-		const char *m0 = "X";
-		int w0 = tud_cdc_n_write(0, (const uint8_t*)m0, 1);
-		tud_cdc_n_write_flush(0);
-		// printf("W0=%d\n", w0);
-	}
-	if (tud_cdc_n_connected(1) && tud_cdc_n_write_available(1) > 0) {
-		const char *m1 = "Y";
-		int w1 = tud_cdc_n_write(1, (const uint8_t*)m1, 1);
-		tud_cdc_n_write_flush(1);
-		// printf("W1=%d\n", w1);
-	}
-#endif
-}
-
-// Invoked when cdc when line state changed e.g connected/disconnected
-// Use to reset to DFU when disconnect with 1200 bps
-void
-tud_cdc_line_state_cb(uint8_t instance, bool dtr, bool rts)
-{
-	(void)rts;
-
-	// DTR = false is counted as disconnected
-	if (!dtr) {
-		// touch 1200 only with first CDC instance (Serial)
-		if (instance == 0) {
-			cdc_line_coding_t coding;
-			tud_cdc_get_line_coding(&coding);
-			if (coding.bit_rate == 1200) {
-				if (board_reset_to_bootloader)
-					board_reset_to_bootloader();
-			}
-		}
-	}
-}
-
 static struct emulated_uart *console;
 
 static bool
@@ -802,8 +688,7 @@ guest_try_loop(void)
 		// Keep cranking the USB handle
 		// Run TinyUSB service task every 1 ms (non-blocking)
 		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			tud_task();
-			cdc_task();
+			optional_usb_poll();
 			next_usb = make_timeout_time_ms(1u);
 		}
 		uart_task(console, &write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
@@ -926,8 +811,7 @@ process_command(char *buf)
 			// Keep cranking the USB handle
 			// Run TinyUSB service task every 1 ms (non-blocking)
 			if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-				tud_task();
-				cdc_task();
+				optional_usb_poll();
 				next_usb = make_timeout_time_ms(1u);
 			}
 			sysreq_process();
@@ -998,26 +882,36 @@ process_command(char *buf)
 		printf("UART: Control: %5u\tTx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
 		printf("UART: Status:  %5u\tRx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
 #endif
-	} else if (strcasecmp(tokenlist[0], "snippet") == 0) {
-		if (tokencount > 17u || tokencount < 2u) {
-			printf("Usage:\n\n> snippet <byte> [ <byte> ... ]\n\n");
+	} else if (strcasecmp(tokenlist[0], "snip") == 0) {
+		bool headless = false;
+		if (tokencount > 18u || tokencount < 2u) {
+			printf("Usage:\n\n> snippet [ h ] <byte> [ <byte> ... ]\n\n");
 			return;
 		}
-		for (int i = 1; i < tokencount; i++) {
+		if (tokencount >= 3) {
+			if (strcasecmp(tokenlist[1], "h") == 0)
+				headless = true;
+		}
+		uint offset = (headless ? 2u : 1u);
+		for (uint i = offset ; i < tokencount; i++) {
 			const uint hexnum = hex(tokenlist[i], 0);
 			if (hexnum > 0xFF) {
 				printf("Invalid byte '%s'\n", tokenlist[i]);
 				return;
 			}
-			buffer[i - 1] = hexnum;
+			buffer[i - offset] = hexnum;
 		}
 		printf("%04X:", 0xFFE0u);
-		for (uint i = 0; i < tokencount - 1; i++) {
+		for (uint i = 0; i < tokencount - offset; i++) {
 			read_registers[REGISTER_SNIPPET_OFFSET + i] = buffer[i];
 			printf(" %02X", read_registers[REGISTER_SNIPPET_OFFSET + i]);
 		}
 		printf("\n");
 		read_registers16[REGISTER_VECTOR_RESET_OFFSET/2] = reverse_bytes(REGISTER_SNIPPET);
+		if (headless)
+			start_guest_headless();
+		else
+			start_guest();
 	} else if (strcasecmp(tokenlist[0], "vec") == 0) {
 		uint16_t temp[8];
 		if (tokencount != 9u) {
@@ -1465,8 +1359,7 @@ poll_console_and_bus(void)
 		// Keep cranking the USB handle
 		// Run TinyUSB service task every 1 ms (non-blocking)
 		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			tud_task();
-			cdc_task();
+			optional_usb_poll();
 			next_usb = make_timeout_time_ms(1u);
 		}
 		uart_task(console, &write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
@@ -1974,34 +1867,6 @@ bus_pio_dma_init(void)
 
 #if 0
 static void
-handle_private_packet(const uint8_t *data, uint32_t len)
-{
-	// Example: echo upper-cased
-	uint8_t reply[64];
-	for (uint32_t i = 0; i < len; i++)
-		reply[i] = (data[i] >= 'a' && data[i] <= 'z') ? data[i] - 32 : data[i];
-
-	tud_cdc_n_write(1, reply, len);
-	tud_cdc_n_write_flush(1);
-}
-
-void
-tud_cdc_rx_cb(uint8_t itf)
-{
-	uint8_t buf[64];
-	uint32_t count = tud_cdc_n_read(itf, buf, sizeof(buf));
-
-	if (itf == 0) {
-		handle_private_packet(buf, count);
-	} else if (itf == 1) {
-		handle_private_packet(buf, count);
-		// Optional: handle CDC0 input
-	}
-}
-#endif
-
-#if 0
-static void
 measure_freqs(void) {
 	uint f_pll_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_SYS_CLKSRC_PRIMARY)/1000;
 	uint f_pll_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY)/1000;
@@ -2025,14 +1890,6 @@ measure_freqs(void) {
 	printf("clk_rtc  = %d kHz\n", f_clk_rtc);
 #endif
 	// Can't measure clk_ref / xosc as it is the ref
-}
-
-static void
-clock_code_blue(void)
-{
-	// Set up the clocks
-	clocks_init();
-	//measure_freqs();
 }
 #endif
 
@@ -2064,30 +1921,7 @@ main(void)
 	}
 	printf("Pico2 MC6809E console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
-	sleep_ms(100); // give macOS time to notice “device disappeared”
-	reset_block(RESETS_RESET_USBCTRL_BITS);
-	unreset_block(RESETS_RESET_USBCTRL_BITS);
-	board_init();
-	sleep_ms(200); // give macOS time to notice “device disappeared”
-	// Init USB device stack on configured roothub port
-	tusb_rhport_init_t dev_init = {
-		.role = TUSB_ROLE_DEVICE,
-		.speed = TUSB_SPEED_AUTO
-	};
-	tusb_init(BOARD_TUD_RHPORT, &dev_init);
-
-	if (board_init_after_tusb)
-		board_init_after_tusb();
-
-	sleep_ms(100);
-	tud_disconnect();   // force clean re-enumeration
-	sleep_ms(100);
-	tud_connect();
-	printf("Pico2 MC6809E initialised USB\n");
-
-	// clocks_enable_resus(clock_code_blue);
 	// measure_freqs();
-
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
@@ -2111,9 +1945,11 @@ main(void)
 	gpio_init(GPIO_IRQ);
 	gpio_put(GPIO_IRQ, false);
 
-	sleep_ms(100);
-
+	sleep_ms(10);
 	printf("Pico2 MC6809E external power on.\n");
+
+	optional_usb_init();
+	printf("Pico2 MC6809E initialised USB\n");
 
 	clock_pio_init();
 	bus_pio_dma_init();
@@ -2121,9 +1957,6 @@ main(void)
 	printf("Pico2 MC6809E emulated RAM and read_registers initialised\n");
 
 	multicore_launch_core1(main_core1);
-	sleep_ms(100);
-
-	printf("Pico2 MC6809E ready!\n");
 
 	struct tm tm = build_time_tm();
 	aon_timer_stop();
@@ -2131,14 +1964,7 @@ main(void)
 
 	print_time();
 
-#if 0
-	while (1) { // OINQUE!!!
-		tud_task(); // TinyUSB device task
-		cdc_task();
-		sleep_ms(1);
-		// debug_cdc_status();
-	}
-#endif
+	printf("Pico2 MC6809E ready!\n");
 
 	poll_console_and_bus();
 }
