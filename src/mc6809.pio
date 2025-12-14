@@ -23,7 +23,7 @@
 .define	public	GPIO_TRACE_WR	30	; Debugging
 
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
-; Side-set bits [Q:E] as E is 0b01, Q is 0b10.
+; Side-set bits [Q:E] as Q is 0b10, E is 0b01.
 .program	mc6809_clock
 .side_set	2
 .wrap_target
@@ -54,6 +54,9 @@ mc6809_clock_program_init(PIO pio, uint sm, uint offset)
 ; returned immediately to here, where we can take our time by sending
 ; to D7-0 after Q trailing edge. The output is cleared at E trailing edge
 ; (plus a bit).
+;
+; To consider: Don't auto-return the read byte ASAP, instead give the
+; Pico a chance to decide what to send.
 ;
 ; IN  pins:    (7) A5-0, R/!W
 ; OUT pins:    (8) D7-0

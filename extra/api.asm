@@ -17,16 +17,20 @@ UARTS	equ	$FFC8
 UARTTX	equ	$FFC9
 UARTRX	equ	$FFC9
 
-* Used by the Pico2 to copy up to 16 bytes of data from the 6809's
-* main memory.
-	ORG	START
-CopyIn	LDX	#SHARED
-	LDU	#$AAAA	This address will be replaced by the Pico
-	LDB	#$BB	This count will be replaced by the Pico
-l@0	LDA	,U+
-	STA	,X+
-	DECB
-	BNE	l@0
+* Put these in a dedicated file, FFS!
+NUL	equ	$00
+LF	equ	$0A
+CR	equ	$0D
+ESC	equ	$1B
+
+* Initialise the DAT RAM. Essential for anything outside the Pico
+* Do this automatically?
+DATInit	ORG	START
+	LDX	#DATRAM
+	CLRA
+D@0	STA	,X+
+	INCA
+	BNE	D@0
 	SYNC
 
 * Used by the Pico2 to copy up to 16 bytes of data to the 6809's
@@ -41,21 +45,17 @@ l@0	LDA	,X+
 	BNE	l@0
 	SYNC
 
-DATInit	ORG	START
-	LDX	#DATRAM
-	CLRA
-D@0	STA	,X+
-	INCA
-	BNE	D@0
+* Used by the Pico2 to copy up to 16 bytes of data from the 6809's
+* main memory.
+	ORG	START
+CopyIn	LDX	#SHARED
+	LDU	#$AAAA	This address will be replaced by the Pico
+	LDB	#$BB	This count will be replaced by the Pico
+l@0	LDA	,U+
+	STA	,X+
+	DECB
+	BNE	l@0
 	SYNC
-
-DATRead	ORG	START
-D@0	LDX	#DATRAM
-	CLRA
-D@1	LDB	,X+
-	INCA
-	BNE	D@1
-	BRA	D@0
 
 * Instant stop. Proves that bus BS_SYNC is detected and acted upon.
 	ORG	START
@@ -180,7 +180,7 @@ UartIRQ	LDS	#$2000
 	CLR	EXITC
 	LDA	#$40
 	STA	,X
-	ANDCC	#%11101111
+	ANDCC	#%11101111	; Enable IRQ
 	LDX	HELLO
 u@0	LDA	,X+
 	BEQ	FINISH
@@ -280,13 +280,11 @@ Cont	NOP
 	SYNC
 
 	ORG	$0000
-	FCC	"COPY_IN"
+	FCC	"DAT_INIT"
 	FCB	' '
 	FCC	"COPY_OUT"
 	FCB	' '
-	FCC	"DAT_INIT"
-	FCB	' '
-	FCC	"DAT_READ"
+	FCC	"COPY_IN"
 	FCB	' '
 	FCC	"SYNC"
 	FCB	' '

@@ -5,104 +5,104 @@
 #include "bsp/board.h"
 #include "tusb.h"
 #include "optional_usb.h"
+//#include "uart.h"
 
 // --- USB optional init / force enumeration ---
 void
 optional_usb_init(void)
 {
-        // Brief delay for host detection (macOS especially)
-        sleep_ms(100);
+	// Brief delay for host detection (macOS especially)
+	sleep_ms(100);
 
-        // Reset USB PHY to ensure clean state after debugger flash
-        reset_block(RESETS_RESET_USBCTRL_BITS);
-        unreset_block(RESETS_RESET_USBCTRL_BITS);
-        sleep_ms(50);
+	// Reset USB PHY to ensure clean state after debugger flash
+	reset_block(RESETS_RESET_USBCTRL_BITS);
+	unreset_block(RESETS_RESET_USBCTRL_BITS);
+	sleep_ms(50);
 
-        // Initialize board pins (USB DP/DM, etc.)
-        board_init();
+	// Initialize board pins (USB DP/DM, etc.)
+	board_init();
 
-        // Check USB clock frequency
-        uint usb_freq = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY);
-        printf("USB clock frequency: %u kHz\n", usb_freq);
-        if (usb_freq != 48000)
-                printf("ERROR: USB clock is not 48MHz\n");
+	// Check USB clock frequency
+	uint usb_freq = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY);
+	printf("USB clock frequency: %u kHz\n", usb_freq);
+	if (usb_freq != 48000)
+		printf("ERROR: USB clock is not 48MHz\n");
 
-        // TinyUSB device stack
-        tusb_rhport_init_t dev_init = {
-                .role  = TUSB_ROLE_DEVICE,
-                .speed = TUSB_SPEED_AUTO
-            };
-        tusb_init(0, &dev_init);
+	// TinyUSB device stack
+	tusb_rhport_init_t dev_init = {
+		.role = TUSB_ROLE_DEVICE,
+		.speed = TUSB_SPEED_AUTO
+	};
+	tusb_init(0, &dev_init);
 
-        // Optional board callback after TinyUSB init
-        if (board_init_after_tusb)
-                board_init_after_tusb();
+	// Optional board callback after TinyUSB init
+	if (board_init_after_tusb)
+		board_init_after_tusb();
 
-        // Force clean enumeration
-        sleep_ms(100);
-        tud_disconnect();
-        sleep_ms(100);
-        tud_connect();
+	// Force clean enumeration
+	sleep_ms(100);
+	tud_disconnect();
+	sleep_ms(100);
+	tud_connect();
 
-        // Optional extra delay for host
-        sleep_ms(50);
+	// Optional extra delay for host
+	sleep_ms(50);
 }
 
 static void
 cdc_loopback(void)
 {
-        uint8_t buf[64];
-        uint32_t count;
+	uint8_t buf[64];
+	uint32_t count;
 
-        if (!tud_cdc_connected())
-                return;
+	if (!tud_cdc_connected())
+		return;
 
-        if (tud_cdc_available() > 0) {
-                count = tud_cdc_read(buf, sizeof(buf));
-                if (count > 0) {
-                        tud_cdc_write(buf, count);
-                        tud_cdc_write_flush();
-                }
-        }
+	if (tud_cdc_available() > 0) {
+		count = tud_cdc_read(buf, sizeof(buf));
+		if (count > 0) {
+			tud_cdc_write(buf, count);
+			tud_cdc_write_flush();
+		}
+	}
 }
 
 /* Called when device mounted (enumerated) */
 void
 tud_mount_cb(void)
 {
-        printf("USB mounted\n");
+	printf("USB mounted\n");
 }
 
 /* Called when device unmounted (disconnected) */
 void
 tud_umount_cb(void)
 {
-        printf("USB unmounted\n");
+	printf("USB unmounted\n");
 }
 
 /* CDC handled by polling; no extra callbacks required for simple loopback */
 
 static absolute_time_t g_next_originate;
 
-/* Vendor RX callback — unbuffered or buffered forms supported by TinyUSB version.
- * We implement the two common variants: (itf) or (itf, buf, bufsize).
- * Use preprocessor checks so either prototype compiles depending on your TinyUSB.
- */
-
+// Called when the user sends serial data down the Pico's main USB/Power route.
+// Hand the virtual UART to the guest CPU.
 void
 tud_vendor_rx_cb(uint8_t itf, uint8_t const *buf, uint16_t bufsize)
 {
-        (void)itf;
-        // printf("USB Rx callback: got %u bytes\n", bufsize);
+	(void) itf;
+	// printf("USB Rx callback: got %u bytes\n", bufsize);
 
-        // MUST tell TinyUSB the data was consumed
-        tud_vendor_read(NULL, bufsize);
+	// MUST tell TinyUSB the data was consumed
+	tud_vendor_read(NULL, bufsize);
 
-        // Echo it back immediately
-        if (bufsize > 0) {
-                tud_vendor_write(buf, bufsize);
-                tud_vendor_write_flush();
-        }
+	// Send it to the guest
+#if 1
+	if (bufsize > 0) {
+		tud_vendor_write(buf, bufsize);
+		tud_vendor_write_flush();
+	}
+#endif
 }
 
 #ifdef NOT_USED_JUST_YET
@@ -110,10 +110,10 @@ tud_vendor_rx_cb(uint8_t itf, uint8_t const *buf, uint16_t bufsize)
 void
 tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes)
 {
-        (void)itf;
-        (void)sent_bytes;
-        // printf("USB Tx callback\n");
-        /* Could queue more data here */
+	(void) itf;
+	(void) sent_bytes;
+	// printf("USB Tx callback\n");
+	/* Could queue more data here */
 }
 #endif
 
@@ -123,29 +123,29 @@ tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes)
 static void
 vendor_maybe_originate(void)
 {
-        if (!tud_mounted())
-                return;
+	if (!tud_mounted())
+		return;
 
-        if (!time_reached(g_next_originate))
-                return;
+	if (!time_reached(g_next_originate))
+		return;
 
-        const char msg[] = "device-initiated-ping\n";
-        if (tud_vendor_write((const uint8_t *)msg, sizeof(msg) - 1) > 0)
-                tud_vendor_write_flush();
+	const uint8_t msg[] = "device-initiated-ping\n";
+	if (tud_vendor_write(msg, sizeof(msg) - 1) > 0)
+		tud_vendor_write_flush();
 
-        g_next_originate = make_timeout_time_ms(VENDOR_ORIGINATE_MS);
+	g_next_originate = make_timeout_time_ms(VENDOR_ORIGINATE_MS);
 }
 
 void
 optional_usb_poll(void)
 {
-        tud_task();
-        cdc_loopback();
-        vendor_maybe_originate();
+	tud_task();
+	cdc_loopback();
+	vendor_maybe_originate();
 }
 
 bool
 optional_usb_is_active(void)
 {
-        return (tud_ready());
+	return (tud_ready());
 }
