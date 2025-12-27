@@ -11,13 +11,15 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
-#include <cstdint>
+//#include <cstdint>
 
 #include "pico/aon_timer.h"
 #include "pico/assert.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+
 #include "hardware/clocks.h"
+#include "hardware/adc.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
@@ -25,9 +27,9 @@
 #include "bsp/board_api.h"
 
 #include "tusb.h"
-#include "optional_usb.h"
-
+#include "usb.h"
 #include "mc6809.h"
+#include "processor.h"
 #include "srec.h"
 #include "uart.h"
 #include "build_time.h"
@@ -38,85 +40,11 @@
 // I'm really pushing my luck with this.
 #define SYS_CLK_DEFAULT 360000000
 
-// Guest E/Q clocks in MHz
-#define GUEST_CLK_DEFAULT 1.0f
-#define GUEST_CLK_MIN 0.8f
-#define GUEST_CLK_MAX 3.0f
-
 // Default pico uart for command-line interactive access
 #define CONSOLE uart0
 #define CONSOLE_BAUDRATE 115200
 
-// RESET is active-low.
-#define RESET_HOLD_US 500u
-#define RESET_ASSERT do { gpio_put(GPIO_RESET, false); sleep_us(RESET_HOLD_US); } while (0)
-#define RESET_DEASSERT do { sleep_us(RESET_HOLD_US); gpio_put(GPIO_RESET, true); } while (0)
-#define RESET_IS_ASSERTED (!gpio_get(GPIO_RESET))
-
-// HALT is active-low.
-#define HALT_ASSERT gpio_put(GPIO_HALT, false);
-#define HALT_DEASSERT gpio_put(GPIO_HALT, true);
-#define HALT_IS_ASSERTED (!gpio_get(GPIO_HALT))
-
-// POWER is active-high.
-#define POWER_ASSERT gpio_put(GPIO_POWER, true);
-#define POWER_DEASSERT gpio_put(GPIO_POWER, false);
-#define POWER_IS_ASSERTED (gpio_get(GPIO_POWER))
-
-// Interrupts are simulated open-collector. Becoming an output causes
-// a drive-low, becoming an input sets high impedance.
-#define ASSERT_NMI gpio_set_dir(GPIO_NMI, GPIO_OUT)
-#define DEASSERT_NMI gpio_set_dir(GPIO_NMI, GPIO_IN)
-#define ASSERT_FIRQ gpio_set_dir(GPIO_FIRQ, GPIO_OUT)
-#define DEASSERT_FIRQ gpio_set_dir(GPIO_FIRQ, GPIO_IN)
-#define ASSERT_IRQ gpio_set_dir(GPIO_IRQ, GPIO_OUT)
-#define DEASSERT_IRQ gpio_set_dir(GPIO_IRQ, GPIO_IN)
-
-static volatile bool verbose = false;
-
-static void
-assert_interrupt(interrupt eirq)
-{
-	switch (eirq) {
-	case INTERRUPT_NMI:
-		ASSERT_NMI;
-		break;
-	case INTERRUPT_FIRQ:
-		ASSERT_FIRQ;
-		break;
-	case INTERRUPT_IRQ:
-		ASSERT_IRQ;
-		break;
-	default:
-		break;
-	}
-}
-
-static void
-deassert_interrupt(interrupt eirq)
-{
-	switch (eirq) {
-	case INTERRUPT_NMI:
-		DEASSERT_NMI;
-		break;
-	case INTERRUPT_FIRQ:
-		DEASSERT_FIRQ;
-		break;
-	case INTERRUPT_IRQ:
-		DEASSERT_IRQ;
-		break;
-	default:
-		break;
-	}
-}
-
-struct pio_dma {
-	PIO pio;
-	int sm;
-	int address_channel;
-	int data_channel;
-	uint32_t irq;
-};
+volatile bool verbose = false;
 
 #define BUS_CLOCK_PIO pio0
 
@@ -148,268 +76,67 @@ static pio_dma piodma_write = {
 	DMA_IRQ_1
 };
 
-// 64-byte memory-mapped read_registers.
+// 64-byte memory-mapped registers
 // There are 2 blocks, one for the Read DMA and the other for the Write DMA.
 // This allows for software enforcement of read-only areas and for device
 // registers to share status and control at the same address.
 // The alignment is there to allow the base address to have the lower 6 bits
 // all zeroes, so that the rest can be used as DMA prefixes without faffing
 // around with pointer arithmetic.
-__scratch_y("")
-__attribute__((aligned(64)))
-static volatile uint8_t write_registers[64];
-static volatile uint16_t *const write_registers16 = reinterpret_cast<volatile uint16_t *>(write_registers);
-__scratch_y("")
-__attribute__((aligned(64)))
-static volatile uint8_t read_registers[64];
-static volatile uint16_t *const read_registers16 = reinterpret_cast<volatile uint16_t *>(read_registers);
 
-static inline float reverse_float(uint32_t index)
-{
-	return reverse_4_bytes(reinterpret_cast<volatile float *>(read_registers)[index]);
-}
-static inline void reverse_set_float(uint32_t index, float val)
-{
-	reinterpret_cast<volatile float *>(read_registers)[index] = reverse_4_bytes(val);
-}
+registers &reg = registers::getInstance();
 
-processor::processor() : task(0u), busy(false), lic(false), vma(false)
-{
-	old_bus_state.state = BS_RUNNING_RESET;
-	bus_state.state = BS_RUNNING_RESET;
-	run_state = RS_HEADLESS_STOPPED;
-	busy_lic_avma.byte = 0x00u;
-	task_stack_ptr = 0u;
-	e_freq = GUEST_CLK_DEFAULT;
-#ifdef DEBUG
-	_count_lic = 0u;
-#endif
-}
-
-// Done once at start of run
 void
-processor::task_initialise()
+registers::copy_out(uint8_t *dst, uint16_t addr, uint16_t len)
 {
-	task_stack_ptr = 0x00u;
-	task = 0u;
-	read_registers[SYSTEM_TASK] = 0u;
-	init_pins_range(GPIO_TASK_BASE, NUM_TASK_PINS);
-	gpio_set_dir_out_masked64(TASK_PINS_MASK << GPIO_TASK_BASE);
-	gpio_init(GPIO_TASK_0);
-	gpio_set_dir(GPIO_TASK_0, GPIO_OUT);
-	gpio_put_masked64(TASK_PINS_MASK << GPIO_TASK_BASE, 0LLu);
-	gpio_put(GPIO_TASK_0, true);
+	for (uint16_t i = 0; i < len; i++)
+		dst[i] = read_registers[addr + i];
 }
 
-// Done when the guest changes the task register
-uint8_t
-processor::task_change(uint8_t new_task)
-{
-	new_task &= TASK_PINS_MASK;
-	task = new_task;
-	gpio_put_masked64(TASK_PINS_MASK << GPIO_TASK_BASE, new_task << GPIO_TASK_BASE);
-	gpio_put(GPIO_TASK_0, new_task == 0u);
-	return new_task;
-}
 
-// Return the active task number
-uint8_t
-processor::task_get() const
+void
+registers::copy_in(uint16_t addr, const uint8_t *src, uint16_t len)
 {
-	return task;
+	for (uint16_t i = 0u; i < len; i++)
+		read_registers[addr + i] = src[i];
 }
-
-processor MC6809;
 
 // Keep track of which task was interrupted
 #define MAX_INT_NEST_DEPTH 16u
 static volatile uint8_t task_stack[MAX_INT_NEST_DEPTH];
 
-#ifdef DEBUG
-#define TRACE_SIZE 1024u
-#define TRACE_READ 0x00000000u
-#define TRACE_WRITE 0x10000000u
-static constexpr unsigned trace_size = TRACE_SIZE;
-static volatile unsigned trace_pos = 0u;
-static volatile uint32_t trace[trace_size][4u];
-#endif
-
-static uint8_t *
-READ_ADDR(const uint16_t addr)
-{
-	return const_cast<uint8_t *>(&read_registers[REGISTER_INDEX(addr)]);
-}
-
-static uint8_t *
-WRITE_ADDR(const uint16_t addr)
-{
-	return const_cast<uint8_t *>(&write_registers[REGISTER_INDEX(addr)]);
-}
-
-static const char *ba_bs_string[] = {
-	foreach_busstate(enum_list_strings)
-};
-
-static const char *run_state_string[] = {
-	foreach_runstate(enum_list_strings)
-};
-
-bool
-processor::assert_stopped() const
-{
-	bool retval = run_state == RS_STOPPED || run_state == RS_HEADLESS_STOPPED;
-	if (!retval)
-		printf("MC6809 not stopped, currently in %s\n", run_state_string[run_state]);
-	return retval;
-}
-
-void
-processor::setup(enum run_state rs)
-{
-	assert(rs == RS_STOPPED || rs == RS_HEADLESS_STOPPED);
-	run_state = rs;
-	old_bus_state.state = BS_RUNNING_RESET;
-	bus_state.state = BS_RUNNING_RESET;
-	busy_lic_avma.byte = 0x00u;
-	task = 0u;
-	task_stack_ptr = 0u;
-	vma = false;
-#ifdef DEBUG
-	_count_lic = 0u;
-	trace_pos = 0u;
-#endif
-	task_initialise();
-}
-
-void
-processor::init()
-{
-	RESET_ASSERT;
-	HALT_DEASSERT;
-	DEASSERT_NMI;
-	DEASSERT_FIRQ;
-	DEASSERT_IRQ;
-	setup(RS_STOPPED);
-}
-
-void
-processor::start()
-{
-	if (!assert_stopped())
-		return;
-	setup(RS_STOPPED);
-	if (verbose)
-		printf("Starting MC6809 from %04X at E = %.1f MHz\n\n",
-		       reverse_2_bytes(read_registers16[REGISTER_VECTOR_RESET_OFFSET/2]), e_freq);
-	RESET_DEASSERT;
-	if (verbose) {
-		sleep_ms(10u);
-		printf("Started MC6809 bus state = %u = %s\n", bus_state.state, ba_bs_string[bus_state.state]);
-		printf("Started MC6809 run state = %u = %s\n", run_state, run_state_string[run_state]);
-	}
-}
-
-void
-processor::start_headless()
-{
-	if (!assert_stopped())
-		return;
-	setup(RS_HEADLESS_STOPPED);
-	if (verbose)
-		printf("Starting MC6809 headless from %04X at E = %.1f MHz\n\n",
-		       reverse_2_bytes(read_registers16[REGISTER_VECTOR_RESET_OFFSET/2]), e_freq);
-	RESET_DEASSERT;
-}
-
-void
-processor::start_with_timeout(const uint32_t timeout_ms)
-{
-	uint32_t i;
-	uint32_t timeout_us = timeout_ms*1000u;
-
-	timeout_us = MAX(1000u, timeout_us);
-	timeout_us = MIN(1000000u, timeout_us);
-	if (!assert_stopped())
-		return;
-	if (verbose)
-		printf("Starting MC6809 headless from %04X at E = %.1f MHz and timeout = %u us\n\n",
-		       reverse_2_bytes(read_registers16[REGISTER_VECTOR_RESET_OFFSET/2]), e_freq, timeout_us);
-	setup(RS_HEADLESS_STOPPED);
-#ifdef DEBUG
-	uint32_t lic_start = _count_lic;
-#endif
-	RESET_DEASSERT;
-	for (i = 0; i < 1000u*timeout_ms; i++) {
-		sleep_us(1u);
-		if (run_state == RS_HEADLESS_SYNCED) {
-			if (verbose)
-				printf("Stopping MC6809 due to SYNC\n");
-			break;
-		}
-	}
-	RESET_ASSERT;
-	if (verbose) {
-		printf("MC6809 run took %u iterations\n", i);
-#ifdef DEBUG
-		printf("%lu LICs were counted\n", _count_lic - lic_start);
-#endif
-		if (i == 1000u*timeout_ms)
-			printf("Stopped due to timeout\n");
-	}
-}
-
-void
-processor::stop()
-{
-	RESET_ASSERT;
-	if (verbose)
-		printf("\n\nStopped MC6809\n");
-}
-
 static void
 dump_registers()
 {
-	static char printables[16];
+	static uint8_t printables[16];
 
 	printf("Write block:\n");
-	for (uint32_t i = 0u; i < 4u; i++) {
-		memcpy(printables, WRITE_ADDR(i * 16u), 16u);
-		printf("%04X:", REGISTER_BASE + i * 16u);
-		for (uint32_t j = 0u; j < 16u; j++) {
+	for (uint16_t i = 0u; i < 4u; i++) {
+		registers::copy_out(printables, i*16u, 16u);
+		printf("%04X:", REGISTER_BASE + i*16u);
+		for (uint16_t j = 0u; j < 16u; j++) {
 			auto ch = static_cast<unsigned char>(printables[j]) & 0x7F;
 			printf(" %02X", printables[j]);
+			if (j == 7u)
+				printf(" ");
 			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
 		}
-		printf(" |%.16s|\n", printables);
+		printf(" |%.16s|\n", reinterpret_cast<char *>(printables));
 	}
 	printf("Read block:\n");
-	for (uint32_t i = 0u; i < 4u; i++) {
-		memcpy(printables, READ_ADDR(i * 16u), 16u);
-		printf("%04X:", REGISTER_BASE + i * 16u);
-		for (uint32_t j = 0u; j < 16u; j++) {
+	for (uint16_t i = 0u; i < 4u; i++) {
+		registers::copy_out(printables, i*16u, 16u);
+		printf("%04X:", static_cast<uint16_t>(REGISTER_BASE + i*16u));
+		for (uint16_t j = 0u; j < 16u; j++) {
 			auto ch = static_cast<unsigned char>(printables[j]) & 0x7F;
 			printf(" %02X", printables[j]);
+			if (j == 7u)
+				printf(" ");
 			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
 		}
-		printf(" |%.16s|\n", printables);
+		printf(" |%.16s|\n", reinterpret_cast<char *>(printables));
 	}
 	printf("--\n");
-}
-
-void
-processor::halt()
-{
-	HALT_ASSERT;
-	if (verbose)
-		printf("\n\nHalted MC6809\n");
-}
-
-void
-processor::release()
-{
-	if (verbose)
-		printf("Releasing MC6809\n");
-	HALT_DEASSERT;
 }
 
 //	BS_RUNNING,    BS_IRQ,         BS_SYNC,   BS_HALT,   BS_RUNNING_RESET ....
@@ -419,12 +146,9 @@ static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
 	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_HALTED
 	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_SYNCED
 	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_STOPPED
-	{RS_HEADLESS_STARTED, RS_HEADLESS_INTERRUPTED, RS_HEADLESS_SYNCED, RS_HEADLESS_HALTED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED}, // RS_HEADLESS_STARTED
-	{RS_HEADLESS_STARTED, RS_HEADLESS_INTERRUPTED, RS_HEADLESS_SYNCED, RS_HEADLESS_HALTED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED}, // RS_HEADLESS_INTERRUPTED
-	{RS_HEADLESS_STARTED, RS_HEADLESS_INTERRUPTED, RS_HEADLESS_SYNCED, RS_HEADLESS_HALTED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED}, // RS_HEADLESS_HALTED
-	{RS_HEADLESS_STARTED, RS_HEADLESS_INTERRUPTED, RS_HEADLESS_SYNCED, RS_HEADLESS_HALTED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED}, // RS_HEADLESS_SYNCED
-	{RS_HEADLESS_STARTED, RS_HEADLESS_INTERRUPTED, RS_HEADLESS_SYNCED, RS_HEADLESS_HALTED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED, RS_HEADLESS_STOPPED}, // RS_HEADLESS_STOPPED
 };
+
+static volatile bool q_falling_edge = false;
 
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
@@ -452,6 +176,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		}
 //	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 	} else {
+		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
 		// These 3 signals are all predictive; they indicate the status of the _next_ memory access
 		MC6809.set_busy_lic_avma(static_cast<uint8_t>((gpio_get_all() >> GPIO_BUSY) & 0b00000111));
@@ -462,7 +187,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 // ISR for the R/!W bus read loop and DMA chain
 // The PIO mediates the signalling
 // There are 2 DMA transfers:
-//   1) accept read_registers + A5-0
+//   1) accept reg + A5-0
 //   2) return the byte at that address
 //
 // This reacts to a read after the fact. Consider breaking
@@ -481,7 +206,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
 		read_location = read_addr & 0x0000003Fu;
 		read_irq_received = true;
-#ifdef DEBUG
+#ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
 			trace[trace_pos][0] = read_location;
 			trace[trace_pos][1] = *reinterpret_cast<volatile std::uint8_t *>(read_addr);
@@ -514,7 +239,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
 		write_location = written_addr & 0x0000003Fu;
 		write_irq_received = true;
-#ifdef DEBUG
+#ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
 			trace[trace_pos][0] = write_location;
 			trace[trace_pos][1] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
@@ -549,8 +274,8 @@ static uint8_t snippet_code[SNIPPET_LEN][16u] = {
 static void
 snippet_copy(const snippet snippet_num)
 {
-	memcpy(READ_ADDR(REGISTER_SNIPPET), snippet_code[snippet_num], 16u);
-	read_registers16[REGISTER_VECTOR_RESET_OFFSET / 2] = reverse_2_bytes(REGISTER_SNIPPET);
+	registers::copy_in(REGISTER_SNIPPET_OFFSET, snippet_code[snippet_num], 16u);
+	reg[REGISTER_VECTOR_RESET_OFFSET] = REGISTER_SNIPPET;
 }
 
 enum copy_type {
@@ -577,14 +302,14 @@ copy(const copy_type direction, const uint16_t count, const uint16_t address, ui
 		const uint8_t len = MIN(16u, end - start);
 		if (verbose)
 			printf(s, len, start);
-		read_registers16[REGISTER_SNIPPET_OFFSET/2 + 2u] = reverse_2_bytes(start);
-		read_registers[REGISTER_SNIPPET_OFFSET + 7u] = len;
+		reg[REGISTER_SNIPPET_OFFSET + 4u] = start;
+		reg[REGISTER_SNIPPET_OFFSET + 7u] = len;
 		if (direction == OUTWARDS) {
-			memcpy(READ_ADDR(REGISTER_BUFFER), data + pos, len);
+			registers::copy_in(REGISTER_BUFFER_OFFSET, data + pos, len);
 			MC6809.start_with_timeout(4u);
 		} else {
 			MC6809.start_with_timeout(4u);
-			memcpy(data + pos, READ_ADDR(REGISTER_BUFFER), len);
+			registers::copy_out(data + pos, REGISTER_BUFFER_OFFSET, len);
 		}
 		start += len;
 		pos += len;
@@ -609,19 +334,29 @@ static const char *chunk_string[] = {
 #undef  CHUNK_INITIALISERS_INC
 #endif
 
+#ifdef DEBUG
+static volatile unsigned UART_CONTROL_COUNT = 0u, UART_TX_DATA_COUNT = 0u;
+static volatile unsigned UART_STATUS_COUNT = 0u, UART_RX_DATA_COUNT = 0u;
+#endif
+
 static void
 peripheral_clear(const bool sysvectors)
 {
-	explicit_bzero(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(write_registers)), sizeof(write_registers));
-	explicit_bzero(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(read_registers)), sizeof(read_registers));
-
-	for (uint32_t i = 0u; i < 16u; i++)
-		read_registers[REGISTER_DEVICES_OFFSET + i] = 0xFFu;
+	registers::clear();
+	for (uint16_t i = 0u; i < 16u; i++)
+		reg[REGISTER_DEVICES_OFFSET + i] = static_cast<uint8_t>(0xFFu);
 	if (sysvectors) {
 		snippet_copy(SYNC);
-		for (uint32_t i = 0u; i < 8u; i++)
-			read_registers16[REGISTER_VECTORS_OFFSET / 2 + i] = reverse_2_bytes(REGISTER_SNIPPET);
+		for (uint16_t i = 0u; i < 16u; i += 2)
+			reg[REGISTER_VECTORS_OFFSET + i] = REGISTER_SNIPPET;
 	}
+#ifdef DEBUG
+	UART_CONTROL_COUNT = 0u;
+	UART_TX_DATA_COUNT = 0u;
+	UART_STATUS_COUNT = 0u;
+	UART_RX_DATA_COUNT = 0u;
+#endif
+
 }
 
 void
@@ -632,153 +367,80 @@ sysreq_initialise()
 void
 sysreq_process()
 {
-	if (read_registers[SYSTEM_REQUEST_RESPONSE] == RESPONSE_BUSY) {
-		switch (read_registers[SYSTEM_REQUEST]) {
+	if (reg[SYSTEM_REQUEST_RESPONSE] == RESPONSE_BUSY) {
+		switch (static_cast<uint8_t>(reg[SYSTEM_REQUEST])) {
 		default:
 			// TODO: MarkM - Bad Juju - investigate/report
 			break;
 		case REQUEST_TIME: {
 			tm tm{};
-			struct {
-				uint8_t year;
-				uint8_t month;
-				uint8_t day;
-				uint8_t hour;
-				uint8_t minute;
-				uint8_t second;
-				uint8_t day_of_week;
+			union {
+				struct {
+					uint8_t year;
+					uint8_t month;
+					uint8_t day;
+					uint8_t hour;
+					uint8_t minute;
+					uint8_t second;
+					uint8_t day_of_week;
+				} time;
+				uint8_t bytes[7];
 			} guest_time{};
 			if (aon_timer_get_time_calendar(&tm)) {
-				guest_time.year = tm.tm_year;
-				guest_time.month = tm.tm_mon + 1u;
-				guest_time.day = tm.tm_mday;
-				guest_time.hour = tm.tm_hour;
-				guest_time.minute = tm.tm_min;
-				guest_time.second = tm.tm_sec;
-				guest_time.day_of_week = tm.tm_wday;
-				memcpy(READ_ADDR(REGISTER_BUFFER), &guest_time, MIN(sizeof(guest_time), 16u));
-				read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_DONE;
+				guest_time.time.year = tm.tm_year;
+				guest_time.time.month = tm.tm_mon + 1u;
+				guest_time.time.day = tm.tm_mday;
+				guest_time.time.hour = tm.tm_hour;
+				guest_time.time.minute = tm.tm_min;
+				guest_time.time.second = tm.tm_sec;
+				guest_time.time.day_of_week = tm.tm_wday;
+				registers::copy_in(REGISTER_BUFFER_OFFSET, guest_time.bytes, MIN(sizeof(guest_time), 16u));
+				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_DONE;
 			} else
-				read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
+				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
 		case REQUEST_SETTIME: {
 			tm tm{};
-			struct {
-				uint8_t year;
-				uint8_t month;
-				uint8_t day;
-				uint8_t hour;
-				uint8_t minute;
-				uint8_t second;
-				uint8_t day_of_week;
+			union {
+				struct {
+					uint8_t year;
+					uint8_t month;
+					uint8_t day;
+					uint8_t hour;
+					uint8_t minute;
+					uint8_t second;
+					uint8_t day_of_week;
+				} time;
+				uint8_t bytes[7];
 			} guest_time{};
-			memcpy(&guest_time, READ_ADDR(REGISTER_BUFFER), MIN(sizeof(guest_time), 16u));
-			tm.tm_year = guest_time.year;
-			tm.tm_mon = guest_time.month;
-			tm.tm_mday = guest_time.day;
-			tm.tm_hour = guest_time.hour;
-			tm.tm_min = guest_time.minute;
-			tm.tm_sec = guest_time.second;
-			tm.tm_wday = guest_time.day_of_week;
+			registers::copy_out(guest_time.bytes, REGISTER_BUFFER, MIN(sizeof(guest_time), 16u));
+			tm.tm_year = guest_time.time.year;
+			tm.tm_mon = guest_time.time.month;
+			tm.tm_mday = guest_time.time.day;
+			tm.tm_hour = guest_time.time.hour;
+			tm.tm_min = guest_time.time.minute;
+			tm.tm_sec = guest_time.time.second;
+			tm.tm_wday = guest_time.time.day_of_week;
 			if (aon_timer_set_time_calendar(&tm))
-				read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_DONE;
+				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_DONE;
 			else
-				read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
+				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
 		case REQUEST_MOUNT: {
-			read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
+			reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
 		case REQUEST_UNMOUNT: {
-			read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
+			reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
 		}
 	}
 }
 
-#ifdef DEBUG
-static volatile unsigned UART_CONTROL_COUNT = 0u, UART_TX_DATA_COUNT = 0u;
-static volatile unsigned UART_STATUS_COUNT = 0u, UART_RX_DATA_COUNT = 0u;
-#endif
-
 emulated_uart fast_serial;
-
-bool
-processor::try_loop()
-{
-	static uint32_t exit_count = 0u;
-	bool retval = false;
-	absolute_time_t next_usb = get_absolute_time();
-
-	while (MC6809.run_state == RS_STARTED) {
-		const int ch = getchar_timeout_us(0);
-		if (ch != PICO_ERROR_TIMEOUT) {
-			uint8_t ch_u8 = ch;
-			if (ch_u8 == ' ') {
-				printf("UART: TxQueue: %u\n", fast_serial.recv_level());
-				printf("UART: RxQueue: %u\n", fast_serial.send_level());
-#ifdef DEBUG
-				printf("UART: Control: %5u\tTx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
-				printf("UART: Status:  %5u\tRx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
-#endif
-			}
-			if (ch_u8 == '\x1B') {
-				exit_count++;
-				if (exit_count == 8u) {
-					if (verbose)
-						printf("Detach commanded from console, going headless\n");
-					exit_count = 0u;
-					MC6809.run_state = RS_HEADLESS_STARTED;
-					if (verbose)
-						printf("Flushing output buffer\n");
-					while (fast_serial.host_receive_avail())
-						putchar(fast_serial.host_receive());
-					retval = true;
-					break;
-				}
-			} else
-				exit_count = 0u;
-			if (fast_serial.host_send_avail())
-				fast_serial.host_send(ch_u8);
-		}
-		if (fast_serial.host_receive_avail())
-			putchar(fast_serial.host_receive());
-		// Keep cranking the USB handle
-		// Run TinyUSB service task every 1 ms (non-blocking)
-		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			optional_usb_poll();
-			next_usb = make_timeout_time_ms(1u);
-		}
-		fast_serial.task(&write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
-		sysreq_process();
-	}
-	return retval;
-}
-
-void
-processor::set_e_frequency(const float target_mhz)
-{
-	e_freq = target_mhz;
-	if (e_freq < GUEST_CLK_MIN)
-		e_freq = GUEST_CLK_MIN;
-	if (e_freq > GUEST_CLK_MAX)
-		e_freq = GUEST_CLK_MAX;
-	const float sys_clock_rate = clock_get_hz(clk_sys);
-	const float guest_divisor = sys_clock_rate/(4.0f*e_freq*1.0e6f);
-	pio_sm_set_clkdiv(pio_clock.pio, pio_clock.sm, guest_divisor);
-#ifdef DEBUG
-	printf("E/Q clock divisor = %f\n", guest_divisor);
-#endif
-}
-
-float
-processor::get_e_frequency() const
-{
-	return e_freq;
-}
 
 static void
 print_time()
@@ -796,13 +458,41 @@ print_time()
 		printf("Unable to get calendar time\n");
 }
 
+enum e_commands {
+	VERBOSE, EXAMINE, MODIFY, STATUS, SNIPPET, VECTOR, FILL, TIME, GO, TASK, IRQ, TRACE, RUN, STOP, FREQ, RESET, USB, S19, NONE
+};
+
+struct s_commands {
+	const char *str;
+	enum e_commands com;
+} commands[] = {
+	{ "verbose", VERBOSE },
+	{ "examine", EXAMINE },
+	{ "modify", MODIFY },
+	{ "status", STATUS },
+	{ "snippet", SNIPPET },
+	{ "vector", VECTOR },
+	{ "fill", FILL },
+	{ "time", TIME },
+	{ "go", GO },
+	{ "task", TASK },
+	{ "irq", IRQ },
+	{ "trace", TRACE },
+	{ "run", RUN },
+	{ "stop", STOP },
+	{ "freq", FREQ },
+	{ "reset", RESET },
+	{ "usb", USB },
+	{ "S19", NONE },
+	{ nullptr, NONE }
+};
 
 #define BUFFER_SIZE 256u
 void
 process_command(char *buf)
 {
 	static uint8_t buffer[BUFFER_SIZE];
-	uint32_t buflen = strlen(buf);
+	uint16_t buflen = strlen(buf);
 	char *tokenlist[64], *ptr = buf + buflen - 1, *token;
 
 	while (isspace(*buf) && buflen > 0u) {
@@ -815,24 +505,49 @@ process_command(char *buf)
 		*ptr-- = '\0';
 		buflen--;
 	}
-	if (buflen == 0u)
-		return;
 	ptr = buf;
-	uint32_t tokencount = 0u;
+	uint16_t tokencount = 0u;
 	while ((token = strsep(&ptr, " \t\n\r")) != nullptr) {
 		if (strlen(token) != 0u)
 			tokenlist[tokencount++] = token;
 	}
-	if (strcmp(tokenlist[0], "verbose") == 0) {
+	e_commands command = NONE;
+	if (tokenlist[0][0] == 'S')
+		command = S19;
+	else {
+		for (int i = 0; ; i++) {
+			if (commands[i].com == NONE)
+				break;
+			if (strncasecmp(tokenlist[0], commands[i].str, strlen(tokenlist[0])) == 0) {
+				if (command == NONE)
+					command = commands[i].com;
+				else {
+					printf("Ambiguous command \"%s\" - \"%s\" vs \"%s\"\n", tokenlist[0], commands[command].str, commands[i].str);
+					return;
+				}
+			}
+		}
+	}
+	if (command == NONE) {
+		printf("Unknown command \"%s\"\n", tokenlist[0]);
+		return;
+	}
+	switch (command) {
+	default:
+		printf("Default case found. Why? Fix it!\n");
+		break;
+	case VERBOSE: {
 		if (tokencount != 1u) {
 			printf("Usage:\n\n> verbose\n\n");
 			return;
 		}
 		verbose = !verbose;
 		printf("Verbose mode %s\n", verbose ? "on" : "off");
-	} else if (strcasecmp(tokenlist[0], "ex") == 0) {
+	}
+	break;
+	case EXAMINE: {
 		if (tokencount != 3u) {
-			printf("Usage:\n\n> ex <start> <end>\n\n");
+			printf("Usage:\n\n> examine <start> <end>\n\n");
 			return;
 		}
 		uint32_t hexnum = hex(tokenlist[1], 0);
@@ -852,11 +567,12 @@ process_command(char *buf)
 		}
 		if (!MC6809.assert_stopped())
 			return;
+		MC6809.preserve_state();
 		const uint16_t end = hexnum;
 		const uint16_t display_start = start & 0xFFF0u;
 		const uint16_t display_end = ((end - 1u) | 0x000Fu) + 1u;
 		absolute_time_t next_usb = get_absolute_time();
-		for (uint32_t loc = display_start; loc < display_end; loc += 16u) {
+		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
 			copy(INWARDS, 16u, loc, buffer);
 			printf("%04X:", loc);
 			for (uint16_t i = 0; i < 16u; i++) {
@@ -864,6 +580,8 @@ process_command(char *buf)
 					printf(" %02X", buffer[i]);
 				else
 					printf("   ");
+				if (i == 7u)
+					printf(" ");
 			}
 			printf(" |");
 			for (uint16_t i = 0; i < 16u; i++) {
@@ -872,19 +590,24 @@ process_command(char *buf)
 					printf("%c", isprint(ch) ? ch  : '.');
 				} else
 					printf(" ");
+				if (i == 7u)
+					printf("|");
 			}
 			printf("|\n");
 			// Keep cranking the USB handle
 			// Run TinyUSB service task every 1 ms (non-blocking)
 			if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-				optional_usb_poll();
+				usb_poll();
 				next_usb = make_timeout_time_ms(1u);
 			}
-			sysreq_process();
+			//sysreq_process();
 		}
-	} else if (strcasecmp(tokenlist[0], "mod") == 0) {
+		MC6809.restore_state();
+	}
+	break;
+	case MODIFY: {
 		if (tokencount < 3u || tokencount > 67u) {
-			printf("Usage:\n\n> mod <start> <byte> [ <byte> ... ] (maximum 64 bytes)\n\n");
+			printf("Usage:\n\n> modify <start> <byte> [ <byte> ... ] (maximum 64 bytes)\n\n");
 			return;
 		}
 		uint32_t hexnum = hex(tokenlist[1], 0);
@@ -903,30 +626,38 @@ process_command(char *buf)
 		}
 		if (start < REGISTER_BASE) {
 			if (start + tokencount - 2u > REGISTER_BASE) {
-				printf("Overflow into register region by %u bytes - truncating overflow\n",
+				printf("Overflow into reg region by %u bytes - truncating overflow\n",
 				       start + tokencount - 2u - REGISTER_BASE);
 				copy(OUTWARDS, REGISTER_BASE - start, start, buffer);
 			} else
 				copy(OUTWARDS, tokencount - 2, start, buffer);
 		} else {
 			printf("Modifying system registers, so provoking callbacks\n");
-			for (uint32_t i = 0u; i < tokencount - 2u; i++) {
-				write_registers[REGISTER_INDEX(start + i)] = buffer[i];
+			for (uint16_t i = 0u; i < tokencount - 2u; i++) {
+				registers::write(start + i) = buffer[i];
 				write_location = (start + i) & 0x3F;
 				write_irq_received = true;
-				fast_serial.task(&write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
-				printf("%04X: %02X %02X %u\n",
-				       start + i,
-				       write_registers[REGISTER_INDEX(start + i)],
-				       read_registers[REGISTER_INDEX(start + i)],
-				       write_irq_received);
+				printf("%04X: %02X %02X %u\n", ADDRESS(start + i), static_cast<uint8_t>(registers::write(start + i)), static_cast<uint8_t>(reg[start + i]), write_irq_received);
 			}
 		}
-	} else if (strcasecmp(tokenlist[0], "stat") == 0) {
+	}
+	break;
+	case STATUS: {
 		if (tokencount != 1u) {
-			printf("Usage:\n\n> stat\n\n");
+			printf("Usage:\n\n> status\n\n");
 			return;
 		}
+		// correction factor tweeked from empirical measurement
+		constexpr float conversion_factor = ((2.5334f*2.0f)/5.0f)*3.3f/(1 << 12);
+		adc_select_input(7);
+		uint16_t raw_vcc = adc_read();
+		printf("External Vcc = %.1f V\n", raw_vcc * conversion_factor * 2.0f);
+		adc_select_input(8);
+		uint16_t raw_temp = adc_read();
+		float voltage_temp;
+		voltage_temp = conversion_factor * raw_temp;
+		float temperature = 27.0f - (voltage_temp - 0.706f)/0.001721f;
+		printf("Pico2 temperature = %.1f C\n", temperature);
 		printf("Run state: %u = %s\n", MC6809.run_state, run_state_string[MC6809.run_state]);
 		printf("Bus State: %u = %s\t(previous is %u = %s)\n",
 		       MC6809.bus_state.state,
@@ -935,79 +666,86 @@ process_command(char *buf)
 		       ba_bs_string[MC6809.old_bus_state.state]);
 		printf("Task: %u\n", MC6809.task);
 		printf("Interrupt task history:");
-		for (uint32_t i = 0; i < MC6809.task_stack_ptr; i++)
+		for (uint16_t i = 0; i < MC6809.task_stack_ptr; i++)
 			printf(" %u", task_stack[i]);
 		printf("\n");
-		printf("POWER pin: %s\n", POWER_IS_ASSERTED ? "HIGH" : "LOW");
-		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "HIGH" : "LOW");
-		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "HIGH" : "LOW");
+		printf("POWER pin: %s\n", POWER_IS_ASSERTED ? "HIGH" : "low");
+		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "high" : "LOW");
+		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "high" : "LOW");
 #ifdef DEBUG
-		printf("LIC count: %lu\n", MC6809.get_lic_count());
-		if (MC6809.get_lic_count() == 0u && (MC6809.run_state == RS_STARTED || MC6809.run_state == RS_HEADLESS_STARTED))
-			printf("WARNING: LIC count is zero, but the run state is %s\n", run_state_string[MC6809.run_state]);
+		{
+			static uint16_t last_LIC = 0u;
+			printf("LIC count: %lu\n", MC6809.get_lic_count());
+			if (MC6809.run_state == RS_STARTED) {
+				uint8_t LIC = MC6809.get_lic_count();
+				if (last_LIC != LIC)
+					last_LIC = LIC;
+				else
+					printf("WARNING: LIC count is same as last time (%u), but the run state is %s\n", LIC, run_state_string[MC6809.run_state]);
+			}
+		}
 #endif
 		printf("Register and emulated RAM block:\n");
 		dump_registers();
 		printf("Console:\n");
-		printf("UART: TxQueue: %u\n", fast_serial.recv_level());
-		printf("UART: RxQueue: %u\n", fast_serial.send_level());
+		printf("Interrupt status: %02X\n", fast_serial.interrupt_status());
+		printf("UART: TxQueue: %u\n", fast_serial.receive_level());
+		printf("UART: RxQueue: %u\n", fast_serial.transmit_level());
 #ifdef DEBUG
 		printf("UART: Control: %5u\tTx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
 		printf("UART: Status:  %5u\tRx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
 #endif
-	} else if (strcasecmp(tokenlist[0], "snip") == 0) {
-		bool headless = false;
+	}
+	break;
+	case SNIPPET: {
 		if (tokencount > 18u || tokencount < 2u) {
-			printf("Usage:\n\n> snippet [ h ] <byte> [ <byte> ... ]\n\n");
+			printf("Usage:\n\n> snippet <byte> [ <byte> ... ]\n\n");
 			return;
 		}
-		if (tokencount >= 3) {
-			if (strcasecmp(tokenlist[1], "h") == 0)
-				headless = true;
-		}
-		uint32_t offset = (headless ? 2u : 1u);
-		for (uint32_t i = offset; i < tokencount; i++) {
+		for (uint16_t i = 1u; i < tokencount; i++) {
 			const uint32_t hexnum = hex(tokenlist[i], 0);
 			if (hexnum > 0xFF) {
 				printf("Invalid byte '%s'\n", tokenlist[i]);
 				return;
 			}
-			buffer[i - offset] = hexnum;
+			buffer[i - 1u] = hexnum;
 		}
 		printf("%04X:", 0xFFE0u);
-		for (uint32_t i = 0; i < tokencount - offset; i++) {
-			read_registers[REGISTER_SNIPPET_OFFSET + i] = buffer[i];
-			printf(" %02X", read_registers[REGISTER_SNIPPET_OFFSET + i]);
+		for (uint16_t i = 0; i < tokencount - 1u; i++) {
+			reg[REGISTER_SNIPPET_OFFSET + i] = buffer[i];
+			printf(" %02X", static_cast<uint8_t>(reg[REGISTER_SNIPPET_OFFSET + i]));
 		}
 		printf("\n");
-		read_registers16[REGISTER_VECTOR_RESET_OFFSET / 2] = reverse_2_bytes(REGISTER_SNIPPET);
-		if (headless)
-			MC6809.start_headless();
-		else
-			MC6809.start();
-	} else if (strcasecmp(tokenlist[0], "vec") == 0) {
-		uint16_t temp[8];
-		if (tokencount != 9u) {
-			printf("Usage:\n\n> vec <vec0> ... <vec7>\n\n");
+		reg[REGISTER_VECTOR_RESET_OFFSET] = REGISTER_SNIPPET;
+		MC6809.start();
+	}
+	break;
+	case VECTOR: {
+		static constexpr uint16_t vector_count = 8u;
+		uint16_t temp[vector_count];
+		if (tokencount != vector_count + 1u) {
+			printf("Usage:\n\n> vector <vec0> ... <vec7>\n\n");
 			return;
 		}
-		for (int i = 1; i < tokencount; i++) {
+		for (int i = 0; i < vector_count; i++) {
 			const uint32_t hexnum = hex(tokenlist[i], 0);
 			if (hexnum > 0xFFFF) {
 				printf("Invalid address '%s'\n", tokenlist[i]);
 				return;
 			}
-			temp[i - 1] = hexnum;
+			temp[i] = hexnum;
 		}
 		printf("%04X:", 0xFFF0u);
-		for (uint32_t i = 0; i < 8; i++) {
-			read_registers16[REGISTER_VECTORS_OFFSET / 2 + i] = reverse_2_bytes(temp[i]);
-			printf(" %04X", reverse_2_bytes(read_registers16[REGISTER_VECTORS_OFFSET/2 + i]));
+		for (uint16_t i = 0; i < 8; i++) {
+			reg[REGISTER_VECTORS_OFFSET + 2u*i] = temp[i];
+			printf(" %04X", static_cast<uint16_t>(reg[REGISTER_VECTORS_OFFSET + 2u*i]));
 		}
 		printf("\n");
-	} else if (strcasecmp(tokenlist[0], "fill") == 0) {
-		if (tokencount != 4u) {
-			printf("Usage:\n\n> fill <start> <end> <value>\n\n");
+	}
+	break;
+	case FILL: {
+		if (tokencount != 3u && tokencount != 4u) {
+			printf("Usage:\n\n> fill <start> <end> [ <value> ]\n\n");
 			return;
 		}
 		uint32_t hexnum = hex(tokenlist[1], 0);
@@ -1022,22 +760,26 @@ process_command(char *buf)
 			return;
 		}
 		uint16_t end = hexnum;
-		hexnum = hex(tokenlist[3], 0);
-		if (hexnum > 0xFF) {
-			printf("Invalid fill byte '%s'\n", tokenlist[3]);
+		uint8_t filler;
+		if (tokencount > 3u) {
+			hexnum = hex(tokenlist[3], 0);
+			if (hexnum > 0xFF) {
+				printf("Invalid fill byte '%s'\n", tokenlist[3]);
+				return;
+			}
+			filler = hexnum;
+		} else
+			filler = 0x00u;
+		if (!MC6809.assert_stopped())
 			return;
-		}
-		const uint8_t filler = hexnum;
-		uint32_t size = end - start;
-		uint32_t s = MIN(size, BUFFER_SIZE);
-		memset(buffer, filler, s);
-		while (size > 0u) {
-			copy(OUTWARDS, s, start, buffer);
-			start += s;
-			size -= s;
-			s = MIN(size, BUFFER_SIZE);
-		}
-	} else if (strcasecmp(tokenlist[0], "time") == 0) {
+		snippet_copy(BLOCK_FILL);
+		reg[REGISTER_SNIPPET_OFFSET + 1u] = filler;
+		reg[REGISTER_SNIPPET_OFFSET + 3u] = start;
+		reg[REGISTER_SNIPPET_OFFSET + 8u] = end;
+		MC6809.start_with_timeout(10000u, true);
+	}
+	break;
+	case TIME: {
 		if (tokencount > 7u) {
 			printf("Usage:\n\n> time [ <Year> [ <Mon> [ <Day> [ <Hour> [ <Min> [ <Sec> ] ] ] ] ] ]\n\n");
 			return;
@@ -1104,43 +846,26 @@ process_command(char *buf)
 		if (tokencount > 1)
 			aon_timer_set_time_calendar(&tm);
 		print_time();
-	} else if (strcasecmp(tokenlist[0], "go") == 0) {
-		bool headless = false;
-		if (tokencount >= 4u) {
-			printf("Usage:\n\n> go [ h ] [ <start> ]\n\n");
+	}
+	break;
+	case GO: {
+		if (tokencount >= 3u) {
+			printf("Usage:\n\n> go [ <start> ]\n\n");
 			return;
 		}
 		if (tokencount == 2) {
-			if (strcasecmp(tokenlist[1], "h") == 0)
-				headless = true;
-			else {
-				const uint32_t hexnum = hex(tokenlist[1], 0);
-				if (hexnum > 0xFFFF) {
-					printf("Invalid hex start address '%s'\n", tokenlist[1]);
-					return;
-				}
-				const uint16_t start = hexnum;
-				read_registers16[REGISTER_VECTOR_RESET_OFFSET / 2] = reverse_2_bytes(start);
-			}
-		} else if (tokencount == 3u) {
-			if (strcasecmp(tokenlist[1], "h") != 0) {
-				printf("Usage:\n\n> go [ h ] [ <start> ]\n\n");
-				return;
-			}
-			headless = true;
-			const uint32_t hexnum = hex(tokenlist[2], 0);
+			const uint32_t hexnum = hex(tokenlist[1], 0);
 			if (hexnum > 0xFFFF) {
-				printf("Invalid hex start address '%s'\n", tokenlist[2]);
+				printf("Invalid hex start address '%s'\n", tokenlist[1]);
 				return;
 			}
 			const uint16_t start = hexnum;
-			read_registers16[REGISTER_VECTOR_RESET_OFFSET / 2] = reverse_2_bytes(start);
+			reg[REGISTER_VECTOR_RESET_OFFSET] = start;
 		}
-		if (headless)
-			MC6809.start_headless();
-		else
-			MC6809.start();
-	} else if (strcasecmp(tokenlist[0], "task") == 0) {
+		MC6809.start();
+	}
+	break;
+	case TASK: {
 		uint8_t task = MC6809.task;
 		if (tokencount > 2u) {
 			printf("Usage:\n\n> task [ <tasknum> ]\n\n");
@@ -1156,7 +881,9 @@ process_command(char *buf)
 			task = MC6809.task_change(task);
 		}
 		printf("Task = %u\n", task);
-	} else if (strcasecmp(tokenlist[0], "irq") == 0) {
+	}
+	break;
+	case IRQ: {
 		if (tokencount != 2u) {
 			printf("Usage:\n\n> irq 1|2|3|4|5\n\n");
 			return;
@@ -1168,18 +895,24 @@ process_command(char *buf)
 		}
 		if (!MC6809.assert_stopped())
 			return;
+		for (int i = 0; i < 16; i++) {
+			registers::write(REGISTER_BUFFER_OFFSET + i) = static_cast<uint8_t>(0x00);
+			reg[REGISTER_BUFFER_OFFSET + i] = static_cast<uint8_t>(0x00);
+		}
+		for (int i = 0; i < 16; i += 2)
+			reg[REGISTER_VECTORS_OFFSET + i] = static_cast<uint16_t>(0x0000);
 		if (hexnum == 1) {
 			printf("SWI Test\n");
 			snippet_copy(TEST_SWI);
-			read_registers16[REGISTER_VECTOR_SWI_OFFSET / 2] = reverse_2_bytes(REGISTER_SNIPPET);
-			MC6809.start_headless();
+			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 14);
+			MC6809.start();
 			printf("SWI: Check that the MC6809 has finished and that the stack frame is OK\n");
 		} else if (hexnum == 2) {
 			printf("NMI Test\n");
 			uint32_t timeout = 0u;
 			snippet_copy(TEST_NMI);
-			read_registers16[REGISTER_VECTOR_NMI_OFFSET / 2] = reverse_2_bytes(REGISTER_SNIPPET);
-			MC6809.start_headless();
+			reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
+			MC6809.start();
 			sleep_us(100u);
 			ASSERT_NMI;
 			while (MC6809.bus_state.state != BS_SYNC) {
@@ -1194,8 +927,8 @@ process_command(char *buf)
 			printf("IRQ Test\n");
 			uint32_t timeout = 0u;
 			snippet_copy(TEST_IRQ);
-			read_registers16[REGISTER_VECTOR_IRQ_OFFSET / 2] = reverse_2_bytes(REGISTER_SNIPPET);
-			MC6809.start_headless();
+			reg[REGISTER_VECTOR_IRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
+			MC6809.start();
 			sleep_us(100u);
 			ASSERT_IRQ;
 			while (MC6809.bus_state.state != BS_SYNC) {
@@ -1210,8 +943,8 @@ process_command(char *buf)
 			printf("FIRQ Test\n");
 			uint32_t timeout = 0u;
 			snippet_copy(TEST_FIRQ);
-			read_registers16[REGISTER_VECTOR_FIRQ_OFFSET / 2] = reverse_2_bytes(REGISTER_SNIPPET);
-			MC6809.start_headless();
+			reg[REGISTER_VECTOR_FIRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
+			MC6809.start();
 			sleep_us(100u);
 			ASSERT_FIRQ;
 			while (MC6809.bus_state.state != BS_SYNC) {
@@ -1224,17 +957,21 @@ process_command(char *buf)
 			printf("FIRQ: Check that the MC6809 has finished and that the stack frame is OK\n");
 		} else {
 			printf("RTI Test\n");
-			static uint8_t stack[12] = {
+			static constexpr uint16_t stack_len = 16u;
+			static uint8_t stack[stack_len] = {
 				0xD0, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x90, 0xFF, 0xE6
 			};
-			for (uint32_t i = 0; i < sizeof(stack); i++)
-				read_registers[REGISTER_BUFFER_OFFSET + 4 + i] = stack[i];
+			for (uint16_t i = 0; i < stack_len; i++)
+				reg[REGISTER_BUFFER_OFFSET + 4 + i] = stack[i];
 			snippet_copy(TEST_RTI);
-			MC6809.start_headless();
+			MC6809.start();
 			printf("RTI: Check that the MC6809 has finished and that the stack frame is OK\n");
 		}
-#ifdef DEBUG
-	} else if (strcasecmp(tokenlist[0], "trace") == 0) {
+	}
+	break;
+	case TRACE:
+#ifdef DEBUG_NOT_NOW
+	{
 		if (tokencount > 2u) {
 			printf("Usage:\n\n> trace [<len>]\n\n");
 			return;
@@ -1260,18 +997,28 @@ process_command(char *buf)
 				       run_state_string[trace[i][2] & 0x0F],
 				       trace[i][3]);
 			}
+	}
+	break;
+#else
+		printf("To enable trace, build with DEBUG defined\n\n");
+		break;
 #endif
-	} else if (strcasecmp(tokenlist[0], "run") == 0) {
-		if (tokencount > 2u) {
-			printf("Usage:\n\n> r [ <snippetnum>|<chunknum> ]\n\n");
+	case RUN: {
+		if (tokencount > 3u || tokencount < 1u) {
+			printf("Usage:\n\n> run [ <snippetnum>|<chunknum> ] [ ! ]\n\n");
 			return;
 		}
 		if (tokencount == 1u) {
-			for (uint32_t i = DAT_INIT; i < SNIPPET_LEN; i++)
-				printf("%2x: %s\n", i, snippet_string[i]);
-			for (uint32_t i = 0; i < CHUNK_LEN; i++)
-				printf("%2x: %s\n", i + SNIPPET_LEN, chunk_string[i]);
+			for (uint16_t i = DAT_INIT; i < SNIPPET_LEN; i++)
+				printf("%d: %s\n", i, snippet_string[i]);
+			for (uint16_t i = 0; i < CHUNK_LEN; i++)
+				printf("%d: %s\n", i + SNIPPET_LEN, chunk_string[i]);
 			return;
+		}
+		bool stop = true;
+		if (tokencount == 3u) {
+			if (strncmp(tokenlist[2], "!", 1u) == 0)
+				stop = false;
 		}
 		uint32_t hexnum = hex(tokenlist[1], 0);
 		snippet snippet_num;
@@ -1288,17 +1035,22 @@ process_command(char *buf)
 			snippet_num = static_cast<snippet>(hexnum);
 		if (MC6809.assert_stopped()) {
 			if (snippet_num < SNIPPET_LEN) {
-				printf("Running headless snippet %u = %s\n", snippet_num, snippet_string[snippet_num]);
+				printf("Running snippet %u = %s\n", snippet_num, snippet_string[snippet_num]);
 				snippet_copy(snippet_num);
-				MC6809.start_headless();
 			} else {
 				printf("Running chunk %u = %s\n", chunk_num, chunk_string[chunk_num]);
 				copy(OUTWARDS, chunk_len[chunk_num], 0x0130u, chunk_code[chunk_num]);
-				read_registers16[REGISTER_VECTOR_RESET_OFFSET / 2] = reverse_2_bytes(0x0130u);
-				MC6809.start();
+				reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
 			}
-		}
-	} else if (strcasecmp(tokenlist[0], "stop") == 0) {
+		} else
+			return;
+		if (stop)
+			MC6809.start_with_timeout(1000u, true);
+		else
+			MC6809.start();
+	}
+	break;
+	case STOP: {
 		if (tokencount < 1u || tokencount > 2u) {
 			printf("Usage:\n\n> stop [halt|restart|stop]\n\n");
 			return;
@@ -1315,7 +1067,9 @@ process_command(char *buf)
 			else
 				printf("Usage:\n\n> stop [halt|restart|stop]\n\n");
 		}
-	} else if (strcasecmp(tokenlist[0], "freq") == 0) {
+	}
+	break;
+	case FREQ: {
 		if (tokencount != 2u) {
 			printf("Usage:\n\n> freq <freqMHz>\n\n");
 			return;
@@ -1329,17 +1083,32 @@ process_command(char *buf)
 			printf("Frequency %f out of range [0.8 .. 3.0]\n", mhz);
 			return;
 		}
-		MC6809.set_e_frequency(mhz);
+		MC6809.set_e_frequency(mhz, pio_clock);
 		printf("Set E to %.1f MHz\n", MC6809.get_e_frequency());
-	} else if (strcasecmp(tokenlist[0], "reset") == 0) {
+	}
+	break;
+	case RESET: {
 		if (tokencount != 1u) {
 			printf("Usage:\n\n> reset\n\n");
 			return;
 		}
 		peripheral_clear(false);
-	} else if (tokenlist[0][0] == 'S') {
+	}
+	break;
+	case USB: {
+		if (tokencount < 2u) {
+			printf("Usage:\n\n> usb ... \n\n");
+			return;
+		}
+		for (unsigned i = 1; i < tokencount; i++) {
+			snprintf(reinterpret_cast<char *>(buffer), 64u, "%s\r\n", tokenlist[i]);
+			usb_cdc_write(buffer, strlen(reinterpret_cast<char *>(buffer)));
+		}
+	}
+	break;
+	case S19: {
 		if (tokencount != 1u) {
-			printf("Usage:\n\nThis should be a valid S0, S1, S5 or S9 record\n\n");
+			printf("Usage:\n\nThis should be a single valid S0, S1, S5 or S9 record\n\n");
 			return;
 		}
 		uint8_t count;
@@ -1348,7 +1117,7 @@ process_command(char *buf)
 		if (process_srecord(tokenlist[0], &count, &address, buffer, &checksum)) {
 			if (tokenlist[0][1] == '0') {
 				printf("S0 data = \"");
-				for (uint32_t i = 0; i < count - 3; i++) {
+				for (uint16_t i = 0; i < count - 3; i++) {
 					const uint8_t c = buffer[i];
 					printf("%c", isprint(c) ? c : ' ');
 				}
@@ -1357,50 +1126,54 @@ process_command(char *buf)
 				if (verbose) {
 					printf("S1 address = %04X, length = %u\n", address, count);
 					printf("%04X:", address);
-					for (uint32_t i = 0; i < count - 3; i++)
+					for (uint16_t i = 0; i < count - 3; i++)
 						printf(" %02X", buffer[i]);
 					printf("\n");
 				}
-				if (address < 0xFE00)
+				if (address < 0xFE00) // Don't mess with the DAT RAM or the Pico-supplied registers
 					copy(OUTWARDS, count - 3u, address, buffer);
-				else
-					for (uint32_t i = 0; i < count - 3; i++)
-						read_registers[REGISTER_INDEX(address + i)] = buffer[i];
+				else if (address >= 0xFFF0) // Allow the reset and interrupt vectors to be set up
+					for (uint16_t i = 0; i < count - 3; i++)
+						reg[address + i] = buffer[i];
 			} else if (tokenlist[0][1] == '5') {
 				if (verbose)
 					printf("S5 record count = %u\n", address);
 			} else if (tokenlist[0][1] == '9') {
 				if (verbose)
 					printf("S9 start = %04X\n", address);
-				read_registers16[REGISTER_VECTOR_RESET_OFFSET / 2] = reverse_2_bytes(address);
+				reg[REGISTER_VECTOR_RESET_OFFSET] = address;
 			}
 		} else
-			printf("Cannot parse S record\n");
-	} else
-		printf("Unrecognised command!\n");
+			printf("Invalid S record\n");
+	}
+	break;
+	}
 }
 
-#define PROMPT ">>> "
+static volatile bool core1_initialised = false;
+
 #define COMMAND_BUFFER_LEN 128u
+
+static constexpr char prompt[] =  ">>> ";
+
 static void
-poll_console_and_bus()
+poll_console()
 {
 	static char buf[COMMAND_BUFFER_LEN];
 	static int idx = 0;
 	static bool prompted = false;
 	absolute_time_t next_usb = get_absolute_time();
 
+	while (!core1_initialised) {
+		sleep_ms(1u);
+		usb_poll();
+	}
+
+	print_time();
+
 	for (;;) {
-		// The MC6809 might be running, so don't do the command processing,
-		// instead hand over the console to the MC6809 observer.
-		if (MC6809.try_loop()) {
-			// We are coming out of an interactive session
-			putchar('\n');
-			prompted = false;
-			idx = 0u;
-		}
 		if (!prompted) {
-			printf(PROMPT);
+			printf(prompt);
 			prompted = true;
 		}
 		const int ch = getchar_timeout_us(0);
@@ -1426,14 +1199,15 @@ poll_console_and_bus()
 			}
 		}
 
-		// Keep cranking the USB handle
+
 		// Run TinyUSB service task every 1 ms (non-blocking)
 		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			optional_usb_poll();
+			usb_poll();
 			next_usb = make_timeout_time_ms(1u);
 		}
-		fast_serial.task(&write_registers[CONSOLE_CONTROL], &read_registers[CONSOLE_STATUS]);
-		sysreq_process();
+		MC6809.uart_task();
+		//fast_serial.task(registers::write(CONSOLE_CONTROL), &reg[CONSOLE_STATUS], &reg[CONSOLE_RX_DATA]);
+		//sysreq_process();
 	}
 }
 
@@ -1451,11 +1225,11 @@ static bool tick_irq[2] = {false, false};
 void
 tick_initialise()
 {
-	read_registers[SYSTEM_TIMER_STATUS] = 0u;
+	reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(0u);
 	tick_timer[0] = 0u;
-	read_registers16[SYSTEM_TIMER_COUNTERS / 2 + 0] = reverse_2_bytes(tick_timer[0]);
+	reg[SYSTEM_TIMER_COUNTERS + 0u] = tick_timer[0];
 	tick_timer[1] = 0u;
-	read_registers16[SYSTEM_TIMER_COUNTERS / 2 + 1] = reverse_2_bytes(tick_timer[1]);
+	reg[SYSTEM_TIMER_COUNTERS + 2u] = tick_timer[1];
 	tick_enabled[0] = false;
 	tick_enabled[1] = false;
 	tick_irq[0] = false;
@@ -1465,13 +1239,13 @@ tick_initialise()
 void
 tick_task()
 {
-	for (uint32_t i = 0; i < 2; i++) {
+	for (uint16_t i = 0; i < 2; i++) {
 		if (tick_timer[i] && tick_enabled[i]) {
-			read_registers16[SYSTEM_TIMER_COUNTERS / 2 + i] = reverse_2_bytes(--tick_timer[i]);
+			reg[SYSTEM_TIMER_COUNTERS + 2*i] = --tick_timer[i];
 			if (tick_timer[i] == 0) {
-				tick_irq[i] = write_registers[SYSTEM_TIMER_CONTROL] >> (i * 4) & TIMER_IRQ;
+				tick_irq[i] = registers::write(SYSTEM_TIMER_CONTROL) >> (i*4) & TIMER_IRQ;
 				if (tick_irq[i])
-					read_registers[SYSTEM_TIMER_STATUS] |= TIMER_IRQ << (4 * i);
+					reg[SYSTEM_TIMER_STATUS] |= static_cast<uint8_t>((TIMER_IRQ << (4 * i)));
 			}
 		}
 	}
@@ -1480,7 +1254,7 @@ tick_task()
 interrupt
 tick_has_interrupt()
 {
-	for (uint32_t i = 0; i < 2; i++)
+	for (uint16_t i = 0; i < 2; i++)
 		if (tick_irq[i] && tick_enabled[i])
 			return INTERRUPT_IRQ;
 	return INTERRUPT_NONE;
@@ -1491,18 +1265,18 @@ __no_inline_not_in_flash_func(main_core1)()
 {
 	printf("Pico2 MC6809E core1 process starting\n");
 
-	init_pins_range(GPIO_TRACE_G, 5); // OINQUE DEBUG trace pins - isr set
-	gpio_set_dir_out_masked64(0b11111LLu << GPIO_TRACE_G);
+	init_pins_range(GPIO_TRACE_G, 4); // OINQUE DEBUG trace pins - isr set
+	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_G);
 
 	MC6809.init();
 	printf("Pico2 MC6809E guest initialised\n");
 
-	fast_serial.reset(&read_registers[CONSOLE_STATUS]);
+	fast_serial.reset();
 	printf("Pico2 MC6809E console initialised/reset\n");
 
 	pio_sm_set_enabled(pio_clock.pio, pio_clock.sm, true);
 	printf("Pico2 MC6809E E/Q clocks started\n");
-	MC6809.set_e_frequency(GUEST_CLK_DEFAULT);
+	MC6809.set_e_frequency(GUEST_CLK_DEFAULT, pio_clock);
 	printf("Pico2 MC6809E E/Q clock set to %.1f MHz\n", MC6809.get_e_frequency());
 
 	gpio_add_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
@@ -1516,7 +1290,7 @@ __no_inline_not_in_flash_func(main_core1)()
 	irq_set_enabled(piodma_read.irq, true);
 	dma_channel_set_irq0_enabled(piodma_read.data_channel, true);
 	dma_channel_start(piodma_read.address_channel);
-	pio_sm_put(piodma_read.pio, piodma_read.sm, reinterpret_cast<uintptr_t>(read_registers) >> 6); // Six bits for A0-5
+	pio_sm_put(piodma_read.pio, piodma_read.sm, registers::read_address() >> 6); // Six bits for A0-5
 	printf("Pico2 MC6809E Main read DMA chain configured\n");
 
 	irq_set_exclusive_handler(piodma_write.irq, dma_bus_write_irq_handler);
@@ -1524,7 +1298,7 @@ __no_inline_not_in_flash_func(main_core1)()
 	irq_set_enabled(piodma_write.irq, true);
 	dma_channel_set_irq1_enabled(piodma_write.data_channel, true);
 	dma_channel_start(piodma_write.address_channel);
-	pio_sm_put(piodma_write.pio, piodma_write.sm, reinterpret_cast<uintptr_t>(write_registers) >> 6); // Six bits for A0-5
+	pio_sm_put(piodma_write.pio, piodma_write.sm, registers::write_address() >> 6); // Six bits for A0-5
 	printf("Pico2 MC6809E Main write DMA chain configured\n");
 
 	pio_sm_set_enabled(piodma_read.pio, piodma_read.sm, true);
@@ -1541,23 +1315,23 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	printf("Pico2 MC6809E core1 process started\n");
 
+	core1_initialised = true;
+
 	for (;;) {
 		if (absolute_time_diff_us(get_absolute_time(), next_tick) <= 0) {
-			tick_task(); // handles system millisecond clock ticks
+			// tick_task(); // handles system millisecond clock ticks
 			next_tick = make_timeout_time_ms(1u);
 		}
 
 		// For actions that may take more than one E clock cycle, provide
 		// e.g. an "Avail" bit, and set this when the action is done.
 
-		// Get copies of the otherwise more expensive volatile flags
-		bool action_write = write_irq_received;
-		bool action_read = read_irq_received;
-
-		if (action_write || action_read) {
-			static uint32_t interrupt_refcount[NUM_INTERRUPTS];
+		if (q_falling_edge) {
+			q_falling_edge = false;
+			static uint16_t interrupt_refcount[NUM_INTERRUPTS];
 			interrupt eirq;
-			gpio_put(GPIO_TRACE_F, true);
+			//gpio_put(GPIO_TRACE_F, true);
+			fast_serial.task();
 			interrupt_refcount[INTERRUPT_NONE] = 0;
 			interrupt_refcount[INTERRUPT_NMI] = 0;
 			interrupt_refcount[INTERRUPT_FIRQ] = 0;
@@ -1566,266 +1340,268 @@ __no_inline_not_in_flash_func(main_core1)()
 			eirq = tick_has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
+#ifdef DEBUG_NOT_NOW
+			if (eirq != INTERRUPT_NONE)
+				printf("i:%u\n", eirq);
+#endif
 			interrupt_refcount[eirq]++;
 			// ENDFOR
 			if (interrupt_refcount[INTERRUPT_NMI] > 0)
-				assert_interrupt(INTERRUPT_NMI);
+				MC6809.assert_interrupt(INTERRUPT_NMI);
 			else
-				deassert_interrupt(INTERRUPT_NMI);
+				MC6809.deassert_interrupt(INTERRUPT_NMI);
 			if (interrupt_refcount[INTERRUPT_FIRQ] > 0)
-				assert_interrupt(INTERRUPT_FIRQ);
+				MC6809.assert_interrupt(INTERRUPT_FIRQ);
 			else
-				deassert_interrupt(INTERRUPT_FIRQ);
+				MC6809.deassert_interrupt(INTERRUPT_FIRQ);
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0)
-				assert_interrupt(INTERRUPT_IRQ);
+				MC6809.assert_interrupt(INTERRUPT_IRQ);
 			else
-				deassert_interrupt(INTERRUPT_IRQ);
-			gpio_put(GPIO_TRACE_F, false);
+				MC6809.deassert_interrupt(INTERRUPT_IRQ);
+			//gpio_put(GPIO_TRACE_F, false);
+		}
 
-			if (action_write) {
-				gpio_put(GPIO_TRACE_F, true);
-				write_irq_received = false;
-				const uint8_t loc = write_location;
-				const uint8_t written_byte = write_registers[loc];
-				switch (loc) {
+		if (write_irq_received) {
+			//gpio_put(GPIO_TRACE_F, true);
+			write_irq_received = false;
+			const uint8_t loc = write_location;
+			const uint8_t written_byte = (uint8_t)registers::write(loc);
+			switch (loc) {
+			default:
+				break;
+
+			case SYSTEM_TASK: // Task reg for DAT/MMU
+				// TODO: MarkM - Don't allow tasks other than zero to do this!
+				reg[SYSTEM_TASK] = MC6809.task_change(written_byte);
+				break;
+
+			case SYSTEM_REQUEST:
+				if (reg[SYSTEM_REQUEST_RESPONSE] == RESPONSE_BUSY) {
+					// ignore request
+					registers::write(SYSTEM_REQUEST) = (uint8_t)reg[SYSTEM_REQUEST];
+					break;
+				}
+				switch (written_byte) {
 				default:
+					registers::write(SYSTEM_REQUEST) = reg[SYSTEM_REQUEST] = REQUEST_NULL;
+					reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNKNOWN;;
 					break;
-
-				case SYSTEM_TASK: // Task register for DAT/MMU
-					// TODO: MarkM - Don't allow tasks other than zero to do this!
-					read_registers[SYSTEM_TASK] = MC6809.task_change(written_byte);
+				case REQUEST_TIME:
+				case REQUEST_SETTIME:
+				case REQUEST_MOUNT:
+				case REQUEST_UNMOUNT:
+					reg[SYSTEM_REQUEST_STATUS] = registers::write(SYSTEM_REQUEST);
+					reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_BUSY;
 					break;
-
-				case SYSTEM_REQUEST:
-					if (read_registers[SYSTEM_REQUEST_RESPONSE] == RESPONSE_BUSY) {
-						// ignore request
-						write_registers[SYSTEM_REQUEST] = read_registers[SYSTEM_REQUEST];
-						break;
-					}
-					switch (written_byte) {
+				case REQUEST_FLOAT:
+					switch (registers::write(SYSTEM_SUBREQUEST)) {
 					default:
-						write_registers[SYSTEM_REQUEST] = read_registers[SYSTEM_REQUEST] = REQUEST_NULL;
-						read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNKNOWN;;
+						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_UNKNOWN;
+						reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_NULL;
 						break;
-					case REQUEST_TIME:
-					case REQUEST_SETTIME:
-					case REQUEST_MOUNT:
-					case REQUEST_UNMOUNT:
-						read_registers[SYSTEM_REQUEST_STATUS] = write_registers[SYSTEM_REQUEST];
-						read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_BUSY;
-						break;
-					case REQUEST_FLOAT:
-						switch (write_registers[SYSTEM_SUBREQUEST]) {
-						default:
-							read_registers[SYSTEM_REQUEST_STATUS] = RESPONSE_UNKNOWN;
-							read_registers[SYSTEM_REQUEST_RESPONSE] = RESPONSE_NULL;
-							break;
-						case FLOAT_ADD: {
-							float a = reverse_float(REGISTER_BUFFER_OFFSET + 0);
-							float b = reverse_float(REGISTER_BUFFER_OFFSET + 4);
-							float c = a + b;
-							reverse_set_float(REGISTER_BUFFER_OFFSET + 0, c);
-							read_registers[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-							read_registers[SYSTEM_REQUEST_RESPONSE] = c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000);
-							break;
-						}
-						case FLOAT_SUBTRACT: {
-							float a = reverse_float(REGISTER_BUFFER_OFFSET + 0);
-							float b = reverse_float(REGISTER_BUFFER_OFFSET + 4);
-							float c = a - b;
-							reverse_set_float(REGISTER_BUFFER_OFFSET + 0, c);
-							read_registers[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-							read_registers[SYSTEM_REQUEST_RESPONSE] = c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000);
-							break;
-						}
-						case FLOAT_MULTIPLY: {
-							float a = reverse_float(REGISTER_BUFFER_OFFSET + 0);
-							float b = reverse_float(REGISTER_BUFFER_OFFSET + 4);
-							float c = a*b;
-							reverse_set_float(REGISTER_BUFFER_OFFSET + 0, c);
-							read_registers[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-							read_registers[SYSTEM_REQUEST_RESPONSE] = c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000);
-							break;
-						}
-						case FLOAT_DIVIDE: {
-							float a = reverse_float(REGISTER_BUFFER_OFFSET + 0);
-							float b = reverse_float(REGISTER_BUFFER_OFFSET + 4);
-							float c = a/b;
-							reverse_set_float(REGISTER_BUFFER_OFFSET + 0, c);
-							read_registers[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-							read_registers[SYSTEM_REQUEST_RESPONSE] = c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000);
-							break;
-						}
-						}
+					case FLOAT_ADD: {
+						float a = reg[REGISTER_BUFFER_OFFSET + 0];
+						float b = reg[REGISTER_BUFFER_OFFSET + 4];
+						float c = a + b;
+						reg[REGISTER_BUFFER_OFFSET + 0] = c;
+						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
+						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
 						break;
 					}
+					case FLOAT_SUBTRACT: {
+						float a = reg[REGISTER_BUFFER_OFFSET + 0];
+						float b = reg[REGISTER_BUFFER_OFFSET + 4];
+						float c = a - b;
+						reg[REGISTER_BUFFER_OFFSET + 0] = c;
+						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
+						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
+						break;
+					}
+					case FLOAT_MULTIPLY: {
+						float a = reg[REGISTER_BUFFER_OFFSET + 0];
+						float b = reg[REGISTER_BUFFER_OFFSET + 4];
+						float c = a*b;
+						reg[REGISTER_BUFFER_OFFSET + 0] = c;
+						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
+						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
+						break;
+					}
+					case FLOAT_DIVIDE: {
+						float a = reg[REGISTER_BUFFER_OFFSET + 0];
+						float b = reg[REGISTER_BUFFER_OFFSET + 4];
+						float c = a/b;
+						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
+						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
+						break;
+					}
+					}
 					break;
+				}
+				break;
 
-				case SYSTEM_SUBREQUEST:
-					// TODO: MarkM - implement finer-grained sysreqs
-					break;
+			case SYSTEM_SUBREQUEST:
+				// TODO: MarkM - implement finer-grained sysreqs
+				break;
 
-				case SYSTEM_TIMER_CONTROL:
-					read_registers[SYSTEM_TIMER_STATUS] = 0x00u;
-					for (uint32_t i = 0; i < 2; i++)
-						tick_irq[i] = false;
-					break;
+			case SYSTEM_TIMER_CONTROL:
+				reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(0x00u);
+				for (uint16_t i = 0; i < 2; i++)
+					tick_irq[i] = false;
+				break;
 
-				case SYSTEM_TIMER_COUNTERS + 0:
-					break;
-				case SYSTEM_TIMER_COUNTERS + 1:
-					tick_timer[0] = reverse_2_bytes(write_registers16[SYSTEM_TIMER_COUNTERS/2]);
+			case SYSTEM_TIMER_COUNTERS + 0:
+				break;
+			case SYSTEM_TIMER_COUNTERS + 1:
+				tick_timer[0] = registers::write(SYSTEM_TIMER_COUNTERS);
 
-				case SYSTEM_TIMER_COUNTERS + 2:
-					break;
-				case SYSTEM_TIMER_COUNTERS + 3:
-					tick_timer[1] = reverse_2_bytes(write_registers16[SYSTEM_TIMER_COUNTERS/2 + 1]);
-					break;
+			case SYSTEM_TIMER_COUNTERS + 2:
+				break;
+			case SYSTEM_TIMER_COUNTERS + 3:
+				tick_timer[1] = registers::write(SYSTEM_TIMER_COUNTERS + 2u);
+				break;
 
-				case CONSOLE_CONTROL: // UART command
+			case CONSOLE_CONTROL: // UART command
 #ifdef DEBUG
-					UART_CONTROL_COUNT++;
+				if (written_byte & CONSOLE_C_RESET) {
+					UART_CONTROL_COUNT = 0u;
+					UART_TX_DATA_COUNT = 0u;
+					UART_STATUS_COUNT = 0u;
+					UART_RX_DATA_COUNT = 0u;
+				}
+				UART_CONTROL_COUNT++;
 #endif
-					write_registers[CONSOLE_CONTROL] = fast_serial.guest_control(written_byte, &read_registers[CONSOLE_STATUS]);
-					// Tx IRQ will fire when Tx queue is not full
-					// Rx IRQ will fire when Rx queue is not empty
-					// Each IRQ is cleared by reading (Rx) or writing (Tx) the relevant queues.
-					// They may be set again if the relevant queues are still available
-					// ISR's should read/write as much as possible while in interrupt context.
-					break;
+				fast_serial.guest_control();
+				break;
 
-				case CONSOLE_TX_DATA: // UART tx data
+			case CONSOLE_TX_DATA: // UART tx data
 #ifdef DEBUG
-					UART_TX_DATA_COUNT++;
+				UART_TX_DATA_COUNT++;
 #endif
-					fast_serial.guest_send(written_byte, &read_registers[CONSOLE_STATUS]);
-					break;
+				fast_serial.guest_transmit();
+				break;
 
-				case REGISTER_BUFFER_OFFSET + 0x00:
-				case REGISTER_BUFFER_OFFSET + 0x01:
-				case REGISTER_BUFFER_OFFSET + 0x02:
-				case REGISTER_BUFFER_OFFSET + 0x03:
-				case REGISTER_BUFFER_OFFSET + 0x04:
-				case REGISTER_BUFFER_OFFSET + 0x05:
-				case REGISTER_BUFFER_OFFSET + 0x06:
-				case REGISTER_BUFFER_OFFSET + 0x07:
-				case REGISTER_BUFFER_OFFSET + 0x08:
-				case REGISTER_BUFFER_OFFSET + 0x09:
-				case REGISTER_BUFFER_OFFSET + 0x0A:
-				case REGISTER_BUFFER_OFFSET + 0x0B:
-				case REGISTER_BUFFER_OFFSET + 0x0C:
-				case REGISTER_BUFFER_OFFSET + 0x0D:
-				case REGISTER_BUFFER_OFFSET + 0x0E:
-				case REGISTER_BUFFER_OFFSET + 0x0F:
-					// This is a shared block of emulated RAM for
-					// moving around blocks of data. Copy the byte from
-					// the WRITEs location to its READs mirror.
-					read_registers[loc] = written_byte;
-					break;
+			case REGISTER_BUFFER_OFFSET + 0x00:
+			case REGISTER_BUFFER_OFFSET + 0x01:
+			case REGISTER_BUFFER_OFFSET + 0x02:
+			case REGISTER_BUFFER_OFFSET + 0x03:
+			case REGISTER_BUFFER_OFFSET + 0x04:
+			case REGISTER_BUFFER_OFFSET + 0x05:
+			case REGISTER_BUFFER_OFFSET + 0x06:
+			case REGISTER_BUFFER_OFFSET + 0x07:
+			case REGISTER_BUFFER_OFFSET + 0x08:
+			case REGISTER_BUFFER_OFFSET + 0x09:
+			case REGISTER_BUFFER_OFFSET + 0x0A:
+			case REGISTER_BUFFER_OFFSET + 0x0B:
+			case REGISTER_BUFFER_OFFSET + 0x0C:
+			case REGISTER_BUFFER_OFFSET + 0x0D:
+			case REGISTER_BUFFER_OFFSET + 0x0E:
+			case REGISTER_BUFFER_OFFSET + 0x0F:
+				// This is a shared block of emulated RAM for
+				// moving around blocks of data. Copy the byte from
+				// the WRITEs location to its READs mirror.
+				reg[loc] = written_byte;
+				break;
 
-				case REGISTER_SNIPPET_OFFSET + 0x00:
-				case REGISTER_SNIPPET_OFFSET + 0x01:
-				case REGISTER_SNIPPET_OFFSET + 0x02:
-				case REGISTER_SNIPPET_OFFSET + 0x03:
-				case REGISTER_SNIPPET_OFFSET + 0x04:
-				case REGISTER_SNIPPET_OFFSET + 0x05:
-				case REGISTER_SNIPPET_OFFSET + 0x06:
-				case REGISTER_SNIPPET_OFFSET + 0x07:
-				case REGISTER_SNIPPET_OFFSET + 0x08:
-				case REGISTER_SNIPPET_OFFSET + 0x09:
-				case REGISTER_SNIPPET_OFFSET + 0x0A:
-				case REGISTER_SNIPPET_OFFSET + 0x0B:
-				case REGISTER_SNIPPET_OFFSET + 0x0C:
-				case REGISTER_SNIPPET_OFFSET + 0x0D:
-				case REGISTER_SNIPPET_OFFSET + 0x0E:
-				case REGISTER_SNIPPET_OFFSET + 0x0F:
+			case REGISTER_SNIPPET_OFFSET + 0x00:
+			case REGISTER_SNIPPET_OFFSET + 0x01:
+			case REGISTER_SNIPPET_OFFSET + 0x02:
+			case REGISTER_SNIPPET_OFFSET + 0x03:
+			case REGISTER_SNIPPET_OFFSET + 0x04:
+			case REGISTER_SNIPPET_OFFSET + 0x05:
+			case REGISTER_SNIPPET_OFFSET + 0x06:
+			case REGISTER_SNIPPET_OFFSET + 0x07:
+			case REGISTER_SNIPPET_OFFSET + 0x08:
+			case REGISTER_SNIPPET_OFFSET + 0x09:
+			case REGISTER_SNIPPET_OFFSET + 0x0A:
+			case REGISTER_SNIPPET_OFFSET + 0x0B:
+			case REGISTER_SNIPPET_OFFSET + 0x0C:
+			case REGISTER_SNIPPET_OFFSET + 0x0D:
+			case REGISTER_SNIPPET_OFFSET + 0x0E:
+			case REGISTER_SNIPPET_OFFSET + 0x0F:
+			// Use this block as write-only memory for debugging. The MC6809
+			// may write useful debugging info here.
+
+			case REGISTER_VECTORS_OFFSET + 0x00:
+			case REGISTER_VECTORS_OFFSET + 0x01:
+			case REGISTER_VECTORS_OFFSET + 0x02:
+			case REGISTER_VECTORS_OFFSET + 0x03:
+			case REGISTER_VECTORS_OFFSET + 0x04:
+			case REGISTER_VECTORS_OFFSET + 0x05:
+			case REGISTER_VECTORS_OFFSET + 0x06:
+			case REGISTER_VECTORS_OFFSET + 0x07:
+			case REGISTER_VECTORS_OFFSET + 0x08:
+			case REGISTER_VECTORS_OFFSET + 0x09:
+			case REGISTER_VECTORS_OFFSET + 0x0A:
+			case REGISTER_VECTORS_OFFSET + 0x0B:
+			case REGISTER_VECTORS_OFFSET + 0x0C:
+			case REGISTER_VECTORS_OFFSET + 0x0D:
+			case REGISTER_VECTORS_OFFSET + 0x0E:
+			case REGISTER_VECTORS_OFFSET + 0x0F:
 				// Use this block as write-only memory for debugging. The MC6809
 				// may write useful debugging info here.
+				break;
+			}
+			//gpio_put(GPIO_TRACE_F, false);
+		} // if (write_irq_received)
 
-				case REGISTER_VECTORS_OFFSET + 0x00:
-				case REGISTER_VECTORS_OFFSET + 0x01:
-				case REGISTER_VECTORS_OFFSET + 0x02:
-				case REGISTER_VECTORS_OFFSET + 0x03:
-				case REGISTER_VECTORS_OFFSET + 0x04:
-				case REGISTER_VECTORS_OFFSET + 0x05:
-				case REGISTER_VECTORS_OFFSET + 0x06:
-				case REGISTER_VECTORS_OFFSET + 0x07:
-				case REGISTER_VECTORS_OFFSET + 0x08:
-				case REGISTER_VECTORS_OFFSET + 0x09:
-				case REGISTER_VECTORS_OFFSET + 0x0A:
-				case REGISTER_VECTORS_OFFSET + 0x0B:
-				case REGISTER_VECTORS_OFFSET + 0x0C:
-				case REGISTER_VECTORS_OFFSET + 0x0D:
-				case REGISTER_VECTORS_OFFSET + 0x0E:
-				case REGISTER_VECTORS_OFFSET + 0x0F:
-					// Use this block as write-only memory for debugging. The MC6809
-					// may write useful debugging info here.
-					break;
+		if (read_irq_received) {
+			//gpio_put(GPIO_TRACE_F, true);
+			read_irq_received = false;
+			const uint8_t loc = read_location;
+			switch (loc) {
+			default:
+				// The MC6809 got whatever byte was here. By default, do nothing else.
+				break;
+
+			case SYSTEM_TASK:
+				// Will be set by writing to this address
+				break;
+
+			case SYSTEM_REQUEST_RESPONSE:
+				// Will be set by the sysreq processor
+				break;
+
+			case SYSTEM_TIMER_STATUS:
+				break;
+			case SYSTEM_TIMER_COUNTERS + 0:
+				break;
+			case SYSTEM_TIMER_COUNTERS + 1:
+				if (reg[SYSTEM_TIMER_COUNTERS] == static_cast<uint16_t>(0u)) {
+					tick_irq[0] = false;
+					if (registers::write(SYSTEM_TIMER_CONTROL) & TIMER_REPEAT)
+						tick_timer[0] = registers::write(SYSTEM_TIMER_COUNTERS);
+					reg[SYSTEM_TIMER_STATUS] &= static_cast<uint8_t>(~TIMER_IRQ);
 				}
-				gpio_put(GPIO_TRACE_F, false);
-			} // if (action_write)
-
-			if (action_read) {
-				gpio_put(GPIO_TRACE_F, true);
-				read_irq_received = false;
-				const uint8_t loc = read_location;
-				switch (loc) {
-				default:
-					// The MC6809 got whatever byte was here. By default, do nothing else.
-					break;
-
-				case SYSTEM_TASK:
-					// Will be set by writing to this address
-					break;
-
-				case SYSTEM_REQUEST_RESPONSE:
-					// Will be set by the sysreq processor
-					break;
-
-				case SYSTEM_TIMER_STATUS:
-					break;
-				case SYSTEM_TIMER_COUNTERS + 0:
-					break;
-				case SYSTEM_TIMER_COUNTERS + 1:
-					if (read_registers16[SYSTEM_TIMER_COUNTERS / 2] == 0) {
-						tick_irq[0] = false;
-						if (write_registers[SYSTEM_TIMER_CONTROL] & TIMER_REPEAT)
-							tick_timer[0] = reverse_2_bytes(
-								write_registers16[SYSTEM_TIMER_COUNTERS/2]);
-						read_registers[SYSTEM_TIMER_STATUS] &= ~TIMER_IRQ;
-					}
-					break;
-				case SYSTEM_TIMER_COUNTERS + 2:
-					break;
-				case SYSTEM_TIMER_COUNTERS + 3:
-					if (read_registers16[SYSTEM_TIMER_COUNTERS / 2 + 1] == 0) {
-						tick_irq[1] = false;
-						if ((write_registers[SYSTEM_TIMER_CONTROL] >> 4) & TIMER_REPEAT)
-							tick_timer[1] = reverse_2_bytes(
-								write_registers16[SYSTEM_TIMER_COUNTERS/2 + 1]);
-						read_registers[SYSTEM_TIMER_STATUS] &= ~(TIMER_IRQ << 4);
-					}
-					break;
-
-				case CONSOLE_STATUS: // UART status
-#ifdef DEBUG
-					UART_STATUS_COUNT++;
-#endif
-					// Bits in this byte are
-					// TX_IRQ, 0, TX_ERROR, TX_AVAIL, RX_IRQ, 0, RX_ERROR, RX_AVAIL
-					break;
-
-				case CONSOLE_RX_DATA: // UART Rx data
-#ifdef DEBUG
-					UART_RX_DATA_COUNT++;
-#endif
-					read_registers[CONSOLE_RX_DATA] = fast_serial.guest_receive(&read_registers[CONSOLE_STATUS]);
-					break;
+				break;
+			case SYSTEM_TIMER_COUNTERS + 2:
+				break;
+			case SYSTEM_TIMER_COUNTERS + 3:
+				if (reg[SYSTEM_TIMER_COUNTERS + 2u] == static_cast<uint16_t>(0u)) {
+					tick_irq[1] = false;
+					if (registers::write((SYSTEM_TIMER_CONTROL) >> 4) & TIMER_REPEAT)
+						tick_timer[1] = registers::write(SYSTEM_TIMER_COUNTERS + 2u);
+					reg[SYSTEM_TIMER_STATUS] &= static_cast<uint8_t>(~(TIMER_IRQ << 4));
 				}
-				gpio_put(GPIO_TRACE_F, false);
-			} // if (action_read)
-		}         // if (action_write || action_read)
-	}                 // for(;;)
+				break;
+
+			case CONSOLE_STATUS: // UART status
+#ifdef DEBUG
+				UART_STATUS_COUNT++;
+#endif
+				fast_serial.guest_status();
+				break;
+
+			case CONSOLE_RX_DATA: // UART Rx data
+#ifdef DEBUG
+				UART_RX_DATA_COUNT++;
+#endif
+				// The guest already got the byte, now get the next one
+				fast_serial.guest_receive();
+				break;
+			}
+			//gpio_put(GPIO_TRACE_F, false);
+		} // if (read_irq_received)
+	} // for(;;)
 }
 
 static void
@@ -1905,10 +1681,8 @@ bus_pio_dma_init()
 	dma_channel_configure(
 		piodma_read.data_channel,
 		&read_out_dma,
-		&piodma_read.pio->txf[piodma_read.sm],
-		// dst
-		read_registers,
-		// src - will be overwritten by the below DMA
+		&piodma_read.pio->txf[piodma_read.sm],	// dst
+		nullptr,				// src - will be overwritten by the below DMA
 		dma_encode_transfer_count(1),
 		false);
 	printf("Pico2 MC6809E DMA read_out channel configured\n");
@@ -1923,10 +1697,8 @@ bus_pio_dma_init()
 	dma_channel_configure(
 		piodma_read.address_channel,
 		&read_address_dma,
-		&dma_channel_hw_addr(piodma_read.data_channel)->read_addr,
-		// dst
-		&piodma_read.pio->rxf[piodma_read.sm],
-		// src
+		&dma_channel_hw_addr(piodma_read.data_channel)->read_addr,	// dst
+		&piodma_read.pio->rxf[piodma_read.sm],				// src
 		dma_encode_transfer_count(1),
 		false);
 	printf("Pico2 MC6809E DMA read_address channel configured\n");
@@ -1967,10 +1739,8 @@ bus_pio_dma_init()
 	dma_channel_configure(
 		piodma_write.data_channel,
 		&write_in_dma,
-		&write_registers,
-		// dst - will be overwritten by the below DMA
-		&piodma_write.pio->rxf[piodma_write.sm],
-		// src
+		nullptr,					// dst - will be overwritten by the below DMA
+		&piodma_write.pio->rxf[piodma_write.sm],	// src
 		dma_encode_transfer_count(1),
 		false);
 	printf("Pico2 MC6809E DMA write_in channel configured\n");
@@ -1985,10 +1755,8 @@ bus_pio_dma_init()
 	dma_channel_configure(
 		piodma_write.address_channel,
 		&write_address_dma,
-		&dma_channel_hw_addr(piodma_write.data_channel)->write_addr,
-		// dst
-		&piodma_write.pio->rxf[piodma_write.sm],
-		// src
+		&dma_channel_hw_addr(piodma_write.data_channel)->write_addr,	// dst
+		&piodma_write.pio->rxf[piodma_write.sm],			// src
 		dma_encode_transfer_count(1),
 		false);
 	printf("Pico2 MC6809E DMA write_address channel configured\n");
@@ -1998,15 +1766,15 @@ bus_pio_dma_init()
 static void
 measure_freqs()
 {
-	uint32_t f_pll_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_SYS_CLKSRC_PRIMARY) / 1000;
-	uint32_t f_pll_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY) / 1000;
+	uint32_t f_pll_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_SYS_CLKSRC_PRIMARY)/1000;
+	uint32_t f_pll_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY)/1000;
 	uint32_t f_rosc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_ROSC_CLKSRC);
-	uint32_t f_clk_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS) / 1000;
-	uint32_t f_clk_peri = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_PERI) / 1000;
-	uint32_t f_clk_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_USB) / 1000;
-	uint32_t f_clk_adc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_ADC) / 1000;
+	uint32_t f_clk_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS)/1000;
+	uint32_t f_clk_peri = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_PERI)/1000;
+	uint32_t f_clk_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_USB)/1000;
+	uint32_t f_clk_adc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_ADC)/1000;
 #ifdef CLOCKS_FC0_SRC_VALUE_CLK_RTC
-uint32_t f_clk_rtc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_RTC);
+	uint32_t f_clk_rtc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_RTC);
 #endif
 	printf("pll_sys  = %d MHz\n", f_pll_sys);
 	printf("pll_usb  = %d MHz\n", f_pll_usb);
@@ -2018,7 +1786,7 @@ uint32_t f_clk_rtc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_RTC);
 #ifdef CLOCKS_FC0_SRC_VALUE_CLK_RTC
 	printf("clk_rtc  = %d kHz\n", f_clk_rtc);
 #endif
-// Can't measure clk_ref / xosc as it is the ref
+// Can't measure clk_ref/xosc as it is the ref
 }
 #endif
 
@@ -2036,13 +1804,13 @@ main()
 	printf("Pico2 MC6809E build with DEBUG defined\n");
 #endif
 
-	printf("Pico2 MC6809E raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT / 1000000);
+	printf("Pico2 MC6809E raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
 	if (set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
 		stdio_init_all();
 		uart_init(CONSOLE, CONSOLE_BAUDRATE);
 		printf("successful!\n");
 	} else {
-		printf("unsuccessful! Reverting to %d MHz ... ", SYS_CLK_HZ / 1000000);
+		printf("unsuccessful! Reverting to %d MHz ... ", SYS_CLK_HZ/1000000);
 		set_sys_clock_hz(SYS_CLK_HZ, true);
 		stdio_init_all();
 		uart_init(CONSOLE, CONSOLE_BAUDRATE);
@@ -2050,6 +1818,9 @@ main()
 	}
 	printf("Pico2 MC6809E console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
+	adc_init();
+	adc_gpio_init(GPIO_POWER_ADC);
+	adc_set_temp_sensor_enabled(true);
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
@@ -2081,13 +1852,13 @@ main()
 	sleep_ms(10);
 	printf("Pico2 MC6809E external power on.\n");
 
-	optional_usb_init();
+	usb_init();
 	printf("Pico2 MC6809E initialised USB\n");
 
 	clock_pio_init();
 	bus_pio_dma_init();
 	peripheral_clear(true);
-	printf("Pico2 MC6809E emulated RAM and read_registers initialised\n");
+	printf("Pico2 MC6809E emulated RAM and reg initialised\n");
 
 	multicore_launch_core1(main_core1);
 
@@ -2095,9 +1866,7 @@ main()
 	aon_timer_stop();
 	aon_timer_start_calendar(&tm);
 
-	print_time();
-
 	printf("Pico2 MC6809E ready!\n");
 
-	poll_console_and_bus();
+	poll_console();
 }

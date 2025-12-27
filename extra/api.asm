@@ -33,6 +33,15 @@ D@0	STA	,X+
 	BNE	D@0
 	SYNC
 
+* Fill a block of memory with a constant byte
+Fill	ORG	START
+	LDA	#$AA	This value will be replaced by the Pico
+	LDX	#$BBBB	This starting address will be replaced by the Pico
+F@0	STA	,X+
+	CMPX	#$CCCC	This terminal address will be replaced by the Pico
+	BNE	F@0
+	SYNC
+
 * Used by the Pico2 to copy up to 16 bytes of data to the 6809's
 * main memory.
 	ORG	START
@@ -120,7 +129,7 @@ d@1	COM	,X+
 	BNE	d@1
 	BRA	d@0
 
-* Set up the SWI vector to point to the ISR1 address, then chect that
+* Set up the SWI vector to point to the ISR1 address, then check that
 * the stack frame is populated and that the sync is hit.
 	ORG	START
 TstSwi	LDS	#START
@@ -281,6 +290,8 @@ Cont	NOP
 
 	ORG	$0000
 	FCC	"DAT_INIT"
+	FCB	' '
+	FCC	"BLOCK_FILL"
 	FCB	' '
 	FCC	"COPY_OUT"
 	FCB	' '

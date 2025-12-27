@@ -1,15 +1,14 @@
-/* optional_usb.c – FreeBSD style */
+/* usb.c – FreeBSD style */
 
 #include "hardware/clocks.h"
 #include "pico/stdlib.h"
 #include "bsp/board.h"
 #include "tusb.h"
-#include "optional_usb.h"
-//#include "uart.h"
+#include "usb.h"
 
 // --- USB optional init / force enumeration ---
 void
-optional_usb_init(void)
+usb_init(void)
 {
 	// Brief delay for host detection (macOS especially)
 	sleep_ms(100);
@@ -24,9 +23,8 @@ optional_usb_init(void)
 
 	// Check USB clock frequency
 	uint usb_freq = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY);
-	printf("USB clock frequency: %u kHz\n", usb_freq);
 	if (usb_freq != 48000)
-		printf("ERROR: USB clock is not 48MHz\n");
+		printf("ERROR: USB clock is %u kHz and not 48000 kHz\n",usb_freq);
 
 	// TinyUSB device stack
 	tusb_rhport_init_t dev_init = {
@@ -49,6 +47,7 @@ optional_usb_init(void)
 	sleep_ms(50);
 }
 
+#ifdef USB_DEBUG
 static void
 cdc_loopback(void)
 {
@@ -65,6 +64,37 @@ cdc_loopback(void)
 			tud_cdc_write_flush();
 		}
 	}
+}
+#endif
+
+
+// Called when the user sends serial data down the Pico's main USB/Power route.
+// Hand the virtual UART to the guest CPU.
+uint16_t
+usb_cdc_read(uint8_t *buf, const uint16_t buf_len)
+{
+	if (!tud_cdc_connected())
+		return 0u;
+
+	if (tud_cdc_available() > 0)
+		return tud_cdc_read(buf, buf_len);
+	return 0u;
+}
+
+uint16_t
+usb_cdc_write(const uint8_t *buf, const uint16_t buf_len)
+{
+	uint16_t ret_val = 0u;
+	if (!tud_cdc_connected())
+		return 0u;
+	if (!tud_cdc_ready())
+		return 0u;
+
+	if (buf_len > 0) {
+		ret_val = tud_cdc_write(buf, buf_len);
+		tud_cdc_write_flush();
+	}
+	return ret_val;
 }
 
 /* Called when device mounted (enumerated) */
@@ -85,8 +115,6 @@ tud_umount_cb(void)
 
 static absolute_time_t g_next_originate;
 
-// Called when the user sends serial data down the Pico's main USB/Power route.
-// Hand the virtual UART to the guest CPU.
 void
 tud_vendor_rx_cb(uint8_t itf, uint8_t const *buf, uint16_t bufsize)
 {
@@ -137,15 +165,19 @@ vendor_maybe_originate(void)
 }
 
 void
-optional_usb_poll(void)
+usb_poll(void)
 {
 	tud_task();
+	// Keep cranking the USB handle I'm waiting for DTR and RTS.
+	//connected = (tud_cdc_get_line_state() & 0x03u) == 0x03u;
+#ifdef USB_DEBUG
 	cdc_loopback();
 	vendor_maybe_originate();
+#endif
 }
 
 bool
-optional_usb_is_active(void)
+usb_is_active(void)
 {
 	return (tud_ready());
 }

@@ -5,14 +5,17 @@ project(pico-mc6809 C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+add_compile_definitions(DEBUG)
+
 pico_sdk_init()
 
 add_executable(pico-mc6809
 		src/mc6809.cpp
+		src/processor.cpp
 		src/srec.cpp
 		src/uart.cpp
 		src/usb_descriptors.c
-		src/optional_usb.c
+		src/usb.c
 )
 
 # Include both the project headers and generated ones
@@ -56,6 +59,7 @@ target_link_libraries(pico-mc6809
 	pico_multicore
 	pico_aon_timer
 	pico_unique_id
+	hardware_adc
 	hardware_dma
 	hardware_irq
 	hardware_pio

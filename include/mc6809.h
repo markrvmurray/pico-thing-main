@@ -7,20 +7,9 @@
 #ifndef PICO_MC6809_H
 #define PICO_MC6809_H
 
-#include <cstdint>
-
 #define DEVICE_VERSION "vX.X.x"
 
-#define DEBUG
-
-#define stringify(a) x_stringify(a)
-#define x_stringify(a) #a
-
-#define enum_list(e) e,
-#define enum_list_strings(s) #s,
-
-#define reverse_2_bytes(x) __builtin_bswap16(x)
-#define reverse_4_bytes(x) __builtin_bswap32(x)
+extern volatile bool verbose;
 
 // === Pin map ===
 enum {
@@ -67,212 +56,178 @@ enum {
 	GPIO_TRACE_C = 44, // [Y] [o]  Temporary debugging output pins for the scope
 	GPIO_TRACE_D = 45, // [Y] [o]  Temporary debugging output pins for the scope
 	GPIO_TRACE_E = 46, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_F = 47, // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_POWER_ADC = 47, // [Y] [i]  ADC connected to the 5v line, divided by 2
 };
 
-enum interrupt {
-	INTERRUPT_ILLEGAL,
-	INTERRUPT_SWI3,
-	INTERRUPT_SWI2,
-	INTERRUPT_FIRQ,
-	INTERRUPT_IRQ,
-	INTERRUPT_SWI,
-	INTERRUPT_NMI,
-	INTERRUPT_RESET,
-	INTERRUPT_NONE,
-	NUM_INTERRUPTS
-};
-#define foreach_busstate(busstate) \
-busstate(BS_RUNNING)       \
-busstate(BS_IRQ)           \
-busstate(BS_SYNC)          \
-busstate(BS_HALT)          \
-busstate(BS_RUNNING_RESET) \
-busstate(BS_IRQ_RESET)     \
-busstate(BS_SYNC_RESET)    \
-busstate(BS_HALT_RESET)
-
-enum ba_bs {
-	foreach_busstate(enum_list)
-	BUS_STATE_COUNT
-};
-
-union ba_bs_u {
-	uint8_t byte;
-	struct {
-		uint8_t BS: 1;
-		uint8_t BA: 1;
-		uint8_t RESET: 1;
-		uint8_t : 5;
-	} bit;
-	enum ba_bs state;
-};
-
-#define foreach_runstate(runstate) \
-runstate(RS_STARTED) \
-runstate(RS_INTERRUPTED) \
-runstate(RS_HALTED) \
-runstate(RS_SYNCED) \
-runstate(RS_STOPPED) \
-runstate(RS_HEADLESS_STARTED) \
-runstate(RS_HEADLESS_INTERRUPTED) \
-runstate(RS_HEADLESS_HALTED) \
-runstate(RS_HEADLESS_SYNCED) \
-runstate(RS_HEADLESS_STOPPED)
-
-enum run_state {
-	foreach_runstate(enum_list)
-	RUN_STATE_COUNT
-};
-
-union BLA {
-	struct {
-		uint8_t BUSY: 1;
-		uint8_t LIC: 1;
-		uint8_t AVMA: 1;
-		uint8_t : 5;
-	} bit;
-	uint8_t byte;
-};
-
-class processor {
-private:
-	volatile ba_bs_u old_bus_state{};
-	volatile ba_bs_u bus_state{};
-	volatile enum run_state run_state;
-	volatile BLA busy_lic_avma{};
-	volatile uint8_t task;
-	volatile uint32_t task_stack_ptr;
-	volatile bool busy, lic, vma;
-#ifdef DEBUG
-	volatile uint32_t _count_lic;
-#endif
-	float e_freq;
-	void task_initialise();
-	void setup(enum run_state rs);
-public:
-	void set_busy_lic_avma(uint8_t value) { busy_lic_avma.byte = value; }
-	[[nodiscard]] uint8_t get_busy_lic_avma() const { return busy_lic_avma.byte; }
-	void unpack_busy_lic_avma() { busy = busy_lic_avma.bit.BUSY; lic = busy_lic_avma.bit.LIC; vma = busy_lic_avma.bit.AVMA; }
-	[[nodiscard]] bool get_busy() const { return busy; }
-	[[nodiscard]] bool get_lic() const { return lic; }
-	[[nodiscard]] bool get_vma() const { return vma; }
-	void clear_lic_count() { _count_lic = 0u; }
-	[[nodiscard]] uint32_t get_lic_count() const { return _count_lic; }
-	void count_lic() { if (lic) _count_lic++; }
-	processor();
-	void init();
-	uint8_t task_change(uint8_t new_task);
-
-	[[nodiscard]] bool assert_stopped() const;
-	[[nodiscard]] uint8_t task_get() const;
-	void start();
-	void start_headless();
-	void start_with_timeout(uint32_t timeout_ms);
-	void stop();
-	void halt();
-	void release();
-	bool try_loop();
-	void set_e_frequency(float target_mhz);
-	[[nodiscard]] float get_e_frequency() const;
-	friend void gpio_clock_eq_irq_handler();
-	friend void dma_bus_read_irq_handler();
-	friend void dma_bus_write_irq_handler();
-	friend void process_command(char *buf);
-};
 
 void init_pins_range(uint8_t base, uint8_t count);
 
+struct pio_dma {
+	PIO pio;
+	int sm;
+	int address_channel;
+	int data_channel;
+	uint32_t irq;
+};
+
+class registers {
+	static constexpr uint16_t register_length = 64u;
+	__scratch_y("")
+	__attribute__((aligned(register_length)))
+	inline static volatile uint8_t read_registers[register_length];
+	__scratch_y("")
+	__attribute__((aligned(register_length)))
+	inline static volatile uint8_t write_registers[register_length];
+	// This is a singleton class
+	registers() = default; // no public constructor
+	~registers() = default; // no public destructor
+	inline static registers* instance = nullptr;
+	struct ReadProxy {
+		size_t i;
+		operator uint8_t() const { return read_registers[i]; }
+		explicit operator uint16_t() const { return __builtin_bswap16(*reinterpret_cast<volatile uint16_t*>(&read_registers[i])); }
+		explicit operator float() const { uint32_t u = __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(&read_registers[i])); float f; std::memcpy(&f,&u,sizeof f); return f; }		ReadProxy& operator=(volatile uint8_t v){ read_registers[i] = v; return *this; }
+		ReadProxy& operator=(uint16_t v) { *reinterpret_cast<volatile uint16_t*>(&read_registers[i]) = __builtin_bswap16(v); return *this; }
+		ReadProxy& operator=(float v) { uint32_t u; std::memcpy(&u, &v, sizeof u); *reinterpret_cast<volatile uint32_t*>(&read_registers[i]) = __builtin_bswap32(u); return *this; }
+		bool operator==(uint8_t v) const { return read_registers[i] == v; }
+		bool operator==(uint16_t v) const { return *reinterpret_cast<volatile uint16_t*>(&read_registers[i]) == __builtin_bswap16(v); }
+		bool operator==(float v) const { uint32_t u = __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(&read_registers[i])); float f; std::memcpy(&f,&u,sizeof f); return f == v; }
+		ReadProxy& operator&=(uint8_t v) { read_registers[i] &= v; return *this; }
+		ReadProxy& operator&=(uint16_t v) { auto* p = reinterpret_cast<volatile uint16_t*>(&read_registers[i]); *p &= __builtin_bswap16(v); return *this; }
+		ReadProxy& operator|=(uint8_t v) { read_registers[i] |= v; return *this; }
+		ReadProxy& operator|=(uint16_t v) { auto* p = reinterpret_cast<volatile uint16_t*>(&read_registers[i]); *p |= __builtin_bswap16(v); return *this; }
+		// volatile uint8_t* operator&() const { return &read_registers[i]; }
+		// uint8_t operator&(uint8_t v) const { return static_cast<uint8_t>(*this) & v; }
+	};
+	struct WriteProxy {
+		uint16_t i;
+		volatile uint8_t* wbuf;
+		operator uint8_t() const { return wbuf[i]; }
+		explicit operator uint16_t() const { return __builtin_bswap16(*reinterpret_cast<volatile uint16_t*>(&wbuf[i])); }
+		WriteProxy& operator=(uint8_t v) { wbuf[i] = v; return *this; }
+		WriteProxy& operator=(uint16_t v) { *reinterpret_cast<volatile uint16_t*>(&wbuf[i]) = __builtin_bswap16(v); return *this; }
+		[[nodiscard]] volatile uint8_t* address(uint16_t index) const { return wbuf + index; }
+	};
+
+public:
+	static registers& getInstance() { if (!instance) { instance = new registers(); } return *instance; }
+	registers(const registers&) = delete;
+	registers& operator=(const registers&) = delete;
+	ReadProxy operator[](uint16_t i) const { return ReadProxy{static_cast<uint16_t>(i&(register_length - 1))}; }
+	static WriteProxy write(uint16_t i) { return WriteProxy{static_cast<uint16_t>(i&(register_length - 1)), write_registers}; }
+	static void clear() { for (uint16_t i = 0; i < register_length; i++) read_registers[i] = write_registers[i] = 0u; }
+	static void copy_in(uint16_t addr, const uint8_t *src, uint16_t len);
+	static void copy_out(uint8_t *dst, uint16_t addr, uint16_t len);
+	static uintptr_t read_address() { return reinterpret_cast<uintptr_t>(read_registers); }
+	static uintptr_t write_address() { return reinterpret_cast<uintptr_t>(write_registers); }
+};
+
+extern registers &reg;
+
+// Chunks are like snippets, except they are too big for snippet space, so they go into RAM
+#define	CHUNK_ADDRESS	uint16_t(0x0130u)
 // === Device addresses ===
-#define REGISTER_BASE 0xFFC0u
+#define REGISTER_BASE	uint16_t(0xFFC0u)
 
-#define REGISTER_INDEX(addr) ((addr) & 0x3Fu)
+#define ADDRESS(index)	uint16_t(REGISTER_BASE + index)
 
-#define REGISTER_DEVICES_OFFSET 0
-#define REGISTER_DEVICES (REGISTER_BASE + REGISTER_DEVICES_OFFSET)
-#define REGISTER_BUFFER_OFFSET 16
-#define REGISTER_BUFFER (REGISTER_BASE + REGISTER_BUFFER_OFFSET)
-#define REGISTER_SNIPPET_OFFSET 32
-#define REGISTER_SNIPPET (REGISTER_BASE + REGISTER_SNIPPET_OFFSET)
-#define REGISTER_VECTORS_OFFSET 48
-#define REGISTER_VECTORS (REGISTER_BASE + REGISTER_VECTORS_OFFSET)
+#define REGISTER_DEVICES_OFFSET uint16_t(0)
+#define REGISTER_DEVICES uint16_t(REGISTER_BASE + REGISTER_DEVICES_OFFSET)
+#define REGISTER_BUFFER_OFFSET uint16_t(16)
+#define REGISTER_BUFFER uint16_t(REGISTER_BASE + REGISTER_BUFFER_OFFSET)
+#define REGISTER_SNIPPET_OFFSET uint16_t(32)
+#define REGISTER_SNIPPET uint16_t(REGISTER_BASE + REGISTER_SNIPPET_OFFSET)
+#define REGISTER_VECTORS_OFFSET uint16_t(48)
+#define REGISTER_VECTORS uint16_t(REGISTER_BASE + REGISTER_VECTORS_OFFSET)
 
-#define REGISTER_VECTOR_RESERVED (REGISTER_VECTORS + 0)
-#define REGISTER_VECTOR_RESERVED_OFFSET (REGISTER_VECTORS_OFFSET + 0)
-#define REGISTER_VECTOR_SWI3 (REGISTER_VECTORS + 2)
-#define REGISTER_VECTOR_SWI3_OFFSET (REGISTER_VECTORS_OFFSET + 2)
-#define REGISTER_VECTOR_SWI2 (REGISTER_VECTORS + 4)
-#define REGISTER_VECTOR_SWI2_OFFSET (REGISTER_VECTORS_OFFSET + 4)
-#define REGISTER_VECTOR_FIRQ (REGISTER_VECTORS + 6)
-#define REGISTER_VECTOR_FIRQ_OFFSET (REGISTER_VECTORS_OFFSET + 6)
-#define REGISTER_VECTOR_IRQ (REGISTER_VECTORS + 8)
-#define REGISTER_VECTOR_IRQ_OFFSET (REGISTER_VECTORS_OFFSET + 8)
-#define REGISTER_VECTOR_SWI (REGISTER_VECTORS + 10)
-#define REGISTER_VECTOR_SWI_OFFSET (REGISTER_VECTORS_OFFSET + 10)
-#define REGISTER_VECTOR_NMI (REGISTER_VECTORS + 12)
-#define REGISTER_VECTOR_NMI_OFFSET (REGISTER_VECTORS_OFFSET + 12)
-#define REGISTER_VECTOR_RESET (REGISTER_VECTORS + 14)
-#define REGISTER_VECTOR_RESET_OFFSET (REGISTER_VECTORS_OFFSET + 14)
+#define REGISTER_VECTOR_RESERVED uint16_t(REGISTER_VECTORS + 0)
+#define REGISTER_VECTOR_RESERVED_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 0)
+#define REGISTER_VECTOR_SWI3 uint16_t(REGISTER_VECTORS + 2)
+#define REGISTER_VECTOR_SWI3_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 2)
+#define REGISTER_VECTOR_SWI2 uint16_t(REGISTER_VECTORS + 4)
+#define REGISTER_VECTOR_SWI2_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 4)
+#define REGISTER_VECTOR_FIRQ uint16_t(REGISTER_VECTORS + 6)
+#define REGISTER_VECTOR_FIRQ_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 6)
+#define REGISTER_VECTOR_IRQ uint16_t(REGISTER_VECTORS + 8)
+#define REGISTER_VECTOR_IRQ_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 8)
+#define REGISTER_VECTOR_SWI uint16_t(REGISTER_VECTORS + 10)
+#define REGISTER_VECTOR_SWI_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 10)
+#define REGISTER_VECTOR_NMI uint16_t(REGISTER_VECTORS + 12)
+#define REGISTER_VECTOR_NMI_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 12)
+#define REGISTER_VECTOR_RESET uint16_t(REGISTER_VECTORS + 14)
+#define REGISTER_VECTOR_RESET_OFFSET uint16_t(REGISTER_VECTORS_OFFSET + 14)
 
 // System registers relative to REGISTER_DEVICES
-#define SYSTEM_TASK		0x00u
+#define SYSTEM_TASK		uint16_t(0x00u)
 
-#define SYSTEM_REQUEST		0x01u // Write-only
-#define SYSTEM_REQUEST_STATUS	0x01u // Read-only
-#define SYSTEM_SUBREQUEST	0x02u // Write-only
-#define SYSTEM_REQUEST_RESPONSE	0x02u // Read-only
+#define SYSTEM_REQUEST		uint16_t(0x01u) // Write-only
+#define SYSTEM_REQUEST_STATUS	uint16_t(0x01u) // Read-only
+#define SYSTEM_SUBREQUEST	uint16_t(0x02u) // Write-only
+#define SYSTEM_REQUEST_RESPONSE	uint16_t(0x02u) // Read-only
 
-#define SYSTEM_TIMER_CONTROL	0x03u // Write-only
-#define SYSTEM_TIMER_STATUS	0x03u // Read-only
-#define SYSTEM_TIMER_COUNTERS	0x04u // 4/5 and 6/7 are used
+#define SYSTEM_TIMER_CONTROL	uint16_t(0x03u) // Write-only
+#define SYSTEM_TIMER_STATUS	uint16_t(0x03u) // Read-only
+#define SYSTEM_TIMER_COUNTERS	uint16_t(0x04u) // 4/5 and 6/7 are used
 
 // Task register bits
 #define NUM_TASK_PINS		5
 #define	TASK_PINS_MASK		0b00011111u
 
 // System request opcodes
-#define	REQUEST_NULL		0x00u
-#define REQUEST_TIME		'T'
-#define REQUEST_SETTIME		't'
-#define REQUEST_MOUNT		'M'
-#define REQUEST_UNMOUNT		'm'
-#define REQUEST_FLOAT		'R'
+#define	REQUEST_NULL		uint8_t(0x00u)
+#define REQUEST_TIME		uint8_t('T')
+#define REQUEST_SETTIME		uint8_t('t')
+#define REQUEST_MOUNT		uint8_t('M')
+#define REQUEST_UNMOUNT		uint8_t('m')
+#define REQUEST_FLOAT		uint8_t('R')
 
 // System status values
-#define	RESPONSE_NULL		0x00u
-#define	RESPONSE_DONE		0x01u
-#define	RESPONSE_BUSY		0x7Fu
-#define RESPONSE_UNKNOWN	0xFFu
-#define	RESPONSE_UNAVAILABLE	0xFDu
+#define	RESPONSE_NULL		uint8_t(0x00u)
+#define	RESPONSE_DONE		uint8_t(0x01u)
+#define	RESPONSE_BUSY		uint8_t(0x7Fu)
+#define RESPONSE_UNKNOWN	uint8_t(0xFFu)
+#define	RESPONSE_UNAVAILABLE	uint8_t(0xFDu)
 
 // Floating-point requests
-#define FLOAT_ADD		'+'
-#define FLOAT_SUBTRACT		'-'
-#define FLOAT_MULTIPLY		'*'
-#define FLOAT_DIVIDE		'/'
+#define FLOAT_ADD		uint8_t('+')
+#define FLOAT_SUBTRACT		uint8_t('-')
+#define FLOAT_MULTIPLY		uint8_t('*')
+#define FLOAT_DIVIDE		uint8_t('/')
 
 // System timer control/status bits
-#define TIMER_IRQ		0b00000001u
-#define TIMER_ENABLED		0b00000010u
-#define TIMER_REPEAT		0b00000100u
+#define TIMER_IRQ		uint8_t(0b00000001u)
+#define TIMER_ENABLED		uint8_t(0b00000010u)
+#define TIMER_REPEAT		uint8_t(0b00000100u)
 
 // Emulated UART
 // UART registers relative to REGISTER_DEVICES
-#define CONSOLE_CONTROL		0x08u
-#define CONSOLE_STATUS		0x08u
-#define CONSOLE_TX_DATA		0x09u
-#define CONSOLE_RX_DATA		0x09u
+#define CONSOLE_CONTROL		uint16_t(0x08u)
+#define CONSOLE_STATUS		uint16_t(0x08u)
+#define CONSOLE_TX_DATA		uint16_t(0x09u)
+#define CONSOLE_RX_DATA		uint16_t(0x09u)
+
 // UART register bits
-#define CONSOLE_NONE		0b00000000u
-#define CONSOLE_TX_MASK		0b11110000u
-#define CONSOLE_TX_AVAIL	0b00010000u
-#define CONSOLE_TX_ERROR	0b00100000u
-#define CONSOLE_TX_IRQ		0b10000000u
-#define CONSOLE_RX_MASK		0b00001111u
-#define CONSOLE_RX_AVAIL	0b00000001u
-#define CONSOLE_RX_ERROR	0b00000010u
-#define CONSOLE_RX_IRQ		0b00001000u
+#define CONSOLE_NONE		uint8_t(0b00000000u)
+// Control (write)
+#define CONSOLE_C_NONE_0	uint8_t(0b00000001u)
+#define CONSOLE_C_TX_IRQ	uint8_t(0b00000010u)
+#define CONSOLE_C_NONE_2	uint8_t(0b00000100u)
+#define CONSOLE_C_RESET		uint8_t(0b00001000u)
+#define CONSOLE_C_NONE_4	uint8_t(0b00010000u)
+#define CONSOLE_C_RX_IRQ	uint8_t(0b00100000u)
+#define CONSOLE_C_NONE_6	uint8_t(0b01000000u)
+#define CONSOLE_C_NONE_7	uint8_t(0b10000000u)
+
+// Status (read)
+#define CONSOLE_S_TX_EMPTY	uint8_t(0b00000001u)
+#define CONSOLE_S_TX_IRQ	uint8_t(0b00000010u)
+#define CONSOLE_S_NONE_2	uint8_t(0b00000100u)
+#define CONSOLE_S_BUSY		uint8_t(0b00001000u)
+#define CONSOLE_S_RX_FULL	uint8_t(0b00010000u)
+#define CONSOLE_S_RX_IRQ	uint8_t(0b00100000u)
+#define CONSOLE_S_NONE_6	uint8_t(0b01000000u)
+#define CONSOLE_S_NONE_7	uint8_t(0b10000000u)
+
 //UART miscellaneous constants
-#define CONSOLE_QUEUE_LEN	256
 
 #endif
