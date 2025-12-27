@@ -1,4 +1,4 @@
-all: get.s19 get.bin put.s19 put.bin loop.s19 loop.bin
+all: get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw
 
 get.s19: get.obj io.obj bss.obj syslib.obj
 	lwlink --script=chunk.ld --map=get.map --format=srec --output=$@ $^
@@ -36,5 +36,11 @@ bss.obj: bss.asm
 syslib.obj: syslib.asm
 	lwasm --format=obj --list=syslib.lst --output=$@ $<
 
+hello.srec: hello.c
+	cmoc --void-target --org=0x0130 --initial-s=0xf000 --srec --mc6839 hello.c
+
+hello.raw: hello.c
+	cmoc --void-target --org=0x0130 --initial-s=0xf000 --raw --mc6839 hello.c
+
 clean:
-	rm -f *.bin *.obj *.lst *.map *.s19
+	rm -f *.bin *.obj *.lst *.map *.s19 *.srec *.raw
