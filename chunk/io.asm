@@ -16,34 +16,39 @@ PUTCRLF	EXPORT
 OUTCH	EXPORT
 GETS	EXPORT
 INCH	EXPORT
-IRQ_ISR	EXPORT
 
 *NO_IRQ	EQU	1
 
 	SECTION	TEXT
 
 	IFDEF	NO_IRQ
-INIT	PSHS	CC,A
+INIT	PSHS	CC,A,X
 	BSR	RESET		reset the uart
 	PULS	CC,A,PC
 	ELSE
-INIT	PSHS	CC,A
-	BSR	LOCAL
-	BSR	RESET		reset the uart
-	LDA	IQ_RX		receive interrupts, transmit are done on the fly
+INIT	PSHS	CC,A,X
+*	BSR	IVARS
+	BSR	URESET		reset the uart
+	LDX	#IRQ_ISR
+	BSR	INITIRQ		install the interrrupt service routine
+	LDA	IQ_RX		elect eceive interrupts, transmit are enabled when needed
 	STA	UARTC
 	PULS	CC
-	ANDCC	I		enable interrupts
-	PULS	A,PC
+	ANDCC	I		enable interrupts in cpu
+	PULS	A,X,PC
+
 * Local variable initialisation
-LOCAL	CLR	RX_P_IN
+IVARS	CLR	RX_P_IN
 	CLR	RX_P_OU
 	CLR	TX_P_IN
 	CLR	TX_P_OU
 	RTS
+
+INITIRQ	STX	IRQ+1
+	RTS
 	ENDC
 
-RESET	PSHS	CC,A
+URESET	PSHS	CC,A
 	LDA	#C_RESET	complete uart reset
 	STA	UARTC
 R@0	LDA	UARTS
@@ -180,10 +185,11 @@ I@0	PULS	CC
 * INCH    [ ] RX_P_IN == RX_P_OU  : buffer empty, so clear carry
 * INCH    [ ] RX_P_IN != RX_P_OU  : next byte to return is at RX_P_OU, then RX_P_OU+, set carry
 
-	IFNDEF	NO_IRQ
+	IFDEF	NO_IRQ
+IRQ_ISR	RTI
+	ELSE
 IQ_RX	FCB	C_RX_IRQ
 IQ_RXTX	FCB	C_RX_IRQ|C_TX_IRQ
-
 IRQ_ISR	ORCC	I
 	LDA	UARTS		this doesn't clear the interrupt
 	BITA	#S_TX_IRQ	transmitter interrupt
@@ -228,8 +234,6 @@ RXFULL	LDA	UARTRX		clear the interrupt
 	LDA	#$BE		set errno for the user
 	STA	ERRNO
 	RTI
-	ELSE
-IRQ_ISR	RTI
 	ENDC
 
 	ENDSECTION

@@ -3,11 +3,11 @@
 	USE	syslib.inc
 
 Start	EXPORT
-IRQ_ISR	EXPORT
 
 	SECTION	TEXT
 
-Start	lds	#$8000		; Interrupts won't work without this
+Start	lds	#STACK		; Interrupts won't work without this
+	IFDEF	NOT_DEF
 S@0	clr	SHARED
 	clr	SHARED+1
 	clr	SHARED+2
@@ -21,8 +21,11 @@ S@1	inc	SHARED+3
 	inc	SHARED
 	bne	S@1
 	bra	S@0
-
-IRQ_ISR	rti
+	ELSE
+S@0	lda	>ATAIDE+3
+	sta	SHARED
+	bra	S@0
+	ENDC
 
 	ENDSECTION
 

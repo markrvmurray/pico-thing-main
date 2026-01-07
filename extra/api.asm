@@ -87,8 +87,8 @@ Sync	SYNC
 
 * Looks good on the oscilloscope if the Pico2's PIO SM and DMA ISR are instrumented.
 	ORG	START
-Reads	LDA	>SHARED
-	BRA	Reads
+Loop	LDA	>SHARED
+	BRA	Loop
 	SYNC
 	SYNC
 	SYNC
@@ -99,18 +99,6 @@ Reads	LDA	>SHARED
 	SYNC
 	SYNC
 	SYNC
-	SYNC
-
-* Looks good on the oscilloscope if the Pico2's PIO SM and DMA ISR are instrumented.
-	ORG	START
-Writes	CLRA
-w@0	LDB	#16
-	LDX	#SHARED
-w@1	STA	,X+
-	INCA
-	DECB
-	BNE	w@1
-	BRA	w@0
 	SYNC
 
 	ORG	START
@@ -299,9 +287,7 @@ Cont	NOP
 	FCB	' '
 	FCC	"SYNC"
 	FCB	' '
-	FCC	"READS"
-	FCB	' '
-	FCC	"WRITES"
+	FCC	"LOOP_RW"
 	FCB	' '
 	FCC	"STACK_EX"
 	FCB	' '

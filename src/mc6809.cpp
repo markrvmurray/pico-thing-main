@@ -108,7 +108,7 @@ static volatile uint8_t task_stack[MAX_INT_NEST_DEPTH];
 static void
 dump_registers()
 {
-	static uint8_t printables[16];
+	static uint8_t printables[17]; // Include the decorative bar down the middle
 
 	printf("Write block:\n");
 	for (uint16_t i = 0u; i < 4u; i++) {
@@ -121,7 +121,7 @@ dump_registers()
 				printf(" ");
 			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
 		}
-		printf(" |%.16s|\n", reinterpret_cast<char *>(printables));
+		printf(" |%.8s|%.8s|\n", reinterpret_cast<char *>(printables), reinterpret_cast<char *>(printables + 8));
 	}
 	printf("Read block:\n");
 	for (uint16_t i = 0u; i < 4u; i++) {
@@ -134,7 +134,7 @@ dump_registers()
 				printf(" ");
 			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
 		}
-		printf(" |%.16s|\n", reinterpret_cast<char *>(printables));
+		printf(" |%.8s|%.8s|\n", reinterpret_cast<char *>(printables), reinterpret_cast<char *>(printables + 8));
 	}
 	printf("--\n");
 }
@@ -459,7 +459,7 @@ print_time()
 }
 
 enum e_commands {
-	VERBOSE, EXAMINE, MODIFY, STATUS, SNIPPET, VECTOR, FILL, TIME, GO, TASK, IRQ, TRACE, RUN, STOP, FREQ, RESET, USB, S19, NONE
+	VERBOSE, EXAMINE, MODIFY, STATUS, SNIPPET, LOOP, VECTOR, FILL, TIME, GO, TASK, IRQ, TRACE, RUN, STOP, FREQ, RESET, USB, S19, NONE
 };
 
 struct s_commands {
@@ -471,6 +471,7 @@ struct s_commands {
 	{ "modify", MODIFY },
 	{ "status", STATUS },
 	{ "snippet", SNIPPET },
+	{ "loop", LOOP },
 	{ "vector", VECTOR },
 	{ "fill", FILL },
 	{ "time", TIME },
@@ -546,29 +547,40 @@ process_command(char *buf)
 	}
 	break;
 	case EXAMINE: {
-		if (tokencount != 3u) {
-			printf("Usage:\n\n> examine <start> <end>\n\n");
+		if (tokencount != 2u && tokencount != 3u) {
+			printf("Usage:\n\n> examine { dat | <start> <end> }\n\n");
 			return;
 		}
-		uint32_t hexnum = hex(tokenlist[1], 0);
-		if (hexnum >= REGISTER_BASE) {
-			printf("Invalid hex start address '%s' (valid is 0 .. %04X)\n",
-			       tokenlist[1],
-			       REGISTER_BASE - 1);
-			return;
-		}
-		const uint16_t start = hexnum;
-		hexnum = hex(tokenlist[2], 0);
-		if (hexnum == 0 || hexnum > REGISTER_BASE || hexnum <= start) {
-			printf("Invalid hex end address '%s' (valid is 1 .. %04X, and greater than the start)\n",
-			       tokenlist[2],
-			       REGISTER_BASE);
-			return;
+		uint32_t start, end;
+		if (tokencount == 2u) {
+			if (strcasecmp(tokenlist[1], "dat") == 0u) {
+				start = 0xFD00u;
+				end = 0xFFC0u;
+			} else {
+				printf("Invalid mnemonic memory range name '%s'\n", tokenlist[1]);
+				return;
+			}
+		} else {
+			uint32_t hexnum = hex(tokenlist[1], 0);
+			if (hexnum >= REGISTER_BASE) {
+				printf("Invalid hex start address '%s' (valid is 0 .. %04X)\n",
+				       tokenlist[1],
+				       REGISTER_BASE - 1);
+				return;
+			}
+			start = hexnum;
+			hexnum = hex(tokenlist[2], 0);
+			if (hexnum == 0 || hexnum > REGISTER_BASE || hexnum <= start) {
+				printf("Invalid hex end address '%s' (valid is 1 .. %04X, and greater than the start)\n",
+				       tokenlist[2],
+				       REGISTER_BASE);
+				return;
+			}
+			end = hexnum;
 		}
 		if (!MC6809.assert_stopped())
 			return;
 		MC6809.preserve_state();
-		const uint16_t end = hexnum;
 		const uint16_t display_start = start & 0xFFF0u;
 		const uint16_t display_end = ((end - 1u) | 0x000Fu) + 1u;
 		absolute_time_t next_usb = get_absolute_time();
@@ -720,6 +732,38 @@ process_command(char *buf)
 		MC6809.start();
 	}
 	break;
+	case LOOP: {
+		if (tokencount != 3u) {
+			printf("Usage:\n\n>  loop { r | R | w | W | rw } <address>\n\n");
+			return;
+		}
+		uint8_t opcode;
+		if (strcmp(tokenlist[1], "r") == 0)
+			opcode = 0xB6; // LDA >ADDRESS
+		else if (strcmp(tokenlist[1], "R") == 0)
+			opcode = 0xFC; // LDD >ADDRESS
+		else if (strcmp(tokenlist[1], "w") == 0)
+			opcode = 0xB7; // STA >ADDRESS
+		else if (strcmp(tokenlist[1], "W") == 0)
+			opcode = 0xFD; // STD >ADDRESS
+		else if (strcasecmp(tokenlist[1], "rw") == 0)
+			opcode = 0x70; // NEG >ADDRESS
+		else {
+			printf("Invalid loop type '%s'\n", tokenlist[1]);
+			return;
+		}
+		uint32_t hexnum = hex(tokenlist[2], 0);
+		if (hexnum > 0xFFFF) {
+			printf("Invalid address '%s'\n", tokenlist[2]);
+			return;
+		}
+		uint16_t address = hexnum;
+		snippet_copy(LOOP_RW);
+		reg[REGISTER_SNIPPET_OFFSET + 0u] = opcode;
+		reg[REGISTER_SNIPPET_OFFSET + 1u] = address;
+		MC6809.start();
+	}
+	break;
 	case VECTOR: {
 		static constexpr uint16_t vector_count = 8u;
 		uint16_t temp[vector_count];
@@ -744,32 +788,49 @@ process_command(char *buf)
 	}
 	break;
 	case FILL: {
-		if (tokencount != 3u && tokencount != 4u) {
-			printf("Usage:\n\n> fill <start> <end> [ <value> ]\n\n");
+		if (tokencount < 2u || tokencount > 4u) {
+			printf("Usage:\n\n> fill { <start> <end> | all } [ <value> ]\n\n");
 			return;
 		}
-		uint32_t hexnum = hex(tokenlist[1], 0);
-		if (hexnum >= 0xFFFF) {
-			printf("Invalid start address '%s'\n", tokenlist[1]);
-			return;
-		}
-		uint16_t start = hexnum;
-		hexnum = hex(tokenlist[2], 0);
-		if (hexnum > 0xFFFF || hexnum <= start) {
-			printf("Invalid end address '%s'\n", tokenlist[2]);
-			return;
-		}
-		uint16_t end = hexnum;
+		uint32_t hexnum;
+		uint16_t start, end;
 		uint8_t filler;
-		if (tokencount > 3u) {
-			hexnum = hex(tokenlist[3], 0);
-			if (hexnum > 0xFF) {
-				printf("Invalid fill byte '%s'\n", tokenlist[3]);
+		if (strcasecmp(tokenlist[1], "all") == 0u) {
+			start = 0x0000u;
+			end = 0xFE00u;
+			if (tokencount == 2u)
+				filler = 0x00u;
+			else {
+				hexnum = hex(tokenlist[2], 0);
+				if (hexnum > 0xFFu) {
+					printf("Invalid fill byte '%s'\n", tokenlist[2]);
+					return;
+				}
+				filler = hexnum;
+			}
+		} else {
+			hexnum = hex(tokenlist[1], 0);
+			if (hexnum >= 0xFFFFu) {
+				printf("Invalid start address '%s'\n", tokenlist[1]);
 				return;
 			}
-			filler = hexnum;
-		} else
-			filler = 0x00u;
+			start = hexnum;
+			hexnum = hex(tokenlist[2], 0);
+			if (hexnum > 0xFFFFu || hexnum <= start) {
+				printf("Invalid end address '%s'\n", tokenlist[2]);
+				return;
+			}
+			end = hexnum;
+			if (tokencount > 3u) {
+				hexnum = hex(tokenlist[3], 0);
+				if (hexnum > 0xFF) {
+					printf("Invalid fill byte '%s'\n", tokenlist[3]);
+					return;
+				}
+				filler = hexnum;
+			} else
+				filler = 0x00u;
+		}
 		if (!MC6809.assert_stopped())
 			return;
 		snippet_copy(BLOCK_FILL);
@@ -784,7 +845,7 @@ process_command(char *buf)
 			printf("Usage:\n\n> time [ <Year> [ <Mon> [ <Day> [ <Hour> [ <Min> [ <Sec> ] ] ] ] ] ]\n\n");
 			return;
 		}
-		// 1️⃣ Define the current calendar time (UTC)
+		// Define the current calendar time (UTC)
 		tm tm = {
 			.tm_sec = 0,
 			.tm_min = 0,
@@ -1336,7 +1397,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			interrupt_refcount[INTERRUPT_NMI] = 0;
 			interrupt_refcount[INTERRUPT_FIRQ] = 0;
 			interrupt_refcount[INTERRUPT_IRQ] = 0;
-			// FOREACH interrupt_source:
+			// FOR_EACH interrupt_source:
 			eirq = tick_has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
@@ -1345,7 +1406,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				printf("i:%u\n", eirq);
 #endif
 			interrupt_refcount[eirq]++;
-			// ENDFOR
+			// END FOR_EACH
 			if (interrupt_refcount[INTERRUPT_NMI] > 0)
 				MC6809.assert_interrupt(INTERRUPT_NMI);
 			else
@@ -1365,7 +1426,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			//gpio_put(GPIO_TRACE_F, true);
 			write_irq_received = false;
 			const uint8_t loc = write_location;
-			const uint8_t written_byte = (uint8_t)registers::write(loc);
+			const uint8_t written_byte = registers::write(loc);
 			switch (loc) {
 			default:
 				break;
@@ -1378,7 +1439,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			case SYSTEM_REQUEST:
 				if (reg[SYSTEM_REQUEST_RESPONSE] == RESPONSE_BUSY) {
 					// ignore request
-					registers::write(SYSTEM_REQUEST) = (uint8_t)reg[SYSTEM_REQUEST];
+					registers::write(SYSTEM_REQUEST) = reg[SYSTEM_REQUEST];
 					break;
 				}
 				switch (written_byte) {

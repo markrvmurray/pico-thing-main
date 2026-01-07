@@ -1,26 +1,29 @@
 BSSCLR	EXPORT
-Start	EXTERN
+
+address_BSS	EXTERN
+length_BSS	EXTERN
 
 	SECTION	TEXT
 
-BSSCLR	LDX	#BSSTART	Clear the BSS block
-I@0	CLR	,X+
-	CMPX	#BSSEND
-	BLS	I@0
-	RTS
+* Clear the BSS block.
+* This always works, even if there is no BSS in the rest of
+* the program.
+* All registers are preserved.
+BSSCLR	PSHS	CC,D,X
+	LDX	#address_BSS
+	LDD	#length_BSS
+	BEQ	B@99
+B@0	CLR	,X+
+	SUBD	#1
+	BNE	B@0
+B@99	PULS	CC,D,X,PC
 
 	ENDSECTION
 
-	SECTION	BSSTART
-
-BSSTART	RMB	0
-
-	ENDSECTION
-
-	SECTION	BSSEND
-
-BSSEND	RMB	0
+* Make sure there is always a BSS, even if it has to be an
+* empty one.
+	SECTION	BSS
 
 	ENDSECTION
 
-	END	Start
+	END
