@@ -1,0 +1,85 @@
+Name     MC6809_IDE_BUFFER_LOGIC;
+PartNo   00;
+Date     07/01/2026;
+Revision 00;
+Designer MRVM;
+Company  GTA;
+Assembly None;
+Location 0;
+Device   G22V10;
+
+/* *************** INPUT PINS *********************/
+PIN 1 = QCLK;
+PIN 2 = Q;
+PIN 3 = E;
+PIN 4 = R_nW;
+PIN 5 = LOW;
+PIN 6 = WORD; 
+PIN 7 = SELECT;
+/* PIN 8 = ; */
+/* PIN 9 = ; */
+/* PIN 10 = ; */
+/* PIN 11 = ; */
+/* PIN 13 = ; */
+
+/* *************** OUTPUT PINS *********************/
+/* PIN 14 = ; */
+PIN 15 = READ;
+PIN 16 = !RD;
+PIN 17 = !WR;
+PIN 18 = !LOW_OE_BA;
+PIN 19 = LOW_S_BA;
+PIN 20 = LOW_CP_BA;
+PIN 21 = OE_AB;
+PIN 22 = HIGH_CP_AB;
+PIN 23 = !HIGH_OE_BA;
+
+/* *************** EQUATIONS *********************/
+BYTE = !WORD;
+
+READ.D = R_nW;
+READ.SP = 'b'0;
+READ.AR = 'b'0;
+WRITE = !READ;
+
+/* *************** PINS *********************/
+
+RD = SELECT & READ & ((WORD & !LOW) # BYTE) & (E # !Q);
+WR = SELECT & WRITE & ((WORD & LOW) # BYTE) & E;
+
+/* Low Byte pins at fixed state:
+  S_AB = 0
+  CP_AB = 1
+  OE_AB shared with High Byte
+*/
+LOW_OE_BA = SELECT & READ & ((WORD & LOW) # BYTE);
+/*LOW_OE_BA.AR = 'b'0;
+LOW_OE_BA.SP = 'b'0; */
+LOW_S_BA = SELECT & READ & (WORD & LOW);
+/*LOW_S_BA.AR = 'b'0;
+LOW_S_BA.SP = 'b'0; */
+LOW_CP_BA = !(SELECT & READ & (WORD & !LOW) & E);
+
+OE_AB = SELECT & WRITE;
+/* OE_AB.AR = 'b'0;
+OE_AB.SP = 'b'0; */
+/* LOW_S_AB = 'b'0; */
+/* LOW_CP_AB = 'b'1; */
+
+/* ================================== */
+/* High Byte pins at fixed state:
+  S_AB = 1
+  S_BA = 0
+  CP_BA = 1
+  OE_AB shared with Low Byte
+*/
+HIGH_OE_BA = SELECT & READ & (WORD & !LOW);
+/* HIGH_OE_BA.AR = 'b'0;
+HIGH_OE_BA.SP = 'b'0; */
+/* HIGH_S_BA = 'b'0; */
+/* HIGH_CP_BA = 'b'1; */
+
+/* HIGH_OE_AB.D = SELECT & WRITE & (WORD & LOW); */
+/* HIGH_S_AB = 'b'1; */
+HIGH_CP_AB = !(SELECT & WRITE & (WORD & !LOW) & Q);
+

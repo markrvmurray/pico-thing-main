@@ -1,0 +1,37 @@
+Name     MC6809_DEVICES_GLUE;
+PartNo   00;
+Date     06/01/2026;
+Revision 01;
+Designer MRVM;
+Company  GTA;
+Assembly None;
+Location U102;
+Device   G16V8A;
+
+/* *************** INPUT PINS *********************/
+
+PIN 1 = E;
+PIN 2 = R_nW;
+PIN [3..9,11] = [A0..7];
+PIN 12 = !IOS;
+
+/* *************** OUTPUT PINS ********************/
+
+PIN 19 = !CS_ATA;
+PIN 18 = !CS_VIA;
+PIN 17 = !CS_LCD;
+PIN 16 = RTC_AS;
+PIN 15 = RTC_DS;
+/* PIN 14 = ; */
+/* PIN 13 = ; */
+
+/* *************** EQUATIONS *********************/
+
+FIELD ADDR = [A7..0]; /* We have 00 -> BF available */
+
+CS_ATA = IOS & ADDR:['h'00..'h'0F];
+CS_VIA = IOS & ADDR:['h'20..'h'2F];
+CS_LCD = IOS & ADDR:['h'30..'h'31];
+CS_RTC = IOS & ADDR:['h'32..'h'33];
+RTC_AS = CS_RTC & E & !(A0 # R_nW);
+RTC_DS = CS_RTC & E & A0;

@@ -1,0 +1,46 @@
+Name     MC6809_DAT_RAM_GLUE;
+PartNo   00;
+Date     06/00/2026;
+Revision 01;
+Designer MRVM;
+Company  GTA;
+Assembly None;
+Location U102;
+Device   G22V10;
+
+/* *************** INPUT PINS *********************/
+
+PIN 1 = E;
+PIN 2 = R_nW;
+PIN [3..11,13] = [A15..6];
+PIN 14 = TASK0;
+
+/* *************** OUTPUT PINS ********************/
+
+PIN 23 = !CS_PICO;
+PIN 22 = !IOS;
+PIN 21 = !SEL_ram;
+PIN 20 = !MMU_sel;
+PIN 19 = !MMU_dat;
+PIN 18 = !MMU_wr;
+PIN 17 = !MMU_rd;
+PIN 16 = !MMU_cs;
+PIN 15 = !WR;
+
+/* *************** EQUATIONS *********************/
+
+FIELD ADDR = [A15..6];
+
+RD =  R_nW;
+WR = !R_nW & E;
+
+SEL_ram = ADDR:['h'0000..'h'FDFF];         /* System RAM, via DAT */
+MMU_cs =  ADDR:['h'FE00..'h'FEFF] & TASK0; /* DAT when used in RAM mode */
+MMU_dat = ADDR:['h'0000..'h'FDFF];         /* DAT when used in DAT mode */
+IOS =     ADDR:['h'FF00..'h'FFBF];         /* The 192 bytes before the Pico2, reserved for I/O */
+CS_PICO = ADDR:['h'FFC0..'h'FFFF];         /* Pico2 registers - 64 bytes */
+
+MMU_sel = MMU_dat # MMU_cs; /* Both modes that require the DAT RAMs to be enabled */
+
+MMU_rd = MMU_cs & RD; /* Read from DAT RAM as RAM */
+MMU_wr = MMU_cs & WR; /* Write to DAT RAM as RAM */
