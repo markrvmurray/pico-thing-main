@@ -1,5 +1,5 @@
 ;
-; Copyright (c) 2025 Mark R V Murray
+; Copyright (c) 2025-2026 Mark R V Murray
 ;
 ; SPDX-License-Identifier: BSD-2-Clause
 ;

@@ -1,15 +1,17 @@
 /**
-* Copyright (c) 2025 Mark R V Murray.
+* Copyright (c) 2025-2026 Mark R V Murray.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#ifndef PICO_MC6809_H
-#define PICO_MC6809_H
+#ifndef PICO_THING_H
+#define PICO_THING_H
 
 #define DEVICE_VERSION "vX.X.x"
 
 extern volatile bool verbose;
+
+#include <cstdio>
 
 // === Pin map ===
 enum {
@@ -52,10 +54,10 @@ enum {
 	GPIO_RESET = 41, // [Y] [o]  !RESET
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
-	GPIO_TRACE_G = 43, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_C = 44, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_D = 45, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_E = 46, // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_CORE1 = 43, // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_EQ_IRQ = 44, // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_READ_IRQ = 45, // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_WRITE_IRQ = 46, // [Y] [o]  Temporary debugging output pins for the scope
 	GPIO_POWER_ADC = 47, // [Y] [i]  ADC connected to the 5v line, divided by 2
 };
 
@@ -96,7 +98,7 @@ class registers {
 		ReadProxy& operator&=(uint16_t v) { auto* p = reinterpret_cast<volatile uint16_t*>(&read_registers[i]); *p &= __builtin_bswap16(v); return *this; }
 		ReadProxy& operator|=(uint8_t v) { read_registers[i] |= v; return *this; }
 		ReadProxy& operator|=(uint16_t v) { auto* p = reinterpret_cast<volatile uint16_t*>(&read_registers[i]); *p |= __builtin_bswap16(v); return *this; }
-		// volatile uint8_t* operator&() const { return &read_registers[i]; }
+		// volatile uint8_t *operator&() const { return &read_registers[i]; }
 		// uint8_t operator&(uint8_t v) const { return static_cast<uint8_t>(*this) & v; }
 	};
 	struct WriteProxy {
@@ -107,6 +109,7 @@ class registers {
 		WriteProxy& operator=(uint8_t v) { wbuf[i] = v; return *this; }
 		WriteProxy& operator=(uint16_t v) { *reinterpret_cast<volatile uint16_t*>(&wbuf[i]) = __builtin_bswap16(v); return *this; }
 		[[nodiscard]] volatile uint8_t* address(uint16_t index) const { return wbuf + index; }
+		WriteProxy &operator&=(uint8_t v) { wbuf[i] &= v; return *this; }
 	};
 
 public:
@@ -118,6 +121,7 @@ public:
 	static void clear() { for (uint16_t i = 0; i < register_length; i++) read_registers[i] = write_registers[i] = 0u; }
 	static void copy_in(uint16_t addr, const uint8_t *src, uint16_t len);
 	static void copy_out(uint8_t *dst, uint16_t addr, uint16_t len);
+	static void copy_out_write(uint8_t *dst, uint16_t addr, uint16_t len);
 	static uintptr_t read_address() { return reinterpret_cast<uintptr_t>(read_registers); }
 	static uintptr_t write_address() { return reinterpret_cast<uintptr_t>(write_registers); }
 };
@@ -165,9 +169,18 @@ extern registers &reg;
 #define SYSTEM_SUBREQUEST	uint16_t(0x02u) // Write-only
 #define SYSTEM_REQUEST_RESPONSE	uint16_t(0x02u) // Read-only
 
-#define SYSTEM_TIMER_CONTROL	uint16_t(0x03u) // Write-only
-#define SYSTEM_TIMER_STATUS	uint16_t(0x03u) // Read-only
-#define SYSTEM_TIMER_COUNTERS	uint16_t(0x04u) // 4/5 and 6/7 are used
+// Try to emulate an MC6840 PTM, within reason. The output of
+// Timer 1 is connected to NMI.
+#define SYSTEM_TIMER_BASE	uint16_t(0x08u)
+#define SYSTEM_TIMER_CONTROL_13	uint16_t(0x08u) // Write-only
+#define SYSTEM_TIMER_CONTROL_2	uint16_t(0x09u) // Write-only
+#define SYSTEM_TIMER_STATUS	uint16_t(0x09u) // Reade-only
+#define SYSTEM_TIMER_1_MSB	uint16_t(0x0Au) // Read/Write
+#define SYSTEM_TIMER_1_LSB	uint16_t(0x0Bu) // Read/Write
+#define SYSTEM_TIMER_2_MSB	uint16_t(0x0Cu) // Read/Write
+#define SYSTEM_TIMER_2_LSB	uint16_t(0x0Du) // Read/Write
+#define SYSTEM_TIMER_3_MSB	uint16_t(0x0Eu) // Read/Write
+#define SYSTEM_TIMER_3_LSB	uint16_t(0x0Fu) // Read/Write
 
 // Task register bits
 #define NUM_TASK_PINS		5
@@ -176,7 +189,7 @@ extern registers &reg;
 // System request opcodes
 #define	REQUEST_NULL		uint8_t(0x00u)
 #define REQUEST_TIME		uint8_t('T')
-#define REQUEST_SETTIME		uint8_t('t')
+#define REQUEST_SET_TIME	uint8_t('t')
 #define REQUEST_MOUNT		uint8_t('M')
 #define REQUEST_UNMOUNT		uint8_t('m')
 #define REQUEST_FLOAT		uint8_t('R')
@@ -195,39 +208,17 @@ extern registers &reg;
 #define FLOAT_DIVIDE		uint8_t('/')
 
 // System timer control/status bits
-#define TIMER_IRQ		uint8_t(0b00000001u)
-#define TIMER_ENABLED		uint8_t(0b00000010u)
-#define TIMER_REPEAT		uint8_t(0b00000100u)
+//#define TIMER_IRQ		uint8_t(0b00000001u)
+//#define TIMER_ENABLED		uint8_t(0b00000010u)
+//#define TIMER_REPEAT		uint8_t(0b00000100u)
 
 // Emulated UART
 // UART registers relative to REGISTER_DEVICES
-#define CONSOLE_CONTROL		uint16_t(0x08u)
-#define CONSOLE_STATUS		uint16_t(0x08u)
-#define CONSOLE_TX_DATA		uint16_t(0x09u)
-#define CONSOLE_RX_DATA		uint16_t(0x09u)
-
-// UART register bits
-#define CONSOLE_NONE		uint8_t(0b00000000u)
-// Control (write)
-#define CONSOLE_C_NONE_0	uint8_t(0b00000001u)
-#define CONSOLE_C_TX_IRQ	uint8_t(0b00000010u)
-#define CONSOLE_C_NONE_2	uint8_t(0b00000100u)
-#define CONSOLE_C_RESET		uint8_t(0b00001000u)
-#define CONSOLE_C_NONE_4	uint8_t(0b00010000u)
-#define CONSOLE_C_RX_IRQ	uint8_t(0b00100000u)
-#define CONSOLE_C_NONE_6	uint8_t(0b01000000u)
-#define CONSOLE_C_NONE_7	uint8_t(0b10000000u)
-
-// Status (read)
-#define CONSOLE_S_TX_EMPTY	uint8_t(0b00000001u)
-#define CONSOLE_S_TX_IRQ	uint8_t(0b00000010u)
-#define CONSOLE_S_NONE_2	uint8_t(0b00000100u)
-#define CONSOLE_S_BUSY		uint8_t(0b00001000u)
-#define CONSOLE_S_RX_FULL	uint8_t(0b00010000u)
-#define CONSOLE_S_RX_IRQ	uint8_t(0b00100000u)
-#define CONSOLE_S_NONE_6	uint8_t(0b01000000u)
-#define CONSOLE_S_NONE_7	uint8_t(0b10000000u)
+#define CONSOLE_CONTROL		uint16_t(0x03u)
+#define CONSOLE_STATUS		uint16_t(0x03u)
+#define CONSOLE_TX_DATA		uint16_t(0x04u)
+#define CONSOLE_RX_DATA		uint16_t(0x04u)
 
 //UART miscellaneous constants
 
-#endif
+#endif // PICO_THING_H

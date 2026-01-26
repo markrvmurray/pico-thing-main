@@ -4,12 +4,34 @@
 	* SPDX-License-Identifier: BSD-2-Clause
 	*/
 
-#ifndef PICO_EXAMPLES_PIO_MC6809_UART_H
-#define PICO_EXAMPLES_PIO_MC6809_UART_H
+#ifndef PICO_MC6809_MC6850_H
+#define PICO_MC6809_MC6850_H
 
 #include "pico/util/queue.h"
 
 #define CONSOLE_QUEUE_LEN	256
+
+// UART register bits
+#define CONSOLE_NONE		uint8_t(0b00000000u)
+// Control (write)
+#define CONSOLE_C_DIVIDE_0	uint8_t(0b00000001u)
+#define CONSOLE_C_DIVIDE_1	uint8_t(0b00000010u)
+#define CONSOLE_C_WORD_0	uint8_t(0b00000100u)
+#define CONSOLE_C_WORD_1	uint8_t(0b00001000u)
+#define CONSOLE_C_WORD_2	uint8_t(0b00010000u)
+#define CONSOLE_C_TX_0		uint8_t(0b00100000u)
+#define CONSOLE_C_TX_1		uint8_t(0b01000000u)
+#define CONSOLE_C_RX		uint8_t(0b10000000u)
+
+// Status (read)
+#define CONSOLE_S_RDRF		uint8_t(0b00000001u) // Rx Data Reg Full
+#define CONSOLE_S_TDRE		uint8_t(0b00000010u) // Tx Data Reg Empty
+#define CONSOLE_S_DCD		uint8_t(0b00000100u) // DCD
+#define CONSOLE_S_CTS		uint8_t(0b00001000u) // CTS
+#define CONSOLE_S_FE		uint8_t(0b00010000u) // FE
+#define CONSOLE_S_OVRN		uint8_t(0b00100000u) // OVRN
+#define CONSOLE_S_PE		uint8_t(0b01000000u) // PE
+#define CONSOLE_S_IRQ		uint8_t(0b10000000u) // IRQ
 
 // Wrapper for C-only queue_t type.
 class Queue {
@@ -38,10 +60,36 @@ public:
 	void put(const uint8_t ch) { queue_try_add(&queue, &ch); }
 };
 
-class emulated_uart {
+union Control {
+	uint8_t byte;
+	struct {
+		uint8_t divide_select : 2;
+		uint8_t word_select : 3;
+		uint8_t tx_irq : 2;
+		uint8_t rx_irq : 1;
+	};
+};
+
+union Status {
+	uint8_t byte;
+	struct {
+		uint8_t rdrf : 1;
+		uint8_t tdre : 1;
+		uint8_t dcd : 1;
+		uint8_t cts : 1;
+		uint8_t fe : 1;
+		uint8_t ovrn : 1;
+		uint8_t pe : 1;
+		uint8_t irq : 1;
+	};
+};
+
+class mc6850 {
 	Queue tx;
 	Queue rx;
 	registers &reg;
+	volatile bool busy = true; // Constructor will reset this when done
+	const Status reset_status = { .tdre = 1 };
 	bool transmit_buffer_empty = true;
 	bool receive_buffer_full = false;
 	bool transmit_irq = false;
@@ -50,8 +98,9 @@ class emulated_uart {
 	bool assert_receive_irq = false;
 	void update_receive(bool do_receive = true);
 	void update_transmit(bool do_transmit = true);
+	void update_interrupt();
 public:
-	emulated_uart();
+	mc6850();
 	void reset();
 	void task();
 	uint transmit_level();
@@ -78,6 +127,6 @@ public:
 	[[nodiscard]] interrupt has_interrupt() const;
 };
 
-extern emulated_uart fast_serial;
+extern mc6850 fast_serial;
 
-#endif // PICO_EXAMPLES_PIO_MC6809_UART_H
+#endif // PICO_MC6809_MC6850_H

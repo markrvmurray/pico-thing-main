@@ -23,6 +23,15 @@ SWI	EXPORT
 NMI	EXPORT
 RESET	EXPORT
 
+INITIRQ	EXPORT
+
+	SECTION	TEXT
+
+INITIRQ	STX	IRQ+1		This address is one past a JMP instruction
+	RTS
+
+	ENDSECTION
+
 	SECTION	SYSVECTORS
 
 RSRVD	jmp	>0
@@ -44,12 +53,12 @@ ATAIDE	RMB	32
 
 	SECTION	PICO2
 
-DEVICE	RMB	8		; Devices provided by the Pico 2
+DEVICE	RMB	3		; Other devices provided by the Pico 2
 UARTC	RMB	0		; These two share an address
 UARTS	RMB	1
-UARTTX	RMB	0		; These tow share an address
+UARTTX	RMB	0		; These two share an address
 UARTRX	RMB	1
-	RMB	6
+	RMB	11
 
 SHARED	RMB	16		; Address of a shared buffer for moving bytes
 

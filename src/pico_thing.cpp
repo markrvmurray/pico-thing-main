@@ -28,11 +28,12 @@
 
 #include "tusb.h"
 #include "usb.h"
-#include "mc6809.h"
+#include "pico_thing.h"
 #include "processor.h"
 #include "srec.h"
-#include "uart.h"
+#include "mc6850.h"
 #include "build_time.h"
+#include "mc6840.h"
 
 // PIO program headers will be generated from the .pio file
 #include "mc6809.pio.h"
@@ -93,6 +94,12 @@ registers::copy_out(uint8_t *dst, uint16_t addr, uint16_t len)
 		dst[i] = read_registers[addr + i];
 }
 
+void
+registers::copy_out_write(uint8_t *dst, uint16_t addr, uint16_t len)
+{
+	for (uint16_t i = 0; i < len; i++)
+		dst[i] = write_registers[addr + i];
+}
 
 void
 registers::copy_in(uint16_t addr, const uint8_t *src, uint16_t len)
@@ -112,7 +119,7 @@ dump_registers()
 
 	printf("Write block:\n");
 	for (uint16_t i = 0u; i < 4u; i++) {
-		registers::copy_out(printables, i*16u, 16u);
+		registers::copy_out_write(printables, i*16u, 16u);
 		printf("%04X:", REGISTER_BASE + i*16u);
 		for (uint16_t j = 0u; j < 16u; j++) {
 			auto ch = static_cast<unsigned char>(printables[j]) & 0x7F;
@@ -153,7 +160,7 @@ static volatile bool q_falling_edge = false;
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
 {
-	gpio_put(GPIO_TRACE_C, true); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_EQ_IRQ, true); // OINQUE DEBUG to time this function on the scope
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
 		uint32_t bus_pins = gpio_get_all();
@@ -178,10 +185,13 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 	} else {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
+		uint32_t bus_pins = gpio_get_all();
+		// Grab the current 8 D pins if this is a read cycle, and the LIC timing lets us
+		// know it is an instruction. I want to catch RTI (0x3B).
 		// These 3 signals are all predictive; they indicate the status of the _next_ memory access
-		MC6809.set_busy_lic_avma(static_cast<uint8_t>((gpio_get_all() >> GPIO_BUSY) & 0b00000111));
+		MC6809.set_busy_lic_avma(static_cast<uint8_t>((bus_pins >> GPIO_BUSY) & 0b00000111));
 	}
-	gpio_put(GPIO_TRACE_C, false); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_EQ_IRQ, false); // OINQUE DEBUG to time this function on the scope
 }
 
 // ISR for the R/!W bus read loop and DMA chain
@@ -199,8 +209,8 @@ static volatile uint8_t read_location;
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
 {
-	gpio_put(GPIO_TRACE_D, true); // OINQUE DEBUG to time this function on the scope
-	// if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
+	gpio_put(GPIO_TRACE_READ_IRQ, true); // OINQUE DEBUG to time this function on the scope
+	//if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
 	if (!MC6809.bus_state.bit.RESET && MC6809.get_vma()) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
@@ -217,7 +227,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 #endif
 	}
 	//}
-	gpio_put(GPIO_TRACE_D, false); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_READ_IRQ, false); // OINQUE DEBUG to time this function on the scope
 }
 
 // ISR for the R/!W bus write loop and DMA chain
@@ -232,7 +242,7 @@ static volatile uint8_t write_location;
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
-	gpio_put(GPIO_TRACE_E, true); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_WRITE_IRQ, true); // OINQUE DEBUG to time this function on the scope
 	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
 	if (!MC6809.bus_state.bit.RESET) {
@@ -250,7 +260,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 #endif
 	}
 	// }
-	gpio_put(GPIO_TRACE_E, false); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_WRITE_IRQ, false); // OINQUE DEBUG to time this function on the scope
 }
 
 #define SNIPPET_NAMES_INC 1
@@ -400,7 +410,7 @@ sysreq_process()
 				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
-		case REQUEST_SETTIME: {
+		case REQUEST_SET_TIME: {
 			tm tm{};
 			union {
 				struct {
@@ -440,7 +450,7 @@ sysreq_process()
 	}
 }
 
-emulated_uart fast_serial;
+mc6850 fast_serial;
 
 static void
 print_time()
@@ -529,14 +539,10 @@ process_command(char *buf)
 			}
 		}
 	}
-	if (command == NONE) {
-		printf("Unknown command \"%s\"\n", tokenlist[0]);
-		return;
-	}
 	switch (command) {
 	default:
-		printf("Default case found. Why? Fix it!\n");
-		break;
+		printf("Unknown command \"%s\"\n", tokenlist[0]);
+		return;
 	case VERBOSE: {
 		if (tokencount != 1u) {
 			printf("Usage:\n\n> verbose\n\n");
@@ -663,11 +669,11 @@ process_command(char *buf)
 		constexpr float conversion_factor = ((2.5334f*2.0f)/5.0f)*3.3f/(1 << 12);
 		adc_select_input(7);
 		uint16_t raw_vcc = adc_read();
-		printf("External Vcc = %.1f V\n", raw_vcc * conversion_factor * 2.0f);
+		printf("External Vcc = %.1f V\n", 2.0f * conversion_factor * static_cast<float>(raw_vcc));
 		adc_select_input(8);
 		uint16_t raw_temp = adc_read();
 		float voltage_temp;
-		voltage_temp = conversion_factor * raw_temp;
+		voltage_temp = conversion_factor * static_cast<float>(raw_temp);
 		float temperature = 27.0f - (voltage_temp - 0.706f)/0.001721f;
 		printf("Pico2 temperature = %.1f C\n", temperature);
 		printf("Run state: %u = %s\n", MC6809.run_state, run_state_string[MC6809.run_state]);
@@ -1106,7 +1112,7 @@ process_command(char *buf)
 		} else
 			return;
 		if (stop)
-			MC6809.start_with_timeout(1000u, true);
+			MC6809.start_with_timeout(1000u);
 		else
 			MC6809.start();
 	}
@@ -1191,7 +1197,7 @@ process_command(char *buf)
 						printf(" %02X", buffer[i]);
 					printf("\n");
 				}
-				if (address < 0xFE00) // Don't mess with the DAT RAM or the Pico-supplied registers
+				if (address + count < 0xFE00) // Don't mess with the DAT RAM or the Pico-supplied registers
 					copy(OUTWARDS, count - 3u, address, buffer);
 				else if (address >= 0xFFF0) // Allow the reset and interrupt vectors to be set up
 					for (uint16_t i = 0; i < count - 3; i++)
@@ -1267,8 +1273,6 @@ poll_console()
 			next_usb = make_timeout_time_ms(1u);
 		}
 		MC6809.uart_task();
-		//fast_serial.task(registers::write(CONSOLE_CONTROL), &reg[CONSOLE_STATUS], &reg[CONSOLE_RX_DATA]);
-		//sysreq_process();
 	}
 }
 
@@ -1279,55 +1283,13 @@ init_pins_range(const uint8_t base, const uint8_t count)
 		gpio_init(base + i);
 }
 
-static uint16_t tick_timer[2] = {0u, 0u};
-static bool tick_enabled[2] = {false, false};
-static bool tick_irq[2] = {false, false};
-
-void
-tick_initialise()
-{
-	reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(0u);
-	tick_timer[0] = 0u;
-	reg[SYSTEM_TIMER_COUNTERS + 0u] = tick_timer[0];
-	tick_timer[1] = 0u;
-	reg[SYSTEM_TIMER_COUNTERS + 2u] = tick_timer[1];
-	tick_enabled[0] = false;
-	tick_enabled[1] = false;
-	tick_irq[0] = false;
-	tick_irq[1] = false;
-}
-
-void
-tick_task()
-{
-	for (uint16_t i = 0; i < 2; i++) {
-		if (tick_timer[i] && tick_enabled[i]) {
-			reg[SYSTEM_TIMER_COUNTERS + 2*i] = --tick_timer[i];
-			if (tick_timer[i] == 0) {
-				tick_irq[i] = registers::write(SYSTEM_TIMER_CONTROL) >> (i*4) & TIMER_IRQ;
-				if (tick_irq[i])
-					reg[SYSTEM_TIMER_STATUS] |= static_cast<uint8_t>((TIMER_IRQ << (4 * i)));
-			}
-		}
-	}
-}
-
-interrupt
-tick_has_interrupt()
-{
-	for (uint16_t i = 0; i < 2; i++)
-		if (tick_irq[i] && tick_enabled[i])
-			return INTERRUPT_IRQ;
-	return INTERRUPT_NONE;
-}
-
 static void
 __no_inline_not_in_flash_func(main_core1)()
 {
 	printf("Pico2 MC6809E core1 process starting\n");
 
-	init_pins_range(GPIO_TRACE_G, 4); // OINQUE DEBUG trace pins - isr set
-	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_G);
+	init_pins_range(GPIO_TRACE_CORE1, 4); // OINQUE DEBUG trace pins - isr set
+	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_CORE1);
 
 	MC6809.init();
 	printf("Pico2 MC6809E guest initialised\n");
@@ -1371,17 +1333,22 @@ __no_inline_not_in_flash_func(main_core1)()
 	       piodma_write.sm);
 
 	sysreq_initialise();
-	tick_initialise();
-	absolute_time_t next_tick = get_absolute_time();
+	mc6840 timer(reg, 1);
+	absolute_time_t next_us = get_absolute_time();
+	absolute_time_t next_ms = next_us;
 
 	printf("Pico2 MC6809E core1 process started\n");
 
 	core1_initialised = true;
 
 	for (;;) {
-		if (absolute_time_diff_us(get_absolute_time(), next_tick) <= 0) {
-			// tick_task(); // handles system millisecond clock ticks
-			next_tick = make_timeout_time_ms(1u);
+		if (absolute_time_diff_us(get_absolute_time(), next_us) <= 0) {
+			// timer.tick();
+			next_ms = make_timeout_time_us(1u);
+		}
+		if (absolute_time_diff_us(get_absolute_time(), next_ms) <= 0) {
+			fast_serial.task();
+			next_ms = make_timeout_time_ms(1u);
 		}
 
 		// For actions that may take more than one E clock cycle, provide
@@ -1389,16 +1356,12 @@ __no_inline_not_in_flash_func(main_core1)()
 
 		if (q_falling_edge) {
 			q_falling_edge = false;
-			static uint16_t interrupt_refcount[NUM_INTERRUPTS];
+			static uint32_t interrupt_refcount[NUM_INTERRUPTS];
 			interrupt eirq;
-			//gpio_put(GPIO_TRACE_F, true);
-			fast_serial.task();
-			interrupt_refcount[INTERRUPT_NONE] = 0;
-			interrupt_refcount[INTERRUPT_NMI] = 0;
-			interrupt_refcount[INTERRUPT_FIRQ] = 0;
-			interrupt_refcount[INTERRUPT_IRQ] = 0;
+			//gpio_put(GPIO_TRACE_CORE1, true);
+			timer.tick(1u);
 			// FOR_EACH interrupt_source:
-			eirq = tick_has_interrupt();
+			eirq = timer.has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
 #ifdef DEBUG_NOT_NOW
@@ -1406,24 +1369,13 @@ __no_inline_not_in_flash_func(main_core1)()
 				printf("i:%u\n", eirq);
 #endif
 			interrupt_refcount[eirq]++;
+			processor::apply_interrupts(interrupt_refcount);
 			// END FOR_EACH
-			if (interrupt_refcount[INTERRUPT_NMI] > 0)
-				MC6809.assert_interrupt(INTERRUPT_NMI);
-			else
-				MC6809.deassert_interrupt(INTERRUPT_NMI);
-			if (interrupt_refcount[INTERRUPT_FIRQ] > 0)
-				MC6809.assert_interrupt(INTERRUPT_FIRQ);
-			else
-				MC6809.deassert_interrupt(INTERRUPT_FIRQ);
-			if (interrupt_refcount[INTERRUPT_IRQ] > 0)
-				MC6809.assert_interrupt(INTERRUPT_IRQ);
-			else
-				MC6809.deassert_interrupt(INTERRUPT_IRQ);
-			//gpio_put(GPIO_TRACE_F, false);
+			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
 
 		if (write_irq_received) {
-			//gpio_put(GPIO_TRACE_F, true);
+			//gpio_put(GPIO_TRACE_CORE1, true);
 			write_irq_received = false;
 			const uint8_t loc = write_location;
 			const uint8_t written_byte = registers::write(loc);
@@ -1448,7 +1400,7 @@ __no_inline_not_in_flash_func(main_core1)()
 					reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNKNOWN;;
 					break;
 				case REQUEST_TIME:
-				case REQUEST_SETTIME:
+				case REQUEST_SET_TIME:
 				case REQUEST_MOUNT:
 				case REQUEST_UNMOUNT:
 					reg[SYSTEM_REQUEST_STATUS] = registers::write(SYSTEM_REQUEST);
@@ -1504,26 +1456,20 @@ __no_inline_not_in_flash_func(main_core1)()
 				// TODO: MarkM - implement finer-grained sysreqs
 				break;
 
-			case SYSTEM_TIMER_CONTROL:
-				reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(0x00u);
-				for (uint16_t i = 0; i < 2; i++)
-					tick_irq[i] = false;
-				break;
-
-			case SYSTEM_TIMER_COUNTERS + 0:
-				break;
-			case SYSTEM_TIMER_COUNTERS + 1:
-				tick_timer[0] = registers::write(SYSTEM_TIMER_COUNTERS);
-
-			case SYSTEM_TIMER_COUNTERS + 2:
-				break;
-			case SYSTEM_TIMER_COUNTERS + 3:
-				tick_timer[1] = registers::write(SYSTEM_TIMER_COUNTERS + 2u);
+			case SYSTEM_TIMER_CONTROL_13:
+			case SYSTEM_TIMER_CONTROL_2:
+			case SYSTEM_TIMER_1_MSB:
+			case SYSTEM_TIMER_1_LSB:
+			case SYSTEM_TIMER_2_MSB:
+			case SYSTEM_TIMER_2_LSB:
+			case SYSTEM_TIMER_3_MSB:
+			case SYSTEM_TIMER_3_LSB:
+				timer.write(loc - SYSTEM_TIMER_BASE, written_byte);
 				break;
 
 			case CONSOLE_CONTROL: // UART command
 #ifdef DEBUG
-				if (written_byte & CONSOLE_C_RESET) {
+				if (written_byte & (CONSOLE_C_DIVIDE_0 | CONSOLE_C_DIVIDE_1) == (CONSOLE_C_DIVIDE_0 | CONSOLE_C_DIVIDE_1)) {
 					UART_CONTROL_COUNT = 0u;
 					UART_TX_DATA_COUNT = 0u;
 					UART_STATUS_COUNT = 0u;
@@ -1602,16 +1548,24 @@ __no_inline_not_in_flash_func(main_core1)()
 				// may write useful debugging info here.
 				break;
 			}
-			//gpio_put(GPIO_TRACE_F, false);
+			//gpio_put(GPIO_TRACE_CORE1, false);
 		} // if (write_irq_received)
 
 		if (read_irq_received) {
-			//gpio_put(GPIO_TRACE_F, true);
+			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
 			const uint8_t loc = read_location;
 			switch (loc) {
 			default:
 				// The MC6809 got whatever byte was here. By default, do nothing else.
+				break;
+			case REGISTER_SNIPPET_OFFSET + 0x0F:
+				// Last instruction in the snippet block.
+				// If it is RTI (0x3B), then we need to be switching things
+				// around in the task scheduling.
+				if (MC6809.get_lic())
+					if (reg[REGISTER_SNIPPET_OFFSET + 0x0F] == static_cast<uint8_t>(0x3B))
+						MC6809.apply_rti();
 				break;
 
 			case SYSTEM_TASK:
@@ -1622,27 +1576,15 @@ __no_inline_not_in_flash_func(main_core1)()
 				// Will be set by the sysreq processor
 				break;
 
+			case SYSTEM_TIMER_CONTROL_13:
 			case SYSTEM_TIMER_STATUS:
-				break;
-			case SYSTEM_TIMER_COUNTERS + 0:
-				break;
-			case SYSTEM_TIMER_COUNTERS + 1:
-				if (reg[SYSTEM_TIMER_COUNTERS] == static_cast<uint16_t>(0u)) {
-					tick_irq[0] = false;
-					if (registers::write(SYSTEM_TIMER_CONTROL) & TIMER_REPEAT)
-						tick_timer[0] = registers::write(SYSTEM_TIMER_COUNTERS);
-					reg[SYSTEM_TIMER_STATUS] &= static_cast<uint8_t>(~TIMER_IRQ);
-				}
-				break;
-			case SYSTEM_TIMER_COUNTERS + 2:
-				break;
-			case SYSTEM_TIMER_COUNTERS + 3:
-				if (reg[SYSTEM_TIMER_COUNTERS + 2u] == static_cast<uint16_t>(0u)) {
-					tick_irq[1] = false;
-					if (registers::write((SYSTEM_TIMER_CONTROL) >> 4) & TIMER_REPEAT)
-						tick_timer[1] = registers::write(SYSTEM_TIMER_COUNTERS + 2u);
-					reg[SYSTEM_TIMER_STATUS] &= static_cast<uint8_t>(~(TIMER_IRQ << 4));
-				}
+			case SYSTEM_TIMER_1_MSB:
+			case SYSTEM_TIMER_1_LSB:
+			case SYSTEM_TIMER_2_MSB:
+			case SYSTEM_TIMER_2_LSB:
+			case SYSTEM_TIMER_3_MSB:
+			case SYSTEM_TIMER_3_LSB:
+				// All content provided by mc6840::tick()
 				break;
 
 			case CONSOLE_STATUS: // UART status
@@ -1660,7 +1602,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				fast_serial.guest_receive();
 				break;
 			}
-			//gpio_put(GPIO_TRACE_F, false);
+			//gpio_put(GPIO_TRACE_CORE1, false);
 		} // if (read_irq_received)
 	} // for(;;)
 }
@@ -1705,7 +1647,7 @@ bus_pio_dma_init()
 	init_pins_range(GPIO_BUSY, 3); // BUSY, LIC, AVMA
 	gpio_set_dir_in_masked(0b111u << GPIO_BUSY);
 
-	// DMA for main MC6809 bus read loop
+	// DMA for the main MC6809 bus read loop
 	if (dma_channel_is_claimed(piodma_read.address_channel)) {
 		printf("Pico2 MC6809E DMA channel %d for bus_read address is already claimed\n",
 		       piodma_read.address_channel);
@@ -1777,7 +1719,7 @@ bus_pio_dma_init()
 	}
 	mc6809_bus_write_program_init(piodma_write.pio, piodma_write.sm, ofs_write_bus);
 	printf("Pico2 MC6809E write pio%u sm%d configured\n", PIO_NUM(piodma_write.pio), piodma_write.sm);
-	// DMA for main MC6809 bus write loop
+	// DMA for the main MC6809 bus write loop
 	if (dma_channel_is_claimed(piodma_write.address_channel)) {
 		printf("Pico2 MC6809E DMA channel %d for bus_write address is already claimed\n",
 		       piodma_write.address_channel);

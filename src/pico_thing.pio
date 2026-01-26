@@ -84,7 +84,7 @@ wait_q:
 	pull	block		side 1	; Wait for data byte reply
 	out	pins 8		side 0	; Set D7-0 output values
 	wait	0 gpio GPIO_Q	side 0	; Q trailing edge
-	mov	pindirs !null	side 1	; Set D7-0 to output
+	mov	pindirs !null	side 1	; Set D7-0 to outz                                                                                                                                                                                                                                                                                                                                                                                                                      cput
 	wait	0 gpio GPIO_E	[7] side 1	; E trailing edge plus a bit
 	mov	pindirs null	side 0	; Set D7-0 back to input
 .wrap

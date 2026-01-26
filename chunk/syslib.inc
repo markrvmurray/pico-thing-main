@@ -1,8 +1,9 @@
 ;
-; Copyright (c) 2025 Mark R V Murray
+; Copyright (c) 2025-2026 Mark R V Murray
 ;
 ; SPDX-License-Identifier: BSD-2-Clause
 ;
+
 DEVICE	EXTERN
 SHARED	EXTERN
 SNIPPET	EXTERN
@@ -24,5 +25,7 @@ IRQ	EXTERN
 SWI	EXTERN
 NMI	EXTERN
 RESET	EXTERN
+
+INITIRQ	EXTERN
 
 STACK	EQU	$F000

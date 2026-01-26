@@ -16,9 +16,9 @@
 
 #include "tusb.h"
 #include "usb.h"
-#include "mc6809.h"
+#include "pico_thing.h"
 #include "processor.h"
-#include "uart.h"
+#include "mc6850.h"
 
 const char *ba_bs_string[] = {
 	foreach_busstate(enum_list_strings)
@@ -65,6 +65,12 @@ processor::task_change(uint8_t new_task)
 	gpio_put_masked64(TASK_PINS_MASK << GPIO_TASK_BASE, new_task << GPIO_TASK_BASE);
 	gpio_put(GPIO_TASK_0, new_task == 0u);
 	return new_task;
+}
+
+// The guest just executed an RTI instruction
+void
+processor::apply_rti()
+{
 }
 
 // Return the active task number
@@ -190,39 +196,23 @@ processor::release()
 }
 
 void
-processor::assert_interrupt(interrupt eirq)
+processor::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 {
-	switch (eirq) {
-	case INTERRUPT_NMI:
+	if (interrupt_refcount[INTERRUPT_NMI] > 0u) {
 		ASSERT_NMI;
-		break;
-	case INTERRUPT_FIRQ:
-		ASSERT_FIRQ;
-		break;
-	case INTERRUPT_IRQ:
-		ASSERT_IRQ;
-		break;
-	default:
-		break;
-	}
-}
-
-void
-processor::deassert_interrupt(interrupt eirq)
-{
-	switch (eirq) {
-	case INTERRUPT_NMI:
+		interrupt_refcount[INTERRUPT_NMI] = 0u;
+	} else
 		DEASSERT_NMI;
-		break;
-	case INTERRUPT_FIRQ:
+	if (interrupt_refcount[INTERRUPT_FIRQ] > 0u) {
+		ASSERT_FIRQ;
+		interrupt_refcount[INTERRUPT_FIRQ] = 0u;
+	} else
 		DEASSERT_FIRQ;
-		break;
-	case INTERRUPT_IRQ:
+	if (interrupt_refcount[INTERRUPT_IRQ] > 0u) {
+		ASSERT_IRQ;
+		interrupt_refcount[INTERRUPT_IRQ] = 0u;
+	} else
 		DEASSERT_IRQ;
-		break;
-	default:
-		break;
-	}
 }
 
 #define USB_BUFFER_SIZE 64
@@ -281,7 +271,7 @@ processor::set_e_frequency(const float target_mhz, const pio_dma &pio_clock)
 		e_freq = GUEST_CLK_MIN;
 	if (e_freq > GUEST_CLK_MAX)
 		e_freq = GUEST_CLK_MAX;
-	const float sys_clock_rate = clock_get_hz(clk_sys);
+	const auto sys_clock_rate = static_cast<float>(clock_get_hz(clk_sys));
 	const float guest_divisor = sys_clock_rate/(4.0f*e_freq*1.0e6f);
 	pio_sm_set_clkdiv(pio_clock.pio, pio_clock.sm, guest_divisor);
 	if (verbose)

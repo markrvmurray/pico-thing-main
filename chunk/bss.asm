@@ -1,3 +1,8 @@
+;
+; Copyright (c) 2025-2026 Mark R V Murray
+;
+; SPDX-License-Identifier: BSD-2-Clause
+;
 BSSCLR	EXPORT
 
 address_BSS	EXTERN

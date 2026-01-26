@@ -157,6 +157,7 @@ public:
 #endif
 	void init();
 	uint8_t task_change(uint8_t new_task);
+	void apply_rti();
 
 	[[nodiscard]] bool assert_stopped() const;
 	[[nodiscard]] uint8_t task_get() const;
@@ -165,8 +166,7 @@ public:
 	static void stop();
 	static void halt();
 	static void release();
-	static void assert_interrupt(interrupt eirq);
-	static void deassert_interrupt(interrupt eirq);
+	static void apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS]);
 	static void uart_task();
 	void preserve_state();
 	void restore_state();

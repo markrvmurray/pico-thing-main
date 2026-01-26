@@ -17,44 +17,32 @@ OUTCH	EXPORT
 GETS	EXPORT
 INCH	EXPORT
 
-*NO_IRQ	EQU	1
+#NO_IRQ	EQU	1
 
 	SECTION	TEXT
 
 	IFDEF	NO_IRQ
-INIT	PSHS	CC,A,X
-	BSR	RESET		reset the uart
-	PULS	CC,A,PC
+
+INIT	BSR	URESET		reset the uart
+	RTS
+
 	ELSE
+
 INIT	PSHS	CC,A,X
-*	BSR	IVARS
 	BSR	URESET		reset the uart
 	LDX	#IRQ_ISR
-	BSR	INITIRQ		install the interrrupt service routine
-	LDA	IQ_RX		elect eceive interrupts, transmit are enabled when needed
+	LBSR	INITIRQ		install the interrrupt service routine
+	LDA	IQ_RX		select receive interrupts, transmit interrupts are enabled when needed
 	STA	UARTC
 	PULS	CC
 	ANDCC	I		enable interrupts in cpu
 	PULS	A,X,PC
 
-* Local variable initialisation
-IVARS	CLR	RX_P_IN
-	CLR	RX_P_OU
-	CLR	TX_P_IN
-	CLR	TX_P_OU
-	RTS
-
-INITIRQ	STX	IRQ+1
-	RTS
-	ENDC
-
-URESET	PSHS	CC,A
-	LDA	#C_RESET	complete uart reset
+URESET	LDA	#C_RESET	complete uart reset
 	STA	UARTC
-R@0	LDA	UARTS
-	BITA	#S_BUSY
-	BNE	R@0
-	PULS	CC,A,PC
+	RTS
+
+	ENDC
 
 * Print a NUL-terminated string to the console.
 * In: X points to the string.
@@ -106,6 +94,7 @@ G@1	CLR	,Y
 	PULS	CC,A,PC
 
 * OUTCH - output byte in A to UART
+* No registers are changed.
 
 * IRQ_ISR [ ] TX_P_IN == TX_P_OU  : buffer empty
 * IRQ_ISR [ ] TX_P_IN != TX_P_OU  : next byte to transfer is at TX_P_OU, then TX_P_OU+
@@ -113,13 +102,16 @@ G@1	CLR	,Y
 * OUTCH   [*] TX_P_IN+ != TX_P_OU : Store byte in TX_P_IN, then TX_P_IN+
 
 	IFDEF	NO_IRQ
+
 OUTCH	PSHS	CC,B
 O@0	LDB	UARTS
-	BITB	#S_TX_EMPTY
+	BITB	#S_TDRE
 	BEQ	O@0		branch if transmitter not empty
 	STA	UARTTX
 	PULS	CC,B,PC
+
 	ELSE
+
 OUTCH	PSHS	CC,B,U
 	LDU	#TX_BUF
 	LDB	TX_P_IN
@@ -135,7 +127,13 @@ O@0	CMPB	TX_P_OU
 	LDB	IQ_RXTX		receive and transmit are both irq-driven
 	STB	UARTC
 	PULS	CC,B,U,PC
+
 	ENDC
+
+* INCH - input byte from UART to A
+* A contains returned value.
+* C Flag set means a byte was received.
+* No other registers or CC bits are changed.
 
 * IRQ_ISR [ ] RX_P_IN+ == RX_P_OU : buffer full
 * IRQ_ISR [ ] RX_P_IN+ != RX_P_OU : store byte in RX_P_IN, then RX_P_IN+
@@ -143,9 +141,10 @@ O@0	CMPB	TX_P_OU
 * INCH    [*] RX_P_IN != RX_P_OU  : next byte to return is at RX_P_OU, then RX_P_OU+, set carry
 
 	IFDEF	NO_IRQ
+
 INCH	PSHS	CC
 	LDA	UARTS
-	BITA	#S_RX_FULL
+	BITA	#S_RDRF
 	BEQ	I@0		branch if receiver not full
 	LDA	UARTRX
 	PULS	CC
@@ -154,7 +153,9 @@ INCH	PSHS	CC
 I@0	PULS	CC
 	ANDCC	C		carry clear means no byte
 	RTS
+
 	ELSE
+
 INCH	PSHS	CC,B,U
 	LDB	RX_P_OU
 	CMPB	RX_P_IN
@@ -170,6 +171,7 @@ INCH	PSHS	CC,B,U
 I@0	PULS	CC
 	ANDCC	C		carry clear means no byte
 	PULS	B,U,PC
+
 	ENDC
 
 * =====================================================================
@@ -186,24 +188,25 @@ I@0	PULS	CC
 * INCH    [ ] RX_P_IN != RX_P_OU  : next byte to return is at RX_P_OU, then RX_P_OU+, set carry
 
 	IFDEF	NO_IRQ
+
 IRQ_ISR	RTI
+
 	ELSE
-IQ_RX	FCB	C_RX_IRQ
-IQ_RXTX	FCB	C_RX_IRQ|C_TX_IRQ
+
 IRQ_ISR	ORCC	I
 	LDA	UARTS		this doesn't clear the interrupt
-	BITA	#S_TX_IRQ	transmitter interrupt
+	BITA	#S_TDRE		transmitter interrupt
 	BNE	TXIRQ
-	BITA	#S_RX_IRQ	receiver interrupt
+	BITA	#S_RDRF		receiver interrupt
 	BNE	RXIRQ
 * FALLTHROUGH
 	RTI
 
-TXIRQ	LDU	#TX_BUF
-	LDB	TX_P_OU
+TXIRQ	LDB	TX_P_OU
 	CMPB	TX_P_IN
 	BEQ	TXEMPTY
-	LDA	B,U
+	LDX	#TX_BUF
+	LDA	B,X
 	STA	UARTTX		clears the interrupt
 	INCB
 	ANDB	#%00001111	gives MOD 16
@@ -216,16 +219,16 @@ TXEMPTY	LDA	IQ_RX		interrupts on receiver only
 	STA	ERRNO
 	RTI
 
-RXIRQ	LDU	#RX_BUF
-	LDB	RX_P_IN
+RXIRQ	LDB	RX_P_IN
 	INCB
 	ANDB	#%00001111	gives MOD 16
 	CMPB	RX_P_OU
 	BEQ	RXFULL		if the input buffer is full
 	PSHS	B
-	LDB	RX_P_IN
 	LDA	UARTRX		clears the interrupt
-	STA	B,U
+	LDB	RX_P_IN
+	LDX	#RX_BUF
+	STA	B,X
 	PULS	B
 	STB	RX_P_IN
 	RTI
@@ -234,11 +237,19 @@ RXFULL	LDA	UARTRX		clear the interrupt
 	LDA	#$BE		set errno for the user
 	STA	ERRNO
 	RTI
+
 	ENDC
 
 	ENDSECTION
 
 	SECTION	CONSTANT
+
+	IFNDEF	NO_IRQ
+
+IQ_RX	FCB	C_RX_IRQ
+IQ_RXTX	FCB	C_RX_IRQ|C_TX_IRQ
+
+	ENDC
 
 	ENDSECTION
 

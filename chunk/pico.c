@@ -3,15 +3,14 @@
 
 struct sysvectors *sys_vector = (struct sysvectors *)0xFD00;
 
+extern uint8_t *UARTC;
+
 void
 initialiseFastSerial(void)
 {
 	asm {
-		lda	#$08		; complete uart reset
-		sta	$FFC8
-R@0		lda	$FFC8
-		bita	#$08
-		bne	R@0
+		lda	#$03		; complete uart reset
+		sta	$FFC3
 	}
 }
 
@@ -27,10 +26,10 @@ newOutputRoutine(void)
 		lda	#$0a
 O@0		bsr	O@1
 		bra	O@2
-O@1		ldb	$FFC8
-		bitb	#%00000001
+O@1		ldb	$FFC3
+		bitb	#%00000010
 		beq	O@1		; branch if transmitter not empty
-		sta	$FFC9
+		sta	$FFC4
 		rts
 O@2		puls	b
 	}
