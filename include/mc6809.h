@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//#ifndef PICO_MC6809_PROCESSOR_H
-//#define PICO_MC6809_PROCESSOR_H
 #pragma once
 
 // Guest E/Q clocks in MHz
@@ -183,5 +181,3 @@ public:
 // auto MC6809() { return &processor::getInstance(); }
 // processor *MC6809 = processor::getInstance();
 #define MC6809 mc6809::getInstance()
-
-//endif //PICO_MC6809_PROCESSOR_H

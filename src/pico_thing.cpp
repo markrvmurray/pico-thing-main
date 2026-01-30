@@ -155,6 +155,7 @@ static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
 	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_STOPPED
 };
 
+static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
 
 void __isr
@@ -162,6 +163,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 {
 	gpio_put(GPIO_TRACE_EQ_IRQ, true); // OINQUE DEBUG to time this function on the scope
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
+		q_rising_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
 		uint32_t bus_pins = gpio_get_all();
 		ba_bs_u new_bus_state{};
@@ -1334,32 +1336,23 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	sysreq_initialise();
 	mc6840 timer(reg, 1);
-	absolute_time_t next_us = get_absolute_time();
-	absolute_time_t next_ms = next_us;
+	absolute_time_t next_ms = get_absolute_time();
 
 	printf("Pico2 MC6809E core1 process started\n");
 
 	core1_initialised = true;
 
 	for (;;) {
-		if (absolute_time_diff_us(get_absolute_time(), next_us) <= 0) {
-			// timer.tick();
-			next_ms = make_timeout_time_us(1u);
-		}
 		if (absolute_time_diff_us(get_absolute_time(), next_ms) <= 0) {
 			fast_serial.task();
 			next_ms = make_timeout_time_ms(1u);
 		}
 
-		// For actions that may take more than one E clock cycle, provide
-		// e.g. an "Avail" bit, and set this when the action is done.
-
-		if (q_falling_edge) {
-			q_falling_edge = false;
+		// Interrupts need to be done before the falling edge of Q
+		if (q_rising_edge) {
+			q_rising_edge = false;
 			static uint32_t interrupt_refcount[NUM_INTERRUPTS];
 			interrupt eirq;
-			//gpio_put(GPIO_TRACE_CORE1, true);
-			timer.tick(1u);
 			// FOR_EACH interrupt_source:
 			eirq = timer.has_interrupt();
 			interrupt_refcount[eirq]++;
@@ -1371,6 +1364,13 @@ __no_inline_not_in_flash_func(main_core1)()
 			interrupt_refcount[eirq]++;
 			mc6809::apply_interrupts(interrupt_refcount);
 			// END FOR_EACH
+			//gpio_put(GPIO_TRACE_CORE1, false);
+		}
+
+		if (q_falling_edge) {
+			q_falling_edge = false;
+			//gpio_put(GPIO_TRACE_CORE1, true);
+			timer.tick(1u);
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
 
@@ -1469,7 +1469,9 @@ __no_inline_not_in_flash_func(main_core1)()
 
 			case CONSOLE_CONTROL: // UART command
 #ifdef DEBUG
-				if (written_byte & (CONSOLE_C_DIVIDE_0 | CONSOLE_C_DIVIDE_1) == (CONSOLE_C_DIVIDE_0 | CONSOLE_C_DIVIDE_1)) {
+			{
+				mc6850_control cr = {written_byte};
+				if (cr.divide_select == 0b11u) {
 					UART_CONTROL_COUNT = 0u;
 					UART_TX_DATA_COUNT = 0u;
 					UART_STATUS_COUNT = 0u;
@@ -1479,7 +1481,7 @@ __no_inline_not_in_flash_func(main_core1)()
 #endif
 				fast_serial.guest_control();
 				break;
-
+			}
 			case CONSOLE_TX_DATA: // UART tx data
 #ifdef DEBUG
 				UART_TX_DATA_COUNT++;

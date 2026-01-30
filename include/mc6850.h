@@ -4,9 +4,9 @@
 	* SPDX-License-Identifier: BSD-2-Clause
 	*/
 
-//#ifndef _MC6850_H
-//#define _MC6850_H
 #pragma once
+
+#include <pico/mutex.h>
 
 #include "pico/util/queue.h"
 
@@ -14,25 +14,6 @@
 
 // UART register bits
 #define CONSOLE_NONE		uint8_t(0b00000000u)
-// Control (write)
-#define CONSOLE_C_DIVIDE_0	uint8_t(0b00000001u)
-#define CONSOLE_C_DIVIDE_1	uint8_t(0b00000010u)
-#define CONSOLE_C_WORD_0	uint8_t(0b00000100u)
-#define CONSOLE_C_WORD_1	uint8_t(0b00001000u)
-#define CONSOLE_C_WORD_2	uint8_t(0b00010000u)
-#define CONSOLE_C_TX_0		uint8_t(0b00100000u)
-#define CONSOLE_C_TX_1		uint8_t(0b01000000u)
-#define CONSOLE_C_RX		uint8_t(0b10000000u)
-
-// Status (read)
-#define CONSOLE_S_RDRF		uint8_t(0b00000001u) // Rx Data Reg Full
-#define CONSOLE_S_TDRE		uint8_t(0b00000010u) // Tx Data Reg Empty
-#define CONSOLE_S_DCD		uint8_t(0b00000100u) // DCD
-#define CONSOLE_S_CTS		uint8_t(0b00001000u) // CTS
-#define CONSOLE_S_FE		uint8_t(0b00010000u) // FE
-#define CONSOLE_S_OVRN		uint8_t(0b00100000u) // OVRN
-#define CONSOLE_S_PE		uint8_t(0b01000000u) // PE
-#define CONSOLE_S_IRQ		uint8_t(0b10000000u) // IRQ
 
 // Wrapper for C-only queue_t type.
 class Queue {
@@ -61,7 +42,7 @@ public:
 	void put(const uint8_t ch) { queue_try_add(&queue, &ch); }
 };
 
-union Control {
+union mc6850_control {
 	uint8_t byte;
 	struct {
 		uint8_t divide_select : 2;
@@ -71,7 +52,7 @@ union Control {
 	};
 };
 
-union Status {
+union mc6850_status {
 	uint8_t byte;
 	struct {
 		uint8_t rdrf : 1;
@@ -86,11 +67,11 @@ union Status {
 };
 
 class mc6850 {
+	mutex_t reset_lock;
 	Queue tx;
 	Queue rx;
 	registers &reg;
-	volatile bool busy = true; // Constructor will reset this when done
-	const Status reset_status = { .tdre = 1 };
+	const mc6850_status reset_status = { .tdre = 1 };
 	bool transmit_buffer_empty = true;
 	bool receive_buffer_full = false;
 	bool transmit_irq = false;
@@ -104,14 +85,15 @@ public:
 	mc6850();
 	void reset();
 	void task();
-	uint transmit_level();
-	uint host_transmit_level_avail();
-	uint host_receive_level_avail();
-	uint receive_level();
-	bool host_transmit_avail();
-	bool host_receive_avail();
-	uint8_t host_receive();
-	void host_transmit(uint8_t ch);
+	uint host_transmit_level_avail() { return CONSOLE_QUEUE_LEN - rx.get_level(); }
+	uint transmit_level() { return rx.get_level(); }
+	uint host_receive_level_avail() { return tx.get_level(); }
+	uint receive_level() { return tx.get_level(); }
+	bool host_transmit_avail() { return !rx.is_full(); }
+	bool host_receive_avail() { return !tx.is_empty(); }
+	uint8_t host_receive() { return tx.get(); }
+	void host_transmit(const uint8_t ch) { rx.put(ch); }
+
 	[[nodiscard]] uint8_t interrupt_status() const
 	{
 		return	(transmit_buffer_empty ? 0b00000001 : 0b00000000) |
@@ -125,9 +107,7 @@ public:
 	void guest_status();
 	void guest_transmit();
 	void guest_control();
-	[[nodiscard]] interrupt has_interrupt() const;
+	[[nodiscard]] interrupt has_interrupt();
 };
 
 extern mc6850 fast_serial;
-
-//#endif // _MC6850_H

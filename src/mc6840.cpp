@@ -25,26 +25,24 @@ mc6840::mc6840(registers &reg, uint16_t interval)
 void
 mc6840::hard_reset()
 {
-	busy = true;
-	for (uint i = 0; i < 3; i++) {
-		control[i] = 0x00;
-		counter[i].whole = 0x0000;
-		ctr_latch[i].whole = 0xFFFF;
+	for (uint i = CTR1; i <= CTR3; i++) {
+		control[i].byte = 0x00;
+		counter[i].word = 0x0000;
+		ctr_latch[i].word = 0xFFFF;
 		running[i] = false;
 	}
-	status = 0x00;
+	status.byte = 0x00;
 	cycles = 0;
 	// I'm simulating the output of the first timer being
 	// wired to !NMI through an inverter.
 	nmi_pending = false;
-	busy = false;
 }
 
 void
 mc6840::soft_reset()
 {
-	status = 0x00;
-	for (uint i = 0; i < 3; i++)
+	status.byte = 0x00;
+	for (uint i = CTR1; i <= CTR3; i++)
 		initialise(i);
 	cycles = 0;
 }
@@ -54,13 +52,15 @@ mc6840::initialise(uint ctr)
 {
 	assert(ctr < 3 && "Invalid MC6840 counter");
 
-	counter[ctr].whole = ctr_latch[ctr].whole;
-	reg[SYSTEM_TIMER_1_MSB + ctr*2] = ctr_latch[ctr].whole;
-	running[ctr] = true;
-	// I'm simulating the output of the first timer being
-	// wired to !NMI through an inverter.
-	if (ctr == 0)
-		nmi_pending = false;
+	if (control[ctr].e_clk) {
+		counter[ctr].word = ctr_latch[ctr].word;
+		reg[SYSTEM_TIMER_1_MSB + ctr*2] = ctr_latch[ctr].word;
+		running[ctr] = true;
+		// I'm simulating the output of the first timer being
+		// wired to !NMI through an inverter.
+		if (ctr == 0)
+			nmi_pending = false;
+	}
 }
 
 void
@@ -69,37 +69,39 @@ mc6840::tick(uint8_t ticks)
 	cycles += ticks;
 	if (cycles < interval)
 		return;
-	if (control[2] & RESET)
+	if (control[CTR3].bit0) // RESET
 		return;
-	for (uint i = 0; i < 3; i++) {
+	for (uint i = CTR1; i <= CTR3; i++) {
 		if (running[i]) {
-			if ((control[i] & MODE_MASK) == SINGLE_0 && (control[i] & E_CLK)) {
-				if (control[i] & BITS8) {
-					if (counter[i].half[LOWER] != 0x00u)
-						counter[i].half[LOWER]--;
+			if (control[i].mode == SINGLE_0) {
+				if (control[i].bits_8) {
+					if (counter[i].byte[LOWER] != 0x00u)
+						counter[i].byte[LOWER]--;
 					else {
-						if (counter[i].half[UPPER] != 0x00u)
-							counter[i].half[UPPER]--;
+						// I'm simulating the output of the first timer being
+						// wired to !NMI through an inverter.
+						if (i == CTR1)
+							nmi_pending = true;
+						if (counter[i].byte[UPPER] != 0x00u)
+							counter[i].byte[UPPER]--;
 						else {
-							if ((control[i] & IRQ_EN) == IRQ_EN)
-								status |= (0b00000001u << i);
-							running[i] = false;
 							// I'm simulating the output of the first timer being
 							// wired to !NMI through an inverter.
-							if (i == 0)
-								nmi_pending = true;
+							if (i == CTR1)
+								nmi_pending = false;
+							running[i] = false;
+							if (control[i].irq_en)
+								status.irqs |= (0b00000001u << i);
 						}
 					}
-					reg[SYSTEM_TIMER_1_MSB + i*2] = ctr_latch[i].whole;
+					reg[SYSTEM_TIMER_1_MSB + i*2] = counter[i].word;
 				}
 			}
 		}
 	}
 	cycles = 0;
-	if (status & 0b00000111u)
-		status |= IRQ_ANY;
-	else
-		status = 0x00u;
+	status.irq = static_cast<bool>(status.irqs);
+	reg[SYSTEM_TIMER_STATUS] = status.byte;
 }
 
 void
@@ -111,36 +113,36 @@ mc6840::write(uint16_t offset, uint8_t val)
 	default:
 		break;
 	case SYSTEM_TIMER_CONTROL_13:
-		if (control[1] & CR1) {
-			control[0] = val;
-			if (control[0] & RESET)
+		if (control[CTR2].bit0) { // CR1
+			control[CTR1].byte = val;
+			if (control[CTR1].bit0) // RESET
 				soft_reset();
 		} else
-			control[2] = val;
+			control[CTR3].byte = val;
 		break;
 	case SYSTEM_TIMER_CONTROL_2:
-		control[1] = val;
+		control[CTR2].byte = val;
 		break;
 	case SYSTEM_TIMER_1_MSB:
-		ctr_latch[0].half[UPPER] = val;
+		ctr_latch[CTR1].byte[UPPER] = val;
 		break;
 	case SYSTEM_TIMER_1_LSB:
-		ctr_latch[0].half[LOWER] = val;
-		initialise(0);
+		ctr_latch[CTR1].byte[LOWER] = val;
+		initialise(CTR1);
 		break;
 	case SYSTEM_TIMER_2_MSB:
-		ctr_latch[1].half[UPPER] = val;
+		ctr_latch[CTR2].byte[UPPER] = val;
 		break;
 	case SYSTEM_TIMER_2_LSB:
-		ctr_latch[1].half[LOWER] = val;
-		initialise(1);
+		ctr_latch[CTR2].byte[LOWER] = val;
+		initialise(CTR2);
 		break;
 	case SYSTEM_TIMER_3_MSB:
-		ctr_latch[2].half[UPPER] = val;
+		ctr_latch[CTR3].byte[UPPER] = val;
 		break;
 	case SYSTEM_TIMER_3_LSB:
-		ctr_latch[2].half[LOWER] = val;
-		initialise(2);
+		ctr_latch[CTR3].byte[LOWER] = val;
+		initialise(CTR3);
 		break;
 	}
 }
@@ -154,5 +156,5 @@ mc6840::has_interrupt()
 		nmi_pending = false;
 		return INTERRUPT_NMI;
 	}
-	return status & IRQ_ANY ? INTERRUPT_IRQ : INTERRUPT_NONE;
+	return status.irq ? INTERRUPT_IRQ : INTERRUPT_NONE;
 }

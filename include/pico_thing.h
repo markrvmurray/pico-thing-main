@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#ifndef PICO_THING_H
-#define PICO_THING_H
+#pragma once
 
 #define DEVICE_VERSION "vX.X.x"
 
@@ -207,18 +206,9 @@ extern registers &reg;
 #define FLOAT_MULTIPLY		uint8_t('*')
 #define FLOAT_DIVIDE		uint8_t('/')
 
-// System timer control/status bits
-//#define TIMER_IRQ		uint8_t(0b00000001u)
-//#define TIMER_ENABLED		uint8_t(0b00000010u)
-//#define TIMER_REPEAT		uint8_t(0b00000100u)
-
 // Emulated UART
 // UART registers relative to REGISTER_DEVICES
 #define CONSOLE_CONTROL		uint16_t(0x03u)
 #define CONSOLE_STATUS		uint16_t(0x03u)
 #define CONSOLE_TX_DATA		uint16_t(0x04u)
 #define CONSOLE_RX_DATA		uint16_t(0x04u)
-
-//UART miscellaneous constants
-
-#endif // PICO_THING_H

@@ -21,32 +21,37 @@ mc6850::mc6850() :
 	rx(sizeof(uint8_t), CONSOLE_QUEUE_LEN),
 	reg(registers::getInstance())
 {
+	mutex_init(&reset_lock);
 	registers::write(CONSOLE_CONTROL) = CONSOLE_NONE;
 	reg[CONSOLE_STATUS] = reset_status.byte;
+	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>(0x00);
+	reg[CONSOLE_RX_DATA] = static_cast<uint8_t>(0x00);
 }
 
 void
 mc6850::reset()
 {
-	if (busy)
-		return;
-	busy = true;
+	mutex_enter_blocking(&reset_lock);
 	registers::write(CONSOLE_CONTROL) = CONSOLE_NONE;
 	reg[CONSOLE_STATUS] = CONSOLE_NONE;
-	transmit_buffer_empty = false;
+	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>(0x00);
+	reg[CONSOLE_RX_DATA] = static_cast<uint8_t>(0x00);
+	transmit_buffer_empty = true;
 	receive_buffer_full = false;
 	transmit_irq = false;
 	receive_irq = false;
+	assert_transmit_irq = false;
+	assert_receive_irq = false;
 	tx.reset();
 	rx.reset();
 	reg[CONSOLE_STATUS] = reset_status.byte;
-	busy = false;
+	mutex_exit(&reset_lock);
 }
 
 inline void
 mc6850::update_transmit(bool do_transmit)
 {
-	if (busy)
+	if (!mutex_try_enter(&reset_lock, nullptr))
 		return;
 	// The byte just arrived, so deal with it quickly
 	if (do_transmit) {
@@ -54,15 +59,16 @@ mc6850::update_transmit(bool do_transmit)
 			tx.put(registers::write(CONSOLE_TX_DATA));
 	}
 	transmit_buffer_empty = tx.has_space();
-	Status sr = {reg[CONSOLE_STATUS]};
+	mc6850_status sr = {reg[CONSOLE_STATUS]};
 	sr.tdre = transmit_buffer_empty;
 	reg[CONSOLE_STATUS] = sr.byte;
+	mutex_exit(&reset_lock);
 }
 
 inline void
 mc6850::update_receive(bool do_receive)
 {
-	if (busy)
+	if (!mutex_try_enter(&reset_lock, nullptr))
 		return;
 	if (do_receive) {
 		// in this case, the guest just read the byte, so we can replace it
@@ -78,24 +84,26 @@ mc6850::update_receive(bool do_receive)
 				reg[CONSOLE_RX_DATA] = rx.get();
 		}
 	}
-	Status sr = {reg[CONSOLE_STATUS]};
+	mc6850_status sr = {reg[CONSOLE_STATUS]};
 	sr.rdrf = receive_buffer_full;
 	reg[CONSOLE_STATUS] = sr.byte;
+	mutex_exit(&reset_lock);
 }
 
 inline void
 mc6850::update_interrupt()
 {
-	if (busy)
+	if (!mutex_try_enter(&reset_lock, nullptr))
 		return;
-	Control cr = {registers::write(CONSOLE_CONTROL)};
+	mc6850_control cr = {registers::write(CONSOLE_CONTROL)};
 	transmit_irq = cr.tx_irq == 0b01u;
 	receive_irq = cr.rx_irq;
 	assert_receive_irq = receive_irq && receive_buffer_full;
 	assert_transmit_irq = transmit_irq && transmit_buffer_empty;
-	Status sr = {reg[CONSOLE_STATUS] };
+	mc6850_status sr = {reg[CONSOLE_STATUS]};
 	sr.irq = assert_receive_irq || assert_transmit_irq;
 	reg[CONSOLE_STATUS] = sr.byte;
+	mutex_exit(&reset_lock);
 }
 
 void
@@ -117,7 +125,7 @@ mc6850::task()
 void
 mc6850::guest_control()
 {
-	Control cr = {registers::write(CONSOLE_CONTROL)};
+	mc6850_control cr = {registers::write(CONSOLE_CONTROL)};
 	printf("G in  %02X %02X   T: %d %d %d     R: %d %d %d\n", uint8_t(registers::write(CONSOLE_CONTROL)), uint8_t(reg[CONSOLE_STATUS]), assert_transmit_irq, transmit_irq, transmit_buffer_empty, assert_receive_irq, receive_irq, receive_buffer_full);
 	if (cr.divide_select == 0b11u)
 		reset();
@@ -143,60 +151,13 @@ mc6850::guest_receive()
 	update_interrupt();
 }
 
-uint
-mc6850::host_transmit_level_avail()
-{
-	return CONSOLE_QUEUE_LEN - rx.get_level();
-}
-
-uint
-mc6850::transmit_level()
-{
-	return rx.get_level();
-}
-
-uint
-mc6850::host_receive_level_avail()
-{
-	return tx.get_level();
-}
-
-uint
-mc6850::receive_level()
-{
-	return tx.get_level();
-}
-
-bool
-mc6850::host_transmit_avail()
-{
-	return !rx.is_full();
-}
-
-bool
-mc6850::host_receive_avail()
-{
-	return !tx.is_empty();
-}
-
-uint8_t
-mc6850::host_receive()
-{
-	return tx.get();
-}
-
-void
-mc6850::host_transmit(const uint8_t ch)
-{
-	rx.put(ch);
-}
-
 interrupt
-mc6850::has_interrupt() const
+mc6850::has_interrupt()
 {
-	if (busy)
+	if (!mutex_try_enter(&reset_lock, nullptr))
 		return INTERRUPT_NONE;
 	if (assert_transmit_irq || assert_receive_irq)
 		return INTERRUPT_IRQ;
 	return INTERRUPT_NONE;
+	mutex_exit(&reset_lock);
 }
