@@ -4,8 +4,9 @@
 	* SPDX-License-Identifier: BSD-2-Clause
 	*/
 
-#ifndef PICO_MC6809_MC6850_H
-#define PICO_MC6809_MC6850_H
+//#ifndef _MC6850_H
+//#define _MC6850_H
+#pragma once
 
 #include "pico/util/queue.h"
 
@@ -129,4 +130,4 @@ public:
 
 extern mc6850 fast_serial;
 
-#endif // PICO_MC6809_MC6850_H
+//#endif // _MC6850_H

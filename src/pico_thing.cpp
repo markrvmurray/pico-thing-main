@@ -29,7 +29,7 @@
 #include "tusb.h"
 #include "usb.h"
 #include "pico_thing.h"
-#include "processor.h"
+#include "mc6809.h"
 #include "srec.h"
 #include "mc6850.h"
 #include "build_time.h"
@@ -1369,7 +1369,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				printf("i:%u\n", eirq);
 #endif
 			interrupt_refcount[eirq]++;
-			processor::apply_interrupts(interrupt_refcount);
+			mc6809::apply_interrupts(interrupt_refcount);
 			// END FOR_EACH
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}

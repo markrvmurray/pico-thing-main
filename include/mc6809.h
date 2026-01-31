@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#ifndef PICO_MC6809_PROCESSOR_H
-#define PICO_MC6809_PROCESSOR_H
+//#ifndef PICO_MC6809_PROCESSOR_H
+//#define PICO_MC6809_PROCESSOR_H
+#pragma once
 
 // Guest E/Q clocks in MHz
 #define GUEST_CLK_DEFAULT 1.0f
@@ -113,7 +114,7 @@ union BLA {
 #define TRACE_WRITE 0x10000000u
 #endif
 
-class processor {
+class mc6809 {
 private:
 	volatile ba_bs_u old_bus_state{};
 	volatile ba_bs_u bus_state{};
@@ -132,18 +133,18 @@ private:
 	void task_initialise();
 	void setup(enum run_state rs);
 	// This is a singleton class
-	processor(); // no public constructor
-	~processor() = default; // no public destructor
-	inline static processor* instance = nullptr;
+	mc6809(); // no public constructor
+	~mc6809() = default; // no public destructor
+	inline static mc6809* instance = nullptr;
 public:
-	static processor& getInstance() {
+	static mc6809& getInstance() {
 		if (!instance) {
-			instance = new processor();
+			instance = new mc6809();
 		}
 		return *instance;
 	}
-	processor(const processor&) = delete;
-	processor& operator=(const processor&) = delete;
+	mc6809(const mc6809&) = delete;
+	mc6809& operator=(const mc6809&) = delete;
 	void set_busy_lic_avma(uint8_t value) { busy_lic_avma.byte = value; }
 	[[nodiscard]] uint8_t get_busy_lic_avma() const { return busy_lic_avma.byte; }
 	void unpack_busy_lic_avma() { busy = busy_lic_avma.bit.BUSY; lic = busy_lic_avma.bit.LIC; vma = busy_lic_avma.bit.AVMA; }
@@ -181,6 +182,6 @@ public:
 // Tidy up the singleton access semantics
 // auto MC6809() { return &processor::getInstance(); }
 // processor *MC6809 = processor::getInstance();
-#define MC6809 processor::getInstance()
+#define MC6809 mc6809::getInstance()
 
-#endif //PICO_MC6809_PROCESSOR_H
+//endif //PICO_MC6809_PROCESSOR_H

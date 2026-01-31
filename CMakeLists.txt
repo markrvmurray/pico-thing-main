@@ -14,7 +14,7 @@ pico_sdk_init()
 
 add_executable(pico-thing
 		src/pico_thing.cpp
-		src/processor.cpp
+		src/mc6809.cpp
 		src/srec.cpp
 		src/mc6850.cpp
 		src/usb_descriptors.c

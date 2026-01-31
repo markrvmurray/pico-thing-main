@@ -13,7 +13,7 @@
 #include "hardware/pio.h"
 
 #include "pico_thing.h"
-#include "processor.h"
+#include "mc6809.h"
 #include "mc6850.h"
 
 mc6850::mc6850() :

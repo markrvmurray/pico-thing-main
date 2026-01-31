@@ -17,7 +17,7 @@
 #include "tusb.h"
 #include "usb.h"
 #include "pico_thing.h"
-#include "processor.h"
+#include "mc6809.h"
 #include "mc6850.h"
 
 const char *ba_bs_string[] = {
@@ -28,7 +28,7 @@ const char *run_state_string[] = {
 	foreach_runstate(enum_list_strings)
 };
 
-processor::processor() : task(0u), busy(false), lic(false), vma(false), trace{}
+mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 {
 	old_bus_state.state = BS_RUNNING_RESET;
 	bus_state.state = BS_RUNNING_RESET;
@@ -43,7 +43,7 @@ processor::processor() : task(0u), busy(false), lic(false), vma(false), trace{}
 
 // Done once at start of run
 void
-processor::task_initialise()
+mc6809::task_initialise()
 {
 	reg[SYSTEM_TASK] = static_cast<uint8_t>(0u);
 	task_stack_ptr = 0x00u;
@@ -58,7 +58,7 @@ processor::task_initialise()
 
 // Done when the guest changes the task register
 uint8_t
-processor::task_change(uint8_t new_task)
+mc6809::task_change(uint8_t new_task)
 {
 	new_task &= TASK_PINS_MASK;
 	task = new_task;
@@ -69,19 +69,19 @@ processor::task_change(uint8_t new_task)
 
 // The guest just executed an RTI instruction
 void
-processor::apply_rti()
+mc6809::apply_rti()
 {
 }
 
 // Return the active task number
 uint8_t
-processor::task_get() const
+mc6809::task_get() const
 {
 	return task;
 }
 
 bool
-processor::assert_stopped() const
+mc6809::assert_stopped() const
 {
 	bool retval = run_state == RS_STOPPED;
 	if (!retval)
@@ -90,7 +90,7 @@ processor::assert_stopped() const
 }
 
 void
-processor::setup(enum run_state rs)
+mc6809::setup(enum run_state rs)
 {
 	assert(rs == RS_STOPPED);
 	run_state = rs;
@@ -108,7 +108,7 @@ processor::setup(enum run_state rs)
 }
 
 void
-processor::init()
+mc6809::init()
 {
 	RESET_ASSERT;
 	HALT_DEASSERT;
@@ -119,7 +119,7 @@ processor::init()
 }
 
 void
-processor::start()
+mc6809::start()
 {
 	if (!assert_stopped())
 		return;
@@ -135,7 +135,7 @@ processor::start()
 }
 
 void
-processor::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
+mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 {
 	uint32_t i;
 	uint32_t timeout_us = timeout_ms*1000u;
@@ -172,7 +172,7 @@ processor::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 }
 
 void
-processor::stop()
+mc6809::stop()
 {
 	RESET_ASSERT;
 	if (verbose)
@@ -180,7 +180,7 @@ processor::stop()
 }
 
 void
-processor::halt()
+mc6809::halt()
 {
 	HALT_ASSERT;
 	if (verbose)
@@ -188,7 +188,7 @@ processor::halt()
 }
 
 void
-processor::release()
+mc6809::release()
 {
 	if (verbose)
 		printf("Releasing MC6809\n");
@@ -196,7 +196,7 @@ processor::release()
 }
 
 void
-processor::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
+mc6809::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 {
 	if (interrupt_refcount[INTERRUPT_NMI] > 0u) {
 		ASSERT_NMI;
@@ -218,7 +218,7 @@ processor::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 #define USB_BUFFER_SIZE 64
 
 void
-processor::uart_task()
+mc6809::uart_task()
 {
 	static uint8_t receive_buffer[USB_BUFFER_SIZE], transmit_buffer[USB_BUFFER_SIZE];
 	static uint16_t bytes_read = 0u, bytes_read_index = 0u, bytes_write = 0u, bytes_write_index = 0u;
@@ -254,17 +254,17 @@ processor::uart_task()
 }
 
 void
-processor::preserve_state()
+mc6809::preserve_state()
 {
 }
 
 void
-processor::restore_state()
+mc6809::restore_state()
 {
 }
 
 void
-processor::set_e_frequency(const float target_mhz, const pio_dma &pio_clock)
+mc6809::set_e_frequency(const float target_mhz, const pio_dma &pio_clock)
 {
 	e_freq = target_mhz;
 	if (e_freq < GUEST_CLK_MIN)
@@ -279,7 +279,7 @@ processor::set_e_frequency(const float target_mhz, const pio_dma &pio_clock)
 }
 
 float
-processor::get_e_frequency() const
+mc6809::get_e_frequency() const
 {
 	return e_freq;
 }

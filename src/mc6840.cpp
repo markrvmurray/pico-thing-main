@@ -13,7 +13,7 @@
 #include "hardware/pio.h"
 
 #include "pico_thing.h"
-#include "processor.h"
+#include "mc6809.h"
 #include "mc6840.h"
 
 mc6840::mc6840(registers &reg, uint16_t interval)
