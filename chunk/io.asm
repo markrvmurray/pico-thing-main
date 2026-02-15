@@ -17,7 +17,7 @@ OUTCH	EXPORT
 GETS	EXPORT
 INCH	EXPORT
 
-#NO_IRQ	EQU	1
+;NO_IRQ	EQU	1
 
 	SECTION	TEXT
 
@@ -38,11 +38,11 @@ INIT	PSHS	CC,A,X
 	ANDCC	I		enable interrupts in cpu
 	PULS	A,X,PC
 
+	ENDC
+
 URESET	LDA	#C_RESET	complete uart reset
 	STA	UARTC
 	RTS
-
-	ENDC
 
 * Print a NUL-terminated string to the console.
 * In: X points to the string.

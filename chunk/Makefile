@@ -49,7 +49,7 @@ syslib.obj: syslib.asm
 	lwasm --format=obj --list=syslib.lst --output=$@ $<
 
 stub.obj: stub.asm
-	lwasm --format=obj --list=syslib.lst --output=$@ $<
+	lwasm --format=obj --list=stub.lst --output=$@ $<
 
 disk_test.srec: disk_test.o pico.o ide_lib.o
 	cmoc --void-target --org=0x0130 --initial-s=0xf000 --srec --mc6839 -o $@ $^
