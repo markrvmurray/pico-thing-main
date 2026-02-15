@@ -29,9 +29,11 @@ public:
 	}
 	void reset()
 	{
+#ifdef NOT_NOW
 		uint8_t dummy;
 		while (!queue_is_empty(&queue))
 			queue_try_remove(&queue, &dummy);
+#endif
 	}
 	bool is_empty() { return queue_is_empty(&queue); }
 	bool has_bytes() { return !queue_is_empty(&queue); }
@@ -67,7 +69,7 @@ union mc6850_status {
 };
 
 class mc6850 {
-	mutex_t reset_lock;
+	//mutex_t reset_lock;
 	Queue tx;
 	Queue rx;
 	registers &reg;
