@@ -12,15 +12,17 @@
 
 %}
 
-.define	public	GPIO_E		2
-.define	public	GPIO_Q		3
+.define	public	GPIO_E		0
+.define	public	GPIO_Q		1
 
-.define	public	GPIO_RW		4	; R/!W
-.define	public	GPIO_A_BASE	5	; A5-0
-.define	public	GPIO_D_BASE	11	; D7-0
-.define	public	GPIO_CS		19	; !CS_PICO
-.define	public	GPIO_TRACE_RD	29	; Debugging
-.define	public	GPIO_TRACE_WR	30	; Debugging
+.define	public	GPIO_RW		2	; R/!W
+.define	public	GPIO_A_BASE	3	; A5-0
+.define	public	GPIO_D_BASE	9	; D7-0
+.define	public	GPIO_CS		17	; !CS_PICO
+.define	public	GPIO_TRACE_RD	27	; Debugging
+.define	public	GPIO_TRACE_WR	28	; Debugging
+
+.define public	GPIO_PIX_BASE	32	; Communication with the second Pico
 
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.

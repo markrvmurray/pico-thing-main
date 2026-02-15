@@ -49,10 +49,10 @@ mc6809::task_initialise()
 	task_stack_ptr = 0x00u;
 	task = 0u;
 	init_pins_range(GPIO_TASK_BASE, NUM_TASK_PINS);
-	gpio_set_dir_out_masked64(TASK_PINS_MASK << GPIO_TASK_BASE);
+	gpio_set_dir_out_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE);
 	gpio_init(GPIO_TASK_0);
 	gpio_set_dir(GPIO_TASK_0, GPIO_OUT);
-	gpio_put_masked64(TASK_PINS_MASK << GPIO_TASK_BASE, 0LLu);
+	gpio_put_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE, 0LLu);
 	gpio_put(GPIO_TASK_0, true);
 }
 
@@ -62,7 +62,7 @@ mc6809::task_change(uint8_t new_task)
 {
 	new_task &= TASK_PINS_MASK;
 	task = new_task;
-	gpio_put_masked64(TASK_PINS_MASK << GPIO_TASK_BASE, new_task << GPIO_TASK_BASE);
+	gpio_put_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE, static_cast<uint64_t>(new_task) << GPIO_TASK_BASE);
 	gpio_put(GPIO_TASK_0, new_task == 0u);
 	return new_task;
 }
@@ -110,11 +110,32 @@ mc6809::setup(enum run_state rs)
 void
 mc6809::init()
 {
+	// Assert reset until the guest is needed
+	gpio_init(GPIO_RESET);
+	gpio_set_dir(GPIO_RESET, GPIO_OUT);
 	RESET_ASSERT;
+
+	// Hold !halt high until needed
+	gpio_init(GPIO_HALT);
+	gpio_set_dir(GPIO_HALT, GPIO_OUT);
 	HALT_DEASSERT;
+
+	// The 3 interrupt outputs are going to pretend to be open-collector by
+	// either going high impedance (becoming an input) or driving low
+	// (becoming an output). Macros will be used to avoid confusion.
+	gpio_init(GPIO_NMI);
+	gpio_put(GPIO_NMI, false);
+	gpio_set_drive_strength(GPIO_NMI, GPIO_DRIVE_STRENGTH_8MA);
 	DEASSERT_NMI;
+	gpio_init(GPIO_FIRQ);
+	gpio_put(GPIO_FIRQ, false);
+	gpio_set_drive_strength(GPIO_FIRQ, GPIO_DRIVE_STRENGTH_8MA);
 	DEASSERT_FIRQ;
+	gpio_init(GPIO_IRQ);
+	gpio_put(GPIO_IRQ, false);
+	gpio_set_drive_strength(GPIO_IRQ, GPIO_DRIVE_STRENGTH_8MA);
 	DEASSERT_IRQ;
+
 	setup(RS_STOPPED);
 }
 

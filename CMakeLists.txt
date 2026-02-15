@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD pimoroni_pga2350)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
 project(pico-thing C CXX ASM)
@@ -59,7 +60,7 @@ target_link_libraries(pico-thing
 	pico_multicore
 	pico_aon_timer
 	pico_unique_id
-	hardware_adc
+	# hardware_adc
 	hardware_dma
 	hardware_irq
 	hardware_pio
@@ -72,4 +73,4 @@ pico_enable_stdio_usb(pico-thing 0)
 pico_enable_stdio_uart(pico-thing 1)
 
 pico_add_extra_outputs(pico-thing)
-# pico_set_binary_type(pico-thing copy_to_ram)
+pico_set_binary_type(pico-thing copy_to_ram)

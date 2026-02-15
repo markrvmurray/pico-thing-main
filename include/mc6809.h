@@ -170,6 +170,11 @@ public:
 	void preserve_state();
 	void restore_state();
 	void set_e_frequency(float target_mhz, const pio_dma &pio_clock);
+	[[nodiscard]] bool is_started() const { return run_state == RS_STARTED; };
+	[[nodiscard]] bool is_interrupted() const { return run_state == RS_INTERRUPTED; };
+	[[nodiscard]] bool is_synced() const { return run_state == RS_SYNCED; };
+	[[nodiscard]] bool is_halted() const { return run_state == RS_HALTED; };
+	[[nodiscard]] bool is_stopped() const { return run_state == RS_STOPPED; }
 	[[nodiscard]] float get_e_frequency() const;
 	friend void gpio_clock_eq_irq_handler();
 	friend void dma_bus_read_irq_handler();

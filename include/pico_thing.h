@@ -14,50 +14,57 @@ extern volatile bool verbose;
 
 // === Pin map ===
 enum {
-	// Default assignment
-	GPIO_UART_TX = 0, // [Y] [o]  RP2xxx UART Tx
-	GPIO_UART_RX = 1, // [Y] [i]  RP2xxx UART Rx
-
 	// Fast/timing-critical - GPIO Bank0, done by PIO
-	//	GPIO_E = 2,		// [Y] [o]  E clock
-	//	GPIO_Q = 3,		// [Y] [o]  Q clock
-	//	GPIO_RW = 4,		// [Y] [i]  Bus R/!W
-	//	GPIO_A_BASE = 5,	// [Y] [i]  Address bus, 6 pins
-	//	GPIO_D_BASE = 11,	// [Y] [io] Data bus, 8 pins
-	//	GPIO_CS = 19,		// [Y] [i]  Device !CS
+	//	GPIO_E = 0,		// [Y] [o]  E clock
+	//	GPIO_Q = 1,		// [Y] [o]  Q clock
+	//	GPIO_RW = 2,		// [Y] [i]  Bus R/!W
+	//	GPIO_A_BASE = 3,	// [Y] [i]  Address bus, 6 pins
+	//	GPIO_D_BASE = 9,	// [Y] [io] Data bus, 8 pins
+	//	GPIO_CS = 17,		// [Y] [i]  Device !CS
 
 	// Fast/cycle-critical - GPIO Bank0, done by ISR
 	// BS/BA and BUSY/LIC/AVMA must be on consecutive pin runs in this order
-	GPIO_BS = 20,   // [Y] [i]  BS
-	GPIO_BA = 21,   // [Y] [i]  BA
-	GPIO_BUSY = 22, // [Y] [i]  BUSY
-	GPIO_LIC = 23,  // [Y] [i]  LIC
-	GPIO_AVMA = 24, // [Y] [i]  AVMA
+	GPIO_BS = 18,   // [Y] [i]  BS
+	GPIO_BA = 19,   // [Y] [i]  BA
+	GPIO_BUSY = 20, // [Y] [i]  BUSY
+	GPIO_LIC = 21,  // [Y] [i]  LIC
+	GPIO_AVMA = 22, // [Y] [i]  AVMA
 
 	// Asynchronous, at cycle speed
-	GPIO_HALT = 25, // [Y] [o]  !HALT
-	GPIO_NMI = 26,  // [Y] [o*] !NMI
-	GPIO_IRQ = 27,  // [Y] [o*] !IRQ
-	GPIO_FIRQ = 28, // [Y] [o*] !FIRQ
+	GPIO_HALT = 23, // [Y] [o]  !HALT
+	GPIO_NMI = 24,  // [Y] [o*] !NMI
+	GPIO_FIRQ = 25, // [Y] [o*] !FIRQ
+	GPIO_IRQ = 26,  // [Y] [o*] !IRQ
 
 	// Fast/timing-critical - GPIO Bank0 - will be removed when debugging is done
-	//	GPIO_TRACE_RD = 29,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
-	//	GPIO_TRACE_WR = 30,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
-
-	// Slow - guest instruction-level timing
-	GPIO_TASK_BASE = 31,
-	GPIO_TASK_0 = 36,
+	//	GPIO_TRACE_RD = 27,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
+	//	GPIO_TRACE_WR = 28,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
 
 	// Slow - set at a leisurely pace at human-user speeds
-	GPIO_POWER = 40, // [Y] [o]  External power enable
-	GPIO_RESET = 41, // [Y] [o]  !RESET
+	GPIO_RESET = 29, // [Y] [o]  !RESET
+
+	// Default assignment
+	GPIO_UART_TX = 30, // [Y] [o]  RP2xxx UART Tx
+	GPIO_UART_RX = 31, // [Y] [i]  RP2xxx UART Rx
+
+	// Fast communication with the video Pico
+	// GPIO_PIX_BASE = 32, // [ ] Four pins for fast communication
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
-	GPIO_TRACE_CORE1 = 43, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_EQ_IRQ = 44, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_READ_IRQ = 45, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_WRITE_IRQ = 46, // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_POWER_ADC = 47, // [Y] [i]  ADC connected to the 5v line, divided by 2
+	GPIO_TRACE_CORE1 = 36,     // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_EQ_IRQ = 37,    // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_READ_IRQ = 38,  // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_WRITE_IRQ = 39, // [Y] [o]  Temporary debugging output pins for the scope
+
+	// Slow - guest instruction-level timing
+	GPIO_TASK_BASE = 40,
+	GPIO_TASK_0 = 45,
+
+	// Slow - set at a leisurely pace at human-user speeds
+	GPIO_POWER = 46, // [Y] [o]  External power enable
+
+	// Used by the PSRAM !CS on the PGA2350. Bummer.
+	// GPIO_POWER_ADC = 47, // [Y] [i]  ADC connected to the 5v line, divided by 2
 };
 
 
@@ -91,6 +98,7 @@ class registers {
 		ReadProxy& operator=(uint16_t v) { *reinterpret_cast<volatile uint16_t*>(&read_registers[i]) = __builtin_bswap16(v); return *this; }
 		ReadProxy& operator=(float v) { uint32_t u; std::memcpy(&u, &v, sizeof u); *reinterpret_cast<volatile uint32_t*>(&read_registers[i]) = __builtin_bswap32(u); return *this; }
 		bool operator==(uint8_t v) const { return read_registers[i] == v; }
+		bool operator!=(uint8_t v) const { return read_registers[i] != v; }
 		bool operator==(uint16_t v) const { return *reinterpret_cast<volatile uint16_t*>(&read_registers[i]) == __builtin_bswap16(v); }
 		bool operator==(float v) const { uint32_t u = __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(&read_registers[i])); float f; std::memcpy(&f,&u,sizeof f); return f == v; }
 		ReadProxy& operator&=(uint8_t v) { read_registers[i] &= v; return *this; }
@@ -183,7 +191,7 @@ extern registers &reg;
 
 // Task register bits
 #define NUM_TASK_PINS		5
-#define	TASK_PINS_MASK		0b00011111u
+#define	TASK_PINS_MASK		((1u << NUM_TASK_PINS) - 1u)
 
 // System request opcodes
 #define	REQUEST_NULL		uint8_t(0x00u)

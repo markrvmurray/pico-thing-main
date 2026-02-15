@@ -19,7 +19,7 @@
 #include "pico/multicore.h"
 
 #include "hardware/clocks.h"
-#include "hardware/adc.h"
+//#include "hardware/adc.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
@@ -36,10 +36,12 @@
 #include "mc6840.h"
 
 // PIO program headers will be generated from the .pio file
-#include "mc6809.pio.h"
+#include <cstdint>
+
+#include "pico_thing.pio.h"
 
 // I'm really pushing my luck with this.
-#define SYS_CLK_DEFAULT 360000000
+#define SYS_CLK_DEFAULT 320000000
 
 // Default pico uart for command-line interactive access
 #define CONSOLE uart0
@@ -250,6 +252,8 @@ __time_critical_func(dma_bus_write_irq_handler())
 	if (!MC6809.bus_state.bit.RESET) {
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
 		write_location = written_addr & 0x0000003Fu;
+		if (write_location >= REGISTER_BUFFER_OFFSET && write_location <= REGISTER_BUFFER_OFFSET + 15u)
+			reg[write_location] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
 		write_irq_received = true;
 #ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
@@ -471,13 +475,34 @@ print_time()
 }
 
 enum e_commands {
-	VERBOSE, EXAMINE, MODIFY, STATUS, SNIPPET, LOOP, VECTOR, FILL, TIME, GO, TASK, IRQ, TRACE, RUN, STOP, FREQ, RESET, USB, S19, NONE
+	POWER,
+	VERBOSE,
+	EXAMINE,
+	MODIFY,
+	STATUS,
+	SNIPPET,
+	LOOP,
+	VECTOR,
+	FILL,
+	TIME,
+	GO,
+	TASK,
+	IRQ,
+	TRACE,
+	RUN,
+	STOP,
+	FREQ,
+	RESET,
+	USB,
+	S19,
+	NONE
 };
 
 struct s_commands {
 	const char *str;
 	enum e_commands com;
 } commands[] = {
+	{ "power", POWER },
 	{ "verbose", VERBOSE },
 	{ "examine", EXAMINE },
 	{ "modify", MODIFY },
@@ -499,6 +524,20 @@ struct s_commands {
 	{ "S19", NONE },
 	{ nullptr, NONE }
 };
+
+static interrupt console_interrupt = INTERRUPT_NONE;
+
+static void
+console_set_interrupt(interrupt eirq)
+{
+	console_interrupt = eirq;
+}
+
+static interrupt
+console_has_interrupt()
+{
+	return console_interrupt;
+}
 
 #define BUFFER_SIZE 256u
 void
@@ -545,6 +584,10 @@ process_command(char *buf)
 	default:
 		printf("Unknown command \"%s\"\n", tokenlist[0]);
 		return;
+	case POWER: {
+		// TODO: MarkM: Start powered-down, and refactor for user-controlled power-on and -off.
+		return;
+	}
 	case VERBOSE: {
 		if (tokencount != 1u) {
 			printf("Usage:\n\n> verbose\n\n");
@@ -667,7 +710,8 @@ process_command(char *buf)
 			printf("Usage:\n\n> status\n\n");
 			return;
 		}
-		// correction factor tweeked from empirical measurement
+#ifdef NO_ADC_YET
+		// correction factor tweaked from empirical measurement
 		constexpr float conversion_factor = ((2.5334f*2.0f)/5.0f)*3.3f/(1 << 12);
 		adc_select_input(7);
 		uint16_t raw_vcc = adc_read();
@@ -678,6 +722,7 @@ process_command(char *buf)
 		voltage_temp = conversion_factor * static_cast<float>(raw_temp);
 		float temperature = 27.0f - (voltage_temp - 0.706f)/0.001721f;
 		printf("Pico2 temperature = %.1f C\n", temperature);
+#endif
 		printf("Run state: %u = %s\n", MC6809.run_state, run_state_string[MC6809.run_state]);
 		printf("Bus State: %u = %s\t(previous is %u = %s)\n",
 		       MC6809.bus_state.state,
@@ -696,7 +741,7 @@ process_command(char *buf)
 		{
 			static uint16_t last_LIC = 0u;
 			printf("LIC count: %lu\n", MC6809.get_lic_count());
-			if (MC6809.run_state == RS_STARTED) {
+			if (MC6809.is_started()) {
 				uint8_t LIC = MC6809.get_lic_count();
 				if (last_LIC != LIC)
 					last_LIC = LIC;
@@ -953,12 +998,16 @@ process_command(char *buf)
 	}
 	break;
 	case IRQ: {
+		uint32_t timeout = 0u;
+		const uint8_t *final_stack;
+		uint16_t final_stack_length;
+		const char *test_name;
 		if (tokencount != 2u) {
-			printf("Usage:\n\n> irq 1|2|3|4|5\n\n");
+			printf("Usage:\n\n> irq 0|1|2|3|4|5\n\n");
 			return;
 		}
 		const uint32_t hexnum = hex(tokenlist[1], 0);
-		if (hexnum < 1 || hexnum > 5) {
+		if (hexnum > 5) {
 			printf("Bad IRQ test ID '%s'\n", tokenlist[1]);
 			return;
 		}
@@ -970,71 +1019,148 @@ process_command(char *buf)
 		}
 		for (int i = 0; i < 16; i += 2)
 			reg[REGISTER_VECTORS_OFFSET + i] = static_cast<uint16_t>(0x0000);
-		if (hexnum == 1) {
+		snippet_copy(ZERO);
+		MC6809.start_with_timeout(10000u, true);
+		if (hexnum == 0) {
+			printf("Interrupt strobe test. Hit any key to continue.\n");
+			for (;;) {
+				const int ch = getchar_timeout_us(0);
+				if (ch != PICO_ERROR_TIMEOUT)
+					break;
+				console_set_interrupt(INTERRUPT_NMI);
+				sleep_ms(5u);
+				console_set_interrupt(INTERRUPT_NONE);
+				sleep_ms(5u);
+				console_set_interrupt(INTERRUPT_FIRQ);
+				sleep_ms(5u);
+				console_set_interrupt(INTERRUPT_NONE);
+				sleep_ms(5u);
+				console_set_interrupt(INTERRUPT_IRQ);
+				sleep_ms(5u);
+				console_set_interrupt(INTERRUPT_NONE);
+				sleep_ms(5u);
+			}
+			final_stack_length = 0u;
+		} else if (hexnum == 1) {
+			static constexpr const char *testname = "SWI";
+			static constexpr uint16_t stack_result_length = 12u;
+			static constexpr uint8_t stack_result[stack_result_length] = {
+				0xD0, 0x55, 0xAA, 0x00, 0x66, 0x77, 0x00, 0x00, 0x33, 0xCC, 0xFF, 0xEE
+			};
 			printf("SWI Test\n");
 			snippet_copy(TEST_SWI);
 			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 14);
 			MC6809.start();
-			printf("SWI: Check that the MC6809 has finished and that the stack frame is OK\n");
+			while (!MC6809.is_synced()) {
+				sleep_us(1);
+				if (++timeout > 1000000u)
+					break;
+			}
+			MC6809.stop();
+			test_name = testname;
+			final_stack_length = stack_result_length;
+			final_stack = stack_result;
 		} else if (hexnum == 2) {
+			static constexpr const char *testname = "NMI";
+			static constexpr uint16_t stack_result_length = 12u;
+			static constexpr uint8_t stack_result[stack_result_length] = {
+				0xD8, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0x00, 0x00, 0xCC, 0xDD, 0xFF, 0xED
+			};
 			printf("NMI Test\n");
-			uint32_t timeout = 0u;
 			snippet_copy(TEST_NMI);
 			reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
 			MC6809.start();
 			sleep_us(100u);
-			ASSERT_NMI;
-			while (MC6809.bus_state.state != BS_SYNC) {
+			console_set_interrupt(INTERRUPT_NMI);
+			while (!MC6809.is_synced()) {
 				sleep_us(1);
 				if (++timeout > 1000000u)
 					break;
 			}
-			DEASSERT_NMI;
-			printf("Timeout counter went to %u iterations\n", timeout);
-			printf("NMI: Check that the MC6809 has finished and that the stack frame is OK\n");
+			MC6809.stop();
+			console_set_interrupt(INTERRUPT_NONE);
+			test_name = testname;
+			final_stack_length = stack_result_length;
+			final_stack = stack_result;
 		} else if (hexnum == 3) {
+			static constexpr const char *testname = "IRQ";
+			static constexpr uint16_t stack_result_length = 12u;
+			static constexpr uint8_t stack_result[stack_result_length] = {
+				0xC8, 0x00, 0x00, 0x00, 0xAB, 0xAB, 0x00, 0x00, 0xCD, 0xCD, 0xFF, 0xED
+			};
 			printf("IRQ Test\n");
-			uint32_t timeout = 0u;
 			snippet_copy(TEST_IRQ);
 			reg[REGISTER_VECTOR_IRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
 			MC6809.start();
 			sleep_us(100u);
-			ASSERT_IRQ;
-			while (MC6809.bus_state.state != BS_SYNC) {
+			console_set_interrupt(INTERRUPT_IRQ);
+			while (!MC6809.is_synced()) {
 				sleep_us(1);
 				if (++timeout > 1000000u)
 					break;
 			}
-			DEASSERT_IRQ;
-			printf("Timeout counter went to %u iterations\n", timeout);
-			printf("IRQ: Check that the MC6809 has finished and that the stack frame is OK\n");
+			MC6809.stop();
+			console_set_interrupt(INTERRUPT_NONE);
+			test_name = testname;
+			final_stack_length = stack_result_length;
+			final_stack = stack_result;
 		} else if (hexnum == 4) {
+			static constexpr const char *testname = "FIRQ";
+			static constexpr uint16_t stack_result_length = 3u;
+			static constexpr uint8_t stack_result[stack_result_length] = {
+				0x1F, 0xFF, 0xED
+			};
 			printf("FIRQ Test\n");
-			uint32_t timeout = 0u;
 			snippet_copy(TEST_FIRQ);
 			reg[REGISTER_VECTOR_FIRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
 			MC6809.start();
 			sleep_us(100u);
-			ASSERT_FIRQ;
-			while (MC6809.bus_state.state != BS_SYNC) {
+			console_set_interrupt(INTERRUPT_FIRQ);
+			while (!MC6809.is_synced()) {
 				sleep_us(1);
 				if (++timeout > 1000000u)
 					break;
 			}
-			DEASSERT_FIRQ;
-			printf("Timeout counter went to %u iterations\n", timeout);
-			printf("FIRQ: Check that the MC6809 has finished and that the stack frame is OK\n");
+			MC6809.stop();
+			console_set_interrupt(INTERRUPT_NONE);
+			test_name = testname;
+			final_stack_length = stack_result_length;
+			final_stack = stack_result;
 		} else {
-			printf("RTI Test\n");
-			static constexpr uint16_t stack_len = 16u;
-			static uint8_t stack[stack_len] = {
-				0xD0, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x90, 0xFF, 0xE6
+			static constexpr const char *testname = "RTI";
+			static constexpr uint16_t stack_result_length = 12u;
+			static constexpr uint8_t stack_result[stack_result_length] = {
+				0x80, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x90, 0xFF, 0xE7
 			};
-			for (uint16_t i = 0; i < stack_len; i++)
-				reg[REGISTER_BUFFER_OFFSET + 4 + i] = stack[i];
+			printf("RTI Test\n");
+			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 9);
+			for (uint16_t i = 0; i < stack_result_length; i++)
+				reg[REGISTER_BUFFER_OFFSET + (16u - stack_result_length) + i] = stack_result[i];
+			reg[REGISTER_BUFFER_OFFSET + 15u] = static_cast<uint8_t>(0xE6);
 			snippet_copy(TEST_RTI);
 			MC6809.start();
-			printf("RTI: Check that the MC6809 has finished and that the stack frame is OK\n");
+			while (!MC6809.is_synced()) {
+				sleep_us(1);
+				if (++timeout > 1000000u)
+					break;
+			}
+			MC6809.stop();
+			test_name = testname;
+			final_stack_length = stack_result_length;
+			final_stack = stack_result;
+		}
+		if (final_stack_length) {
+			bool success = true;
+			for (uint16_t i = 0; i < final_stack_length; i++)
+				if (reg[REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i] != final_stack[i]) {
+					printf("mismatch %04X %02X %02X\n", REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i, static_cast<uint8_t>(reg.write(REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i)), final_stack[i]);
+					success = false;
+				}
+			if (timeout > 1000000u) {
+				printf("Timeout reached\n");
+				success = false;
+			}
+			printf("%s: Timeout counter: %u  Test result: %s\n", test_name, timeout, success ? "PASS" : "FAIL");
 		}
 	}
 	break;
@@ -1293,9 +1419,6 @@ __no_inline_not_in_flash_func(main_core1)()
 	init_pins_range(GPIO_TRACE_CORE1, 4); // OINQUE DEBUG trace pins - isr set
 	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_CORE1);
 
-	MC6809.init();
-	printf("Pico2 MC6809E guest initialised\n");
-
 	fast_serial.reset();
 	printf("Pico2 MC6809E console initialised/reset\n");
 
@@ -1354,13 +1477,11 @@ __no_inline_not_in_flash_func(main_core1)()
 			static uint32_t interrupt_refcount[NUM_INTERRUPTS];
 			interrupt eirq;
 			// FOR_EACH interrupt_source:
+			eirq = console_has_interrupt();
+			interrupt_refcount[eirq]++;
 			eirq = timer.has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
-#ifdef DEBUG_NOT_NOW
-			if (eirq != INTERRUPT_NONE)
-				printf("i:%u\n", eirq);
-#endif
 			interrupt_refcount[eirq]++;
 			mc6809::apply_interrupts(interrupt_refcount);
 			// END FOR_EACH
@@ -1377,9 +1498,9 @@ __no_inline_not_in_flash_func(main_core1)()
 		if (write_irq_received) {
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			write_irq_received = false;
-			const uint8_t loc = write_location;
-			const uint8_t written_byte = registers::write(loc);
-			switch (loc) {
+			const uint8_t written_location = write_location;
+			const uint8_t written_byte = registers::write(written_location);
+			switch (written_location) {
 			default:
 				break;
 
@@ -1456,17 +1577,6 @@ __no_inline_not_in_flash_func(main_core1)()
 				// TODO: MarkM - implement finer-grained sysreqs
 				break;
 
-			case SYSTEM_TIMER_CONTROL_13:
-			case SYSTEM_TIMER_CONTROL_2:
-			case SYSTEM_TIMER_1_MSB:
-			case SYSTEM_TIMER_1_LSB:
-			case SYSTEM_TIMER_2_MSB:
-			case SYSTEM_TIMER_2_LSB:
-			case SYSTEM_TIMER_3_MSB:
-			case SYSTEM_TIMER_3_LSB:
-				timer.write(loc - SYSTEM_TIMER_BASE, written_byte);
-				break;
-
 			case CONSOLE_CONTROL: // UART command
 #ifdef DEBUG
 			{
@@ -1489,6 +1599,17 @@ __no_inline_not_in_flash_func(main_core1)()
 				fast_serial.guest_transmit();
 				break;
 
+			case SYSTEM_TIMER_CONTROL_13:
+			case SYSTEM_TIMER_CONTROL_2:
+			case SYSTEM_TIMER_1_MSB:
+			case SYSTEM_TIMER_1_LSB:
+			case SYSTEM_TIMER_2_MSB:
+			case SYSTEM_TIMER_2_LSB:
+			case SYSTEM_TIMER_3_MSB:
+			case SYSTEM_TIMER_3_LSB:
+				timer.write(written_location - SYSTEM_TIMER_BASE, written_byte);
+				break;
+
 			case REGISTER_BUFFER_OFFSET + 0x00:
 			case REGISTER_BUFFER_OFFSET + 0x01:
 			case REGISTER_BUFFER_OFFSET + 0x02:
@@ -1506,10 +1627,8 @@ __no_inline_not_in_flash_func(main_core1)()
 			case REGISTER_BUFFER_OFFSET + 0x0E:
 			case REGISTER_BUFFER_OFFSET + 0x0F:
 				// This is a shared block of emulated RAM for
-				// moving around blocks of data. Copy the byte from
-				// the WRITEs location to its READs mirror.
-				reg[loc] = written_byte;
-				break;
+				// moving around blocks of data. The ISR will
+				// copy this over to the read registers for us.
 
 			case REGISTER_SNIPPET_OFFSET + 0x00:
 			case REGISTER_SNIPPET_OFFSET + 0x01:
@@ -1556,8 +1675,7 @@ __no_inline_not_in_flash_func(main_core1)()
 		if (read_irq_received) {
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
-			const uint8_t loc = read_location;
-			switch (loc) {
+			switch (read_location) {
 			default:
 				// The MC6809 got whatever byte was here. By default, do nothing else.
 				break;
@@ -1578,17 +1696,6 @@ __no_inline_not_in_flash_func(main_core1)()
 				// Will be set by the sysreq processor
 				break;
 
-			case SYSTEM_TIMER_CONTROL_13:
-			case SYSTEM_TIMER_STATUS:
-			case SYSTEM_TIMER_1_MSB:
-			case SYSTEM_TIMER_1_LSB:
-			case SYSTEM_TIMER_2_MSB:
-			case SYSTEM_TIMER_2_LSB:
-			case SYSTEM_TIMER_3_MSB:
-			case SYSTEM_TIMER_3_LSB:
-				// All content provided by mc6840::tick()
-				break;
-
 			case CONSOLE_STATUS: // UART status
 #ifdef DEBUG
 				UART_STATUS_COUNT++;
@@ -1603,6 +1710,18 @@ __no_inline_not_in_flash_func(main_core1)()
 				// The guest already got the byte, now get the next one
 				fast_serial.guest_receive();
 				break;
+
+			case SYSTEM_TIMER_CONTROL_13:
+			case SYSTEM_TIMER_STATUS:
+			case SYSTEM_TIMER_1_MSB:
+			case SYSTEM_TIMER_1_LSB:
+			case SYSTEM_TIMER_2_MSB:
+			case SYSTEM_TIMER_2_LSB:
+			case SYSTEM_TIMER_3_MSB:
+			case SYSTEM_TIMER_3_LSB:
+				// All content provided by mc6840::tick()
+				break;
+
 			}
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		} // if (read_irq_received)
@@ -1767,7 +1886,8 @@ bus_pio_dma_init()
 	printf("Pico2 MC6809E DMA write_address channel configured\n");
 }
 
-#if 0
+#define MEASURE_FREQS
+#ifdef MEASURE_FREQS
 static void
 measure_freqs()
 {
@@ -1798,8 +1918,11 @@ measure_freqs()
 int
 main()
 {
-	vreg_set_voltage(VREG_VOLTAGE_1_50);
+	vreg_set_voltage(VREG_VOLTAGE_2_00);
 	sleep_ms(5);
+
+	gpio_set_function(GPIO_UART_TX, UART_FUNCSEL_NUM(uart0, GPIO_UART_TX));
+	gpio_set_function(GPIO_UART_RX, UART_FUNCSEL_NUM(uart0, GPIO_UART_RX));
 
 	stdio_init_all();
 
@@ -1809,6 +1932,9 @@ main()
 	printf("Pico2 MC6809E build with DEBUG defined\n");
 #endif
 
+#ifdef MEASURE_FREQS
+	measure_freqs();
+#endif
 	printf("Pico2 MC6809E raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
 	if (set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
 		stdio_init_all();
@@ -1823,36 +1949,19 @@ main()
 	}
 	printf("Pico2 MC6809E console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
+#ifdef NO_ADC_YET
 	adc_init();
 	adc_gpio_init(GPIO_POWER_ADC);
 	adc_set_temp_sensor_enabled(true);
+#endif
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
 	POWER_ASSERT;
 
-	// Assert reset until the guest is needed
-	gpio_init(GPIO_RESET);
-	gpio_set_dir(GPIO_RESET, GPIO_OUT);
-	RESET_ASSERT;
-
-	// Hold !halt high until needed
-	gpio_init(GPIO_HALT);
-	gpio_set_dir(GPIO_HALT, GPIO_OUT);
-	HALT_DEASSERT;
-
-	// The 3 interrupt outputs are going to pretend to be open-collector by
-	// either going high impedance (becoming an input) or driving low
-	// (becoming an output). Macros will be used to avoid confusion.
-	gpio_init(GPIO_NMI);
-	gpio_put(GPIO_NMI, false);
-	DEASSERT_NMI;
-	gpio_init(GPIO_FIRQ);
-	gpio_put(GPIO_FIRQ, false);
-	DEASSERT_FIRQ;
-	gpio_init(GPIO_IRQ);
-	gpio_put(GPIO_IRQ, false);
-	DEASSERT_IRQ;
+	// Setup !Reset, !Halt, and the interrupt pins.
+	MC6809.init();
+	printf("Pico2 MC6809E guest state initialised\n");
 
 	sleep_ms(10);
 	printf("Pico2 MC6809E external power on.\n");
