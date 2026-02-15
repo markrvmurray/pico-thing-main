@@ -33,6 +33,17 @@ D@0	STA	,X+
 	BNE	D@0
 	SYNC
 
+* Zero all processor registers
+Zero	ORG	START
+	LDD	#$0000
+	ANDCC	#$00
+	ORCC	I,F
+	TFR	D,X
+	TFR	D,Y
+	TFR	D,U
+	TFR	D,S
+	SYNC
+
 * Fill a block of memory with a constant byte
 Fill	ORG	START
 	LDA	#$AA	This value will be replaced by the Pico
@@ -137,8 +148,8 @@ TstNMI	LDS	#START
 	CLRA
 	CLRB
 	LDU	#$CCDD
-t@0	NOP
-	BRA	t@0
+	NOP
+t@0	BRA	t@0
 ISR2	SYNC
 
 * The test driver will need to prepare the IRQ vector, start/observe the run,
@@ -147,10 +158,10 @@ ISR2	SYNC
 	ORG	START
 TstIRQ	LDS	#START
 	LDX	#$ABAB
-	ANDCC	#%11101111
 	LDU	#$CDCD
-t@0	NOP
-	BRA	t@0
+	ANDCC	I
+	NOP
+t@0	BRA	t@0
 ISR3	SYNC
 
 * The test driver will need to prepare the FIRQ vector, start/observe the run,
@@ -158,15 +169,32 @@ ISR3	SYNC
 * and that the SYNC was hit. Proves that !FIRQ works
 	ORG	START
 TstFIRQ	LDS	#START
-	ANDCC	#%10111111
-	ORCC	#%00001111
-t@0	NOP
-	BRA	t@0
-	SYNC
-	SYNC
-	SYNC
-	SYNC
+	ORCC	N,Z,V,C
+	ANDCC	F
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+t@0	BRA	t@0
 ISR4	SYNC
+
+* A prepared stack frame needs to be set up. Once the RTI runs, the return
+* address must point to the Cont offset. SWI is used to dump the registers
+* back onto the stack, then we sync.
+	ORG	START
+TstRti	LDS	#START-12
+	NOP
+	RTI
+Cont	SWI
+	NOP
+	SYNC
+RtiSwi	NOP
+	RTI
+	NOP
+	NOP
+	NOP
+t@0	BRA	t@0
 
 * The test driver will need to copy_out the chunk, set the IRQ vector to ISR5 ($0200),
 * and run the chunk in interactive mode
@@ -259,25 +287,10 @@ EXITC	FCB	0
 	FCB	$DE,$AD,$C0,$DE
 EUrtIRQ	EQU	*
 
-* A prepared stack frame needs to be set up. Once the RTI runs, the return
-* address must point to the Cont offset. Check that the SYNC is hit.
-	ORG	START
-TstRti	LDS	#START-12
-	NOP
-	RTI
-Cont	NOP
-	NOP
-	NOP
-	NOP
-	NOP
-	NOP
-	NOP
-	NOP
-	NOP
-	SYNC
-
 	ORG	$0000
 	FCC	"DAT_INIT"
+	FCB	' '
+	FCC	"ZERO"
 	FCB	' '
 	FCC	"BLOCK_FILL"
 	FCB	' '
@@ -301,6 +314,6 @@ Cont	NOP
 	FCB	' '
 	FCC	"TEST_FIRQ"
 	FCB	' '
-	FCC	"UART_IRQ"
-	FCB	' '
 	FCC	"TEST_RTI"
+	FCB	' '
+	FCC	"UART_IRQ"
