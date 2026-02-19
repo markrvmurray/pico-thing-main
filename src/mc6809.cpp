@@ -16,6 +16,7 @@
 
 #include "tusb.h"
 #include "usb.h"
+#include "registers.h"
 #include "pico_thing.h"
 #include "mc6809.h"
 #include "mc6850.h"
@@ -38,6 +39,7 @@ mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 	e_freq = GUEST_CLK_DEFAULT;
 #ifdef DEBUG
 	_count_lic = 0u;
+	_count_rti = 0u;
 #endif
 }
 
@@ -65,12 +67,6 @@ mc6809::task_change(uint8_t new_task)
 	gpio_put_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE, static_cast<uint64_t>(new_task) << GPIO_TASK_BASE);
 	gpio_put(GPIO_TASK_0, new_task == 0u);
 	return new_task;
-}
-
-// The guest just executed an RTI instruction
-void
-mc6809::apply_rti()
-{
 }
 
 // Return the active task number
@@ -102,6 +98,7 @@ mc6809::setup(enum run_state rs)
 	vma = false;
 #ifdef DEBUG
 	_count_lic = 0u;
+	_count_rti = 0u;
 	trace_pos = 0u;
 #endif
 	task_initialise();
@@ -170,6 +167,7 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 	setup(RS_STOPPED);
 #ifdef DEBUG
 	uint32_t lic_start = _count_lic;
+	uint32_t rti_start = _count_rti;
 #endif
 	RESET_DEASSERT;
 	for (i = 0; i < 1000u*timeout_ms; i++) {
@@ -186,6 +184,7 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 		printf("MC6809 run took %u iterations\n", i);
 #ifdef DEBUG
 		printf("%lu LICs were counted\n", _count_lic - lic_start);
+		printf("%lu RTIs were counted\n", _count_rti - rti_start);
 #endif
 		if (i == 1000u*timeout_ms)
 			printf("Timeout was reached\n");
@@ -234,6 +233,15 @@ mc6809::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 		interrupt_refcount[INTERRUPT_IRQ] = 0u;
 	} else
 		DEASSERT_IRQ;
+}
+
+// The guest just executed an RTI instruction from the snippet block
+void
+mc6809::apply_rti()
+{
+#ifdef DEBUG
+	count_rti();
+#endif
 }
 
 #define USB_BUFFER_SIZE 64

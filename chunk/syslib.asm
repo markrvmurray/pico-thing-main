@@ -47,7 +47,7 @@ RESET	jmp	Start
 
 	SECTION IO_DEVICES
 
-ATAIDE	RMB	32
+ATAIDE	RMB	16
 
 	ENDSECTION
 
@@ -58,7 +58,13 @@ UARTC	RMB	0		; These two share an address
 UARTS	RMB	1
 UARTTX	RMB	0		; These two share an address
 UARTRX	RMB	1
-	RMB	11
+	RMB	3
+PTMC13	RMB	1		; Control registers 1 and 3
+PTMC2	RMB     0		; Control register 2
+PTMSTA	RMB	1		; Read status register
+PTMTM1	RMB	2		; Counter 1
+PTMTM2	RMB	2		; Counter 2
+PTMTM3	RMB	2		; Counter 3
 
 SHARED	RMB	16		; Address of a shared buffer for moving bytes
 

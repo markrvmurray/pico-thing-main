@@ -12,6 +12,7 @@
 
 #include "hardware/pio.h"
 
+#include "registers.h"
 #include "pico_thing.h"
 #include "mc6809.h"
 #include "mc6840.h"

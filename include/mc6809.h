@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+
 // Guest E/Q clocks in MHz
 #define GUEST_CLK_DEFAULT 1.0f
 #define GUEST_CLK_MIN 0.8f
@@ -119,11 +121,12 @@ private:
 	volatile enum run_state run_state;
 	volatile BLA busy_lic_avma{};
 	volatile uint8_t task;
-	volatile uint16_t task_stack_ptr;
+	std::atomic<uint16_t> task_stack_ptr{0u};
 	volatile bool busy, lic, vma;
 #ifdef DEBUG
 	static constexpr unsigned trace_size = TRACE_SIZE;
 	volatile uint32_t _count_lic;
+	volatile uint32_t _count_rti;
 	volatile unsigned trace_pos = 0u;
 	volatile uint32_t trace[trace_size][4u];
 #endif
@@ -133,13 +136,10 @@ private:
 	// This is a singleton class
 	mc6809(); // no public constructor
 	~mc6809() = default; // no public destructor
-	inline static mc6809* instance = nullptr;
 public:
 	static mc6809& getInstance() {
-		if (!instance) {
-			instance = new mc6809();
-		}
-		return *instance;
+		static mc6809 instance;
+		return instance;
 	}
 	mc6809(const mc6809&) = delete;
 	mc6809& operator=(const mc6809&) = delete;
@@ -153,6 +153,9 @@ public:
 	void clear_lic_count() { _count_lic = 0u; }
 	[[nodiscard]] uint32_t get_lic_count() const { return _count_lic; }
 	void count_lic() { if (lic && bus_state.state == BS_RUNNING) _count_lic++; }
+	void clear_rti_count() { _count_rti = 0u; }
+	[[nodiscard]] uint32_t get_rti_count() const { return _count_rti; }
+	void count_rti() { _count_rti++; }
 #endif
 	void init();
 	uint8_t task_change(uint8_t new_task);

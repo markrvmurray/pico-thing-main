@@ -28,6 +28,7 @@
 
 #include "tusb.h"
 #include "usb.h"
+#include "registers.h"
 #include "pico_thing.h"
 #include "mc6809.h"
 #include "srec.h"
@@ -79,74 +80,10 @@ static pio_dma piodma_write = {
 	DMA_IRQ_1
 };
 
-// 64-byte memory-mapped registers
-// There are 2 blocks, one for the Read DMA and the other for the Write DMA.
-// This allows for software enforcement of read-only areas and for device
-// registers to share status and control at the same address.
-// The alignment is there to allow the base address to have the lower 6 bits
-// all zeroes, so that the rest can be used as DMA prefixes without faffing
-// around with pointer arithmetic.
-
-registers &reg = registers::getInstance();
-
-void
-registers::copy_out(uint8_t *dst, uint16_t addr, uint16_t len)
-{
-	for (uint16_t i = 0; i < len; i++)
-		dst[i] = read_registers[addr + i];
-}
-
-void
-registers::copy_out_write(uint8_t *dst, uint16_t addr, uint16_t len)
-{
-	for (uint16_t i = 0; i < len; i++)
-		dst[i] = write_registers[addr + i];
-}
-
-void
-registers::copy_in(uint16_t addr, const uint8_t *src, uint16_t len)
-{
-	for (uint16_t i = 0u; i < len; i++)
-		read_registers[addr + i] = src[i];
-}
-
 // Keep track of which task was interrupted
 #define MAX_INT_NEST_DEPTH 16u
 static volatile uint8_t task_stack[MAX_INT_NEST_DEPTH];
 
-static void
-dump_registers()
-{
-	static uint8_t printables[17]; // Include the decorative bar down the middle
-
-	printf("Write block:\n");
-	for (uint16_t i = 0u; i < 4u; i++) {
-		registers::copy_out_write(printables, i*16u, 16u);
-		printf("%04X:", REGISTER_BASE + i*16u);
-		for (uint16_t j = 0u; j < 16u; j++) {
-			auto ch = static_cast<unsigned char>(printables[j]) & 0x7F;
-			printf(" %02X", printables[j]);
-			if (j == 7u)
-				printf(" ");
-			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
-		}
-		printf(" |%.8s|%.8s|\n", reinterpret_cast<char *>(printables), reinterpret_cast<char *>(printables + 8));
-	}
-	printf("Read block:\n");
-	for (uint16_t i = 0u; i < 4u; i++) {
-		registers::copy_out(printables, i*16u, 16u);
-		printf("%04X:", static_cast<uint16_t>(REGISTER_BASE + i*16u));
-		for (uint16_t j = 0u; j < 16u; j++) {
-			auto ch = static_cast<unsigned char>(printables[j]) & 0x7F;
-			printf(" %02X", printables[j]);
-			if (j == 7u)
-				printf(" ");
-			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
-		}
-		printf(" |%.8s|%.8s|\n", reinterpret_cast<char *>(printables), reinterpret_cast<char *>(printables + 8));
-	}
-	printf("--\n");
-}
 
 //	BS_RUNNING,    BS_IRQ,         BS_SYNC,   BS_HALT,   BS_RUNNING_RESET ....
 static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
@@ -160,16 +97,41 @@ static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
 
+union bus_pins {
+	struct {
+		uint32_t E : 1;
+		uint32_t Q : 1;
+		uint32_t RW : 1;
+		uint32_t A : 6;
+		uint32_t D : 8;
+		uint32_t CS : 1;
+		uint32_t BS_BA : 2;
+		uint32_t BUSY_LIC_AVMA : 3;
+		uint32_t HALT : 1;
+		uint32_t NMI : 1;
+		uint32_t FIRQ : 1;
+		uint32_t IRQ : 1;
+		uint32_t TRACE_RW : 2;
+		uint32_t RESET : 1;
+		uint32_t UART : 2;
+	} bits;
+	uint32_t word;
+};
+
+
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
 {
+#ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, true); // OINQUE DEBUG to time this function on the scope
+#endif
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
 		q_rising_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
-		uint32_t bus_pins = gpio_get_all();
+		bus_pins bus_pins{};
+		bus_pins.word = gpio_get_all();
 		ba_bs_u new_bus_state{};
-		new_bus_state.byte = ((bus_pins >> GPIO_BS) & 0b00000011u);
+		new_bus_state.byte = ((bus_pins.bits.BS_BA) & 0b00000011u);
 		new_bus_state.bit.RESET = RESET_IS_ASSERTED;
 		MC6809.unpack_busy_lic_avma(); // Previous cycle's advance notice
 #ifdef DEBUG
@@ -180,22 +142,28 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			MC6809.bus_state.state = new_bus_state.state;
 			MC6809.run_state = run_state_table[MC6809.run_state][MC6809.bus_state.state];
 			if (new_bus_state.state == BS_IRQ) {
-				auto eirq = static_cast<interrupt>((bus_pins >> (GPIO_A_BASE + 1)) & 0b111u);
+				auto eirq = static_cast<interrupt>(bus_pins.bits.A >> 1);
 				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < MAX_INT_NEST_DEPTH)
-					task_stack[MC6809.task_stack_ptr++] = MC6809.task;
+					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 			}
 		}
 //	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 	} else {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
-		uint32_t bus_pins = gpio_get_all();
+		bus_pins bus_pins{};
+		bus_pins.word = gpio_get_all();
 		// Grab the current 8 D pins if this is a read cycle, and the LIC timing lets us
-		// know it is an instruction. I want to catch RTI (0x3B).
+		// know it is an instruction, and it is the last byte of the snippet block.
+		// I want to catch RTI (0x3B).
+		if (MC6809.get_lic() && bus_pins.bits.RW && !bus_pins.bits.CS && bus_pins.bits.A == ((REGISTER_SNIPPET + REGISTER_SNIPPET_LEN - 1) & registers::register_mask) && bus_pins.bits.D == 0x3Bu)
+			MC6809.apply_rti();
 		// These 3 signals are all predictive; they indicate the status of the _next_ memory access
-		MC6809.set_busy_lic_avma(static_cast<uint8_t>((bus_pins >> GPIO_BUSY) & 0b00000111));
+		MC6809.set_busy_lic_avma(static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA));
 	}
+#ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, false); // OINQUE DEBUG to time this function on the scope
+#endif
 }
 
 // ISR for the R/!W bus read loop and DMA chain
@@ -213,12 +181,14 @@ static volatile uint8_t read_location;
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
 {
+#ifdef DEBUG
 	gpio_put(GPIO_TRACE_READ_IRQ, true); // OINQUE DEBUG to time this function on the scope
+#endif
 	//if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
 	if (!MC6809.bus_state.bit.RESET && MC6809.get_vma()) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
-		read_location = read_addr & 0x0000003Fu;
+		read_location = read_addr & registers::register_mask;
 		read_irq_received = true;
 #ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
@@ -231,7 +201,9 @@ __time_critical_func(dma_bus_read_irq_handler())
 #endif
 	}
 	//}
+#ifdef DEBUG
 	gpio_put(GPIO_TRACE_READ_IRQ, false); // OINQUE DEBUG to time this function on the scope
+#endif
 }
 
 // ISR for the R/!W bus write loop and DMA chain
@@ -246,13 +218,15 @@ static volatile uint8_t write_location;
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
+#ifdef DEBUG
 	gpio_put(GPIO_TRACE_WRITE_IRQ, true); // OINQUE DEBUG to time this function on the scope
+#endif
 	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
 	if (!MC6809.bus_state.bit.RESET) {
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
-		write_location = written_addr & 0x0000003Fu;
-		if (write_location >= REGISTER_BUFFER_OFFSET && write_location <= REGISTER_BUFFER_OFFSET + 15u)
+		write_location = written_addr & registers::register_mask;
+		if (write_location >= REGISTER_BUFFER_OFFSET && write_location < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
 			reg[write_location] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
 		write_irq_received = true;
 #ifdef DEBUG_NOT_NOW
@@ -266,7 +240,9 @@ __time_critical_func(dma_bus_write_irq_handler())
 #endif
 	}
 	// }
+#ifdef DEBUG
 	gpio_put(GPIO_TRACE_WRITE_IRQ, false); // OINQUE DEBUG to time this function on the scope
+#endif
 }
 
 #define SNIPPET_NAMES_INC 1
@@ -525,7 +501,7 @@ struct s_commands {
 	{ nullptr, NONE }
 };
 
-static interrupt console_interrupt = INTERRUPT_NONE;
+static volatile interrupt console_interrupt = INTERRUPT_NONE;
 
 static void
 console_set_interrupt(interrupt eirq)
@@ -698,7 +674,7 @@ process_command(char *buf)
 			printf("Modifying system registers, so provoking callbacks\n");
 			for (uint16_t i = 0u; i < tokencount - 2u; i++) {
 				registers::write(start + i) = buffer[i];
-				write_location = (start + i) & 0x3F;
+				write_location = (start + i) & registers::register_mask;
 				write_irq_received = true;
 				printf("%04X: %02X %02X %u\n", ADDRESS(start + i), static_cast<uint8_t>(registers::write(start + i)), static_cast<uint8_t>(reg[start + i]), write_irq_received);
 			}
@@ -738,20 +714,19 @@ process_command(char *buf)
 		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "high" : "LOW");
 		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "high" : "LOW");
 #ifdef DEBUG
-		{
-			static uint16_t last_LIC = 0u;
-			printf("LIC count: %lu\n", MC6809.get_lic_count());
-			if (MC6809.is_started()) {
-				uint8_t LIC = MC6809.get_lic_count();
-				if (last_LIC != LIC)
-					last_LIC = LIC;
-				else
-					printf("WARNING: LIC count is same as last time (%u), but the run state is %s\n", LIC, run_state_string[MC6809.run_state]);
-			}
+		static uint16_t last_LIC = 0u;
+		printf("LIC count: %lu\n", MC6809.get_lic_count());
+		if (MC6809.is_started()) {
+			uint8_t LIC = MC6809.get_lic_count();
+			if (last_LIC != LIC)
+				last_LIC = LIC;
+			else
+				printf("WARNING: LIC count is same as last time (%u), but the run state is %s\n", LIC, run_state_string[MC6809.run_state]);
 		}
+		printf("RTI count: %lu\n", MC6809.get_rti_count());
 #endif
 		printf("Register and emulated RAM block:\n");
-		dump_registers();
+		registers::dump();
 		printf("Console:\n");
 		printf("Interrupt status: %02X\n", fast_serial.interrupt_status());
 		printf("UART: TxQueue: %u\n", fast_serial.receive_level());
@@ -1068,7 +1043,7 @@ process_command(char *buf)
 			};
 			printf("NMI Test\n");
 			snippet_copy(TEST_NMI);
-			reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
+			reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + REGISTER_SNIPPET_LEN - 1);
 			MC6809.start();
 			sleep_us(100u);
 			console_set_interrupt(INTERRUPT_NMI);
@@ -1090,7 +1065,7 @@ process_command(char *buf)
 			};
 			printf("IRQ Test\n");
 			snippet_copy(TEST_IRQ);
-			reg[REGISTER_VECTOR_IRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
+			reg[REGISTER_VECTOR_IRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + REGISTER_SNIPPET_LEN - 1);
 			MC6809.start();
 			sleep_us(100u);
 			console_set_interrupt(INTERRUPT_IRQ);
@@ -1112,7 +1087,7 @@ process_command(char *buf)
 			};
 			printf("FIRQ Test\n");
 			snippet_copy(TEST_FIRQ);
-			reg[REGISTER_VECTOR_FIRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 15);
+			reg[REGISTER_VECTOR_FIRQ_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + REGISTER_SNIPPET_LEN - 1);
 			MC6809.start();
 			sleep_us(100u);
 			console_set_interrupt(INTERRUPT_FIRQ);
@@ -1136,7 +1111,7 @@ process_command(char *buf)
 			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 9);
 			for (uint16_t i = 0; i < stack_result_length; i++)
 				reg[REGISTER_BUFFER_OFFSET + (16u - stack_result_length) + i] = stack_result[i];
-			reg[REGISTER_BUFFER_OFFSET + 15u] = static_cast<uint8_t>(0xE6);
+			reg[REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN - 1] = static_cast<uint8_t>(0xE6);
 			snippet_copy(TEST_RTI);
 			MC6809.start();
 			while (!MC6809.is_synced()) {
@@ -1684,7 +1659,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				// If it is RTI (0x3B), then we need to be switching things
 				// around in the task scheduling.
 				if (MC6809.get_lic())
-					if (reg[REGISTER_SNIPPET_OFFSET + 0x0F] == static_cast<uint8_t>(0x3B))
+					if (reg[read_location] == static_cast<uint8_t>(0x3B))
 						MC6809.apply_rti();
 				break;
 
@@ -1936,17 +1911,13 @@ main()
 	measure_freqs();
 #endif
 	printf("Pico2 MC6809E raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
-	if (set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
-		stdio_init_all();
-		uart_init(CONSOLE, CONSOLE_BAUDRATE);
-		printf("successful!\n");
-	} else {
+	if (!set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
 		printf("unsuccessful! Reverting to %d MHz ... ", SYS_CLK_HZ/1000000);
 		set_sys_clock_hz(SYS_CLK_HZ, true);
-		stdio_init_all();
-		uart_init(CONSOLE, CONSOLE_BAUDRATE);
-		printf("successful!\n");
 	}
+	stdio_init_all();
+	uart_init(CONSOLE, CONSOLE_BAUDRATE);
+	printf("successful!\n");
 	printf("Pico2 MC6809E console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
 #ifdef NO_ADC_YET

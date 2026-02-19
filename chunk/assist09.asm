@@ -1,7 +1,8 @@
 *************************************
 * COPYRIGHT (C) MOTOROLA, INC. 1979 *
 *************************************
-
+	PRAGMA	autobranchlength
+	PRAGMA	noforwardrefmax
 *************************************
 * THIS IS THE BASE ASSIST09 ROM.
 * IT MAY RUN WITH OR WITHOUT THE
@@ -19,9 +20,9 @@ RAMOFS  EQU     -$1900          ; ROM OFFSET TO RAM WORK PAGE
 ROMSIZ  EQU     2048            ; ROM SIZE
 ROM2OF  EQU     ROMBEG-ROMSIZ   ; START OF EXTENSION ROM
 ACIA    EQU     $FFC3           ; DEFAULT ACIA ADDRESS
-PTM     EQU     $0000           ; DEFAULT PTM ADDRESS
+PTM     EQU     $FFC8           ; DEFAULT PTM ADDRESS
 DFTCHP  EQU     0               ; DEFAULT CHARACTER PAD COUNT
-DFTNLP  EQU     5               ; DEFAULT NEW LINE PAD COUNT
+DFTNLP  EQU     0               ; DEFAULT NEW LINE PAD COUNT
 PROMPT  EQU     '>              ; PROMPT CHARACTER
 NUMBKP  EQU     8               ; NUMBER OF BREAKPOINTS
 *********************************************
