@@ -64,67 +64,58 @@ TEST_CASE("Simple no-argument commands", "[parser]")
 }
 
 // ============================================================
-//  Keyword prefix matching (unambiguous prefixes)
+//  Fixed 2-letter mnemonic matching
+//  Each command accepts its full name OR exactly its registered alias.
 // ============================================================
 
-TEST_CASE("Unambiguous keyword prefix matching", "[parser][prefix]")
+TEST_CASE("Fixed 2-letter mnemonic matching", "[parser][mnemonic]")
 {
 	parsed_cmd_t cmd;
 
-	SECTION("'po' matches power")
+	SECTION("'pw' matches power")
 	{
-		REQUIRE(parse("po", &cmd));
+		REQUIRE(parse("pw", &cmd));
 		CHECK(cmd.tag == CMD_POWER);
 	}
-	SECTION("'ver' matches verbose (disambiguates from vector)")
+	SECTION("'vb' matches verbose (alias distinct from vector's 'vc')")
 	{
-		REQUIRE(parse("ver", &cmd));
+		REQUIRE(parse("vb", &cmd));
 		CHECK(cmd.tag == CMD_VERBOSE);
 	}
-	SECTION("'sta' disambiguates status from stop")
+	SECTION("'ex' matches examine")
 	{
-		REQUIRE(parse("sta", &cmd));
+		REQUIRE(parse("ex dat", &cmd));
+		CHECK(cmd.tag == CMD_EXAMINE_DAT);
+	}
+	SECTION("'mo' matches modify")
+	{
+		REQUIRE(parse("mo 1000 ab cd", &cmd));
+		CHECK(cmd.tag == CMD_MODIFY);
+	}
+	SECTION("'st' matches status")
+	{
+		REQUIRE(parse("st", &cmd));
 		CHECK(cmd.tag == CMD_STATUS);
 	}
-	SECTION("'sto' disambiguates stop from status")
+	SECTION("'sn' matches snippet")
 	{
-		REQUIRE(parse("sto", &cmd));
-		CHECK(cmd.tag == CMD_STOP);
-	}
-	SECTION("'sni' matches snippet")
-	{
-		REQUIRE(parse("sni 01", &cmd));
+		REQUIRE(parse("sn 01", &cmd));
 		CHECK(cmd.tag == CMD_SNIPPET);
 	}
-	SECTION("'re' matches reset (distinguishes from 'run' which starts ru)")
+	SECTION("'lo' matches loop")
 	{
-		REQUIRE(parse("re", &cmd));
-		CHECK(cmd.tag == CMD_RESET);
-	}
-	SECTION("'ru' matches run")
-	{
-		REQUIRE(parse("ru", &cmd));
-		CHECK(cmd.tag == CMD_RUN_LIST);
-	}
-	SECTION("'g' matches go")
-	{
-		REQUIRE(parse("g", &cmd));
-		CHECK(cmd.tag == CMD_GO);
-	}
-	SECTION("'l' matches loop — requires subcommand, so full form")
-	{
-		REQUIRE(parse("l r 1000", &cmd));
+		REQUIRE(parse("lo r 1000", &cmd));
 		CHECK(cmd.tag == CMD_LOOP);
+	}
+	SECTION("'vc' matches vector")
+	{
+		REQUIRE(parse("vc 0001 0002 0003 0004 0005 0006 0007 0008", &cmd));
+		CHECK(cmd.tag == CMD_VECTOR);
 	}
 	SECTION("'fi' matches fill")
 	{
 		REQUIRE(parse("fi all", &cmd));
 		CHECK(cmd.tag == CMD_FILL_ALL);
-	}
-	SECTION("'fr' matches freq")
-	{
-		REQUIRE(parse("fr 1.0", &cmd));
-		CHECK(cmd.tag == CMD_FREQ);
 	}
 	SECTION("'ti' matches time")
 	{
@@ -136,20 +127,52 @@ TEST_CASE("Unambiguous keyword prefix matching", "[parser][prefix]")
 		REQUIRE(parse("ta", &cmd));
 		CHECK(cmd.tag == CMD_TASK_QUERY);
 	}
+	SECTION("'ir' matches irq")
+	{
+		REQUIRE(parse("ir 0", &cmd));
+		CHECK(cmd.tag == CMD_IRQ);
+	}
 	SECTION("'tr' matches trace")
 	{
 		REQUIRE(parse("tr", &cmd));
 		CHECK(cmd.tag == CMD_TRACE);
 	}
-	SECTION("'i' matches irq")
+	SECTION("'ru' matches run")
 	{
-		REQUIRE(parse("i 0", &cmd));
-		CHECK(cmd.tag == CMD_IRQ);
+		REQUIRE(parse("ru", &cmd));
+		CHECK(cmd.tag == CMD_RUN_LIST);
 	}
-	SECTION("'vec' matches vector (disambiguates from verbose)")
+	SECTION("'sp' matches stop")
 	{
-		REQUIRE(parse("vec 0001 0002 0003 0004 0005 0006 0007 0008", &cmd));
-		CHECK(cmd.tag == CMD_VECTOR);
+		REQUIRE(parse("sp", &cmd));
+		CHECK(cmd.tag == CMD_STOP);
+	}
+	SECTION("'fq' matches freq")
+	{
+		REQUIRE(parse("fq 1.0", &cmd));
+		CHECK(cmd.tag == CMD_FREQ);
+	}
+	SECTION("'rs' matches reset")
+	{
+		REQUIRE(parse("rs", &cmd));
+		CHECK(cmd.tag == CMD_RESET);
+	}
+	SECTION("'ub' matches usb")
+	{
+		REQUIRE(parse("ub hello", &cmd));
+		CHECK(cmd.tag == CMD_USB);
+	}
+	SECTION("old prefix 'po' is no longer accepted")
+	{
+		CHECK_FALSE(parse("po", &cmd));
+	}
+	SECTION("old prefix 'ver' is no longer accepted")
+	{
+		CHECK_FALSE(parse("ver", &cmd));
+	}
+	SECTION("old prefix 're' is no longer accepted (reset is 'rs')")
+	{
+		CHECK_FALSE(parse("re", &cmd));
 	}
 }
 
@@ -259,9 +282,9 @@ TEST_CASE("examine command", "[parser][examine]")
 		CHECK(cmd.examine.start == 0x1000);
 		CHECK(cmd.examine.end   == 0x2000);
 	}
-	SECTION("prefix 'exa dat'")
+	SECTION("mnemonic 'ex dat'")
 	{
-		REQUIRE(parse("exa dat", &cmd));
+		REQUIRE(parse("ex dat", &cmd));
 		CHECK(cmd.tag == CMD_EXAMINE_DAT);
 	}
 	SECTION("start == FFC0 is rejected (boundary)")

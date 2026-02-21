@@ -7,8 +7,11 @@
  *
  * Design notes:
  *   - All symbols prefixed with cmd_yy to avoid collisions.
- *   - Command keywords are matched case-insensitively with unambiguous-prefix
- *     support via match_command_keyword() (mirrors the original strncasecmp logic).
+ *   - Command keywords are matched case-insensitively via match_command_keyword().
+ *     Each command accepts exactly its full name or a fixed 2-letter mnemonic
+ *     (e.g. "examine" or "ex").  Arbitrary prefix matching is intentionally
+ *     not supported: it caused hex addresses (e.g. "e", "f") to collide with
+ *     command prefixes when lexed as TOK_NUMBER.
  *   - Subcommand keywords (dat, all, halt, restart) and loop types (r/R/w/W/rw)
  *     are matched exactly (case-sensitive for loop types).
  *   - Numbers: any run of hex digits is TOK_NUMBER (action decides base).
@@ -50,8 +53,8 @@
 static char     _str_pool[CMD_STR_SLOTS][CMD_STR_WIDTH];
 static unsigned _str_head;
 
-void
-cmd_yy_reset_str_pool(void) { _str_head = 0; }
+/* Forward declaration — defined after the second %% where BEGIN() is valid. */
+void cmd_yy_reset_str_pool(void);
 
 static char *
 pool_tok(void)
@@ -68,62 +71,47 @@ pool_tok(void)
 /* -----------------------------------------------------------------------
  * match_command_keyword()
  *
- * Returns the bison token for the given word if it is an unambiguous
- * case-insensitive prefix of a known command keyword.
- * Returns 0 if not found, TOK_AMBIGUOUS if ambiguous (and prints message).
+ * Returns the bison token for the given word if it exactly matches either
+ * the full command name or its fixed 2-letter mnemonic (case-insensitive).
+ * Returns 0 if not recognised.
+ *
+ * Mnemonics are chosen so that no mnemonic consists entirely of hex digits
+ * (a-f), which would otherwise be lexed as TOK_NUMBER before the word rule
+ * has a chance to apply.
  * ----------------------------------------------------------------------- */
 static int
 match_command_keyword(const char *text)
 {
-	static const struct { const char *name; int tok; } kw[] = {
-		{ "power",   TOK_POWER   },
-		{ "verbose", TOK_VERBOSE },
-		{ "examine", TOK_EXAMINE },
-		{ "modify",  TOK_MODIFY  },
-		{ "status",  TOK_STATUS  },
-		{ "snippet", TOK_SNIPPET },
-		{ "loop",    TOK_LOOP    },
-		{ "vector",  TOK_VECTOR  },
-		{ "fill",    TOK_FILL    },
-		{ "time",    TOK_TIME    },
-		{ "go",      TOK_GO      },
-		{ "task",    TOK_TASK    },
-		{ "irq",     TOK_IRQ     },
-		{ "trace",   TOK_TRACE   },
-		{ "run",     TOK_RUN     },
-		{ "stop",    TOK_STOP    },
-		{ "freq",    TOK_FREQ    },
-		{ "reset",   TOK_RESET   },
-		{ "usb",     TOK_USB     },
-		{ NULL, 0 }
+	static const struct { const char *name; const char *alias; int tok; } kw[] = {
+		{ "power",   "pw", TOK_POWER   },
+		{ "verbose", "vb", TOK_VERBOSE },
+		{ "examine", "ex", TOK_EXAMINE },
+		{ "modify",  "mo", TOK_MODIFY  },
+		{ "status",  "st", TOK_STATUS  },
+		{ "snippet", "sn", TOK_SNIPPET },
+		{ "loop",    "lo", TOK_LOOP    },
+		{ "vector",  "vc", TOK_VECTOR  },
+		{ "fill",    "fi", TOK_FILL    },
+		{ "time",    "ti", TOK_TIME    },
+		{ "go",      NULL, TOK_GO      },
+		{ "task",    "ta", TOK_TASK    },
+		{ "irq",     "ir", TOK_IRQ     },
+		{ "trace",   "tr", TOK_TRACE   },
+		{ "run",     "ru", TOK_RUN     },
+		{ "stop",    "sp", TOK_STOP    },
+		{ "freq",    "fq", TOK_FREQ    },
+		{ "reset",   "rs", TOK_RESET   },
+		{ "usb",     "ub", TOK_USB     },
+		{ NULL, NULL, 0 }
 	};
 
-	size_t len = strlen(text);
-	int matched_tok = 0;
-	int matched_count = 0;
-	const char *matched_name = NULL;
-
 	for (int i = 0; kw[i].name != NULL; i++) {
-		if (strncasecmp(text, kw[i].name, len) == 0) {
-			if (matched_count == 0) {
-				matched_tok  = kw[i].tok;
-				matched_name = kw[i].name;
-			} else {
-				/* Second match → ambiguous */
-				printf("Ambiguous command \"%s\" — \"%s\" vs \"%s\"",
-				       text, matched_name, kw[i].name);
-				/* Scan remaining matches to complete the message */
-				for (int j = i + 1; kw[j].name != NULL; j++) {
-					if (strncasecmp(text, kw[j].name, len) == 0)
-						printf(" vs \"%s\"", kw[j].name);
-				}
-				printf("\n");
-				return TOK_AMBIGUOUS;
-			}
-			matched_count++;
-		}
+		if (strcasecmp(text, kw[i].name) == 0)
+			return kw[i].tok;
+		if (kw[i].alias && strcasecmp(text, kw[i].alias) == 0)
+			return kw[i].tok;
 	}
-	return matched_tok; /* 0 if nothing matched */
+	return 0; /* not recognised */
 }
 %}
 
@@ -200,3 +188,12 @@ S[0159][0-9A-Fa-f]+                 { cmd_yylval.str = cmd_yytext; return TOK_SR
 [^ \t\r\n]+                 { cmd_yylval.str = cmd_yytext; return TOK_WORD; }
 
 %%
+
+/* Reset the string pool AND the flex start condition.
+ * Must live after the second %% so that BEGIN() is in scope. */
+void
+cmd_yy_reset_str_pool(void)
+{
+	_str_head = 0;
+	BEGIN(INITIAL);
+}

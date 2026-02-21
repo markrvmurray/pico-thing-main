@@ -148,7 +148,6 @@ static int _t_count;
 
 /* Control tokens */
 %token TOK_BANG
-%token TOK_AMBIGUOUS
 
 %%
 
@@ -180,7 +179,6 @@ command:
 	| freq_cmd
 	| usb_cmd
 	| srecord_cmd
-	| TOK_AMBIGUOUS   { YYERROR; /* message already printed by lexer */ }
 	| TOK_WORD        { printf("Unknown command \"%s\"\n", $1); YYERROR; }
 	;
 
