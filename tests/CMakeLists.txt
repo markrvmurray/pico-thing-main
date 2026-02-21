@@ -4,6 +4,20 @@ project(pico-mc6809-tests CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD 11)
 
+# macOS ships bison 2.3 which is too old; use Homebrew bison 3.x.
+if(APPLE)
+    find_program(_bison_homebrew
+        NAMES bison
+        PATHS /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin
+        NO_DEFAULT_PATH
+    )
+    if(_bison_homebrew)
+        set(BISON_EXECUTABLE "${_bison_homebrew}" CACHE FILEPATH "Bison executable" FORCE)
+    endif()
+endif()
+find_package(FLEX  REQUIRED)
+find_package(BISON 3.0 REQUIRED)
+
 include(FetchContent)
 FetchContent_Declare(
     Catch2
@@ -29,6 +43,37 @@ target_include_directories(test_srec PRIVATE
 )
 target_link_libraries(test_srec PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_srec)
+
+# ---------------------------------------------------------------------------
+# test_command_parser: flex/bison parser compiled natively for the host.
+#
+# Re-runs flex/bison on the same source files used by the firmware build;
+# the generated .c files land in the tests binary directory and are compiled
+# with the host compiler (not arm-none-eabi-gcc).
+# ---------------------------------------------------------------------------
+FLEX_TARGET(CmdLexerTest
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/command_lexer.l
+    ${CMAKE_CURRENT_BINARY_DIR}/command_lexer.c
+)
+BISON_TARGET(CmdParserTest
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/command_parser.y
+    ${CMAKE_CURRENT_BINARY_DIR}/command_parser.c
+    DEFINES_FILE ${CMAKE_CURRENT_BINARY_DIR}/command_parser.tab.h
+)
+ADD_FLEX_BISON_DEPENDENCY(CmdLexerTest CmdParserTest)
+
+add_executable(test_command_parser
+    test_command_parser.cpp
+    cmd_parse_shim.c
+    ${FLEX_CmdLexerTest_OUTPUTS}
+    ${BISON_CmdParserTest_OUTPUTS}
+)
+target_include_directories(test_command_parser PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(test_command_parser PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_command_parser)
 
 # ---------------------------------------------------------------------------
 # Future test targets for hardware-emulation classes (mc6850, mc6840, …)

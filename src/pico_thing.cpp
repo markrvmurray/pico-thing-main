@@ -35,6 +35,17 @@
 #include "mc6850.h"
 #include "build_time.h"
 #include "mc6840.h"
+#include "command_parser.h"
+
+/* Flex/bison generated scanner API (yy_buffer_state is flex's internal type) */
+extern "C" {
+struct yy_buffer_state;
+typedef struct yy_buffer_state *YY_BUFFER_STATE;
+extern YY_BUFFER_STATE cmd_yy_scan_string(const char *);
+extern void            cmd_yy_delete_buffer(YY_BUFFER_STATE);
+extern int             cmd_yyparse(parsed_cmd_t *);
+extern void            cmd_yy_reset_str_pool(void);
+}
 
 // PIO program headers will be generated from the .pio file
 #include <cstdint>
@@ -308,7 +319,6 @@ copy(const copy_type direction, const uint16_t count, const uint16_t address, ui
 	}
 }
 
-#if 1
 #define CHUNK_NAMES_INC 1
 #include "api.inc"
 #undef  CHUNK_NAMES_INC
@@ -324,7 +334,6 @@ static const char *chunk_string[] = {
 #define CHUNK_INITIALISERS_INC 1
 #include "api.inc"
 #undef  CHUNK_INITIALISERS_INC
-#endif
 
 #ifdef DEBUG
 static volatile unsigned UART_CONTROL_COUNT = 0u, UART_TX_DATA_COUNT = 0u;
@@ -450,56 +459,21 @@ print_time()
 		printf("Unable to get calendar time\n");
 }
 
-enum e_commands {
-	POWER,
-	VERBOSE,
-	EXAMINE,
-	MODIFY,
-	STATUS,
-	SNIPPET,
-	LOOP,
-	VECTOR,
-	FILL,
-	TIME,
-	GO,
-	TASK,
-	IRQ,
-	TRACE,
-	RUN,
-	STOP,
-	FREQ,
-	RESET,
-	USB,
-	S19,
-	NONE
-};
-
-struct s_commands {
-	const char *str;
-	enum e_commands com;
-} commands[] = {
-	{ "power", POWER },
-	{ "verbose", VERBOSE },
-	{ "examine", EXAMINE },
-	{ "modify", MODIFY },
-	{ "status", STATUS },
-	{ "snippet", SNIPPET },
-	{ "loop", LOOP },
-	{ "vector", VECTOR },
-	{ "fill", FILL },
-	{ "time", TIME },
-	{ "go", GO },
-	{ "task", TASK },
-	{ "irq", IRQ },
-	{ "trace", TRACE },
-	{ "run", RUN },
-	{ "stop", STOP },
-	{ "freq", FREQ },
-	{ "reset", RESET },
-	{ "usb", USB },
-	{ "S19", NONE },
-	{ nullptr, NONE }
-};
+/* cmd_parse() - glue between process_command() and the flex/bison parser */
+bool
+cmd_parse(char *input, parsed_cmd_t *out)
+{
+	out->tag = CMD_NONE;
+	cmd_yy_reset_str_pool();
+	YY_BUFFER_STATE buf = cmd_yy_scan_string(input);
+	int rc = cmd_yyparse(out);
+	cmd_yy_delete_buffer(buf);
+	/* YYERROR in grammar actions does not invoke yyerror(), so cmd.tag may
+	 * remain CMD_NONE on failure.  Normalise to CMD_SYNTAX_ERROR. */
+	if (rc != 0 && out->tag == CMD_NONE)
+		out->tag = CMD_SYNTAX_ERROR;
+	return rc == 0;
+}
 
 static volatile interrupt console_interrupt = INTERRUPT_NONE;
 
@@ -515,187 +489,41 @@ console_has_interrupt()
 	return console_interrupt;
 }
 
-#define BUFFER_SIZE 256u
 void
 process_command(char *buf)
 {
-	static uint8_t buffer[BUFFER_SIZE];
-	uint16_t buflen = strlen(buf);
-	char *tokenlist[64], *ptr = buf + buflen - 1, *token;
+	static uint8_t buffer[256];
+	parsed_cmd_t cmd;
 
-	while (isspace(*buf) && buflen > 0u) {
+	/* Skip blank lines */
+	while (isspace(static_cast<unsigned char>(*buf)))
 		buf++;
-		buflen--;
-	}
-	if (buflen == 0u)
+	if (*buf == '\0')
 		return;
-	while (isspace(*ptr) && buflen > 0u) {
-		*ptr-- = '\0';
-		buflen--;
-	}
-	ptr = buf;
-	uint16_t tokencount = 0u;
-	while ((token = strsep(&ptr, " \t\n\r")) != nullptr) {
-		if (strlen(token) != 0u)
-			tokenlist[tokencount++] = token;
-	}
-	e_commands command = NONE;
-	if (tokenlist[0][0] == 'S')
-		command = S19;
-	else {
-		for (int i = 0; ; i++) {
-			if (commands[i].com == NONE)
-				break;
-			if (strncasecmp(tokenlist[0], commands[i].str, strlen(tokenlist[0])) == 0) {
-				if (command == NONE)
-					command = commands[i].com;
-				else {
-					printf("Ambiguous command \"%s\" - \"%s\" vs \"%s\"\n", tokenlist[0], commands[command].str, commands[i].str);
-					return;
-				}
-			}
-		}
-	}
-	switch (command) {
-	default:
-		printf("Unknown command \"%s\"\n", tokenlist[0]);
-		return;
-	case POWER: {
+
+	if (!cmd_parse(buf, &cmd))
+		return; /* error message already printed by parser */
+
+	switch (cmd.tag) {
+
+	case CMD_POWER:
 		// TODO: MarkM: Start powered-down, and refactor for user-controlled power-on and -off.
-		return;
-	}
-	case VERBOSE: {
-		if (tokencount != 1u) {
-			printf("Usage:\n\n> verbose\n\n");
-			return;
-		}
+		break;
+
+	case CMD_VERBOSE:
 		verbose = !verbose;
 		printf("Verbose mode %s\n", verbose ? "on" : "off");
-	}
-	break;
-	case EXAMINE: {
-		if (tokencount != 2u && tokencount != 3u) {
-			printf("Usage:\n\n> examine { dat | <start> <end> }\n\n");
-			return;
-		}
-		uint32_t start, end;
-		if (tokencount == 2u) {
-			if (strcasecmp(tokenlist[1], "dat") == 0u) {
-				start = 0xFD00u;
-				end = 0xFFC0u;
-			} else {
-				printf("Invalid mnemonic memory range name '%s'\n", tokenlist[1]);
-				return;
-			}
-		} else {
-			uint32_t hexnum = hex(tokenlist[1], 0);
-			if (hexnum >= REGISTER_BASE) {
-				printf("Invalid hex start address '%s' (valid is 0 .. %04X)\n",
-				       tokenlist[1],
-				       REGISTER_BASE - 1);
-				return;
-			}
-			start = hexnum;
-			hexnum = hex(tokenlist[2], 0);
-			if (hexnum == 0 || hexnum > REGISTER_BASE || hexnum <= start) {
-				printf("Invalid hex end address '%s' (valid is 1 .. %04X, and greater than the start)\n",
-				       tokenlist[2],
-				       REGISTER_BASE);
-				return;
-			}
-			end = hexnum;
-		}
-		if (!MC6809.assert_stopped())
-			return;
-		MC6809.preserve_state();
-		const uint16_t display_start = start & 0xFFF0u;
-		const uint16_t display_end = ((end - 1u) | 0x000Fu) + 1u;
-		absolute_time_t next_usb = get_absolute_time();
-		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
-			copy(INWARDS, 16u, loc, buffer);
-			printf("%04X:", loc);
-			for (uint16_t i = 0; i < 16u; i++) {
-				if (loc + i >= start && loc + i < end)
-					printf(" %02X", buffer[i]);
-				else
-					printf("   ");
-				if (i == 7u)
-					printf(" ");
-			}
-			printf(" |");
-			for (uint16_t i = 0; i < 16u; i++) {
-				if (loc + i >= start && loc + i < end) {
-					auto ch = buffer[i] & 0x7F;
-					printf("%c", isprint(ch) ? ch  : '.');
-				} else
-					printf(" ");
-				if (i == 7u)
-					printf("|");
-			}
-			printf("|\n");
-			// Keep cranking the USB handle
-			// Run TinyUSB service task every 1 ms (non-blocking)
-			if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-				usb_poll();
-				next_usb = make_timeout_time_ms(1u);
-			}
-			//sysreq_process();
-		}
-		MC6809.restore_state();
-	}
-	break;
-	case MODIFY: {
-		if (tokencount < 3u || tokencount > 67u) {
-			printf("Usage:\n\n> modify <start> <byte> [ <byte> ... ] (maximum 64 bytes)\n\n");
-			return;
-		}
-		uint32_t hexnum = hex(tokenlist[1], 0);
-		if (hexnum > 0xFFFE) {
-			printf("Invalid hex start address '%s'\n", tokenlist[1]);
-			return;
-		}
-		const uint16_t start = hexnum;
-		for (int i = 2; i < tokencount; i++) {
-			hexnum = hex(tokenlist[i], 0);
-			if (hexnum > 0xFF) {
-				printf("Invalid byte '%s'\n", tokenlist[i]);
-				return;
-			}
-			buffer[i - 2] = hexnum;
-		}
-		if (start < REGISTER_BASE) {
-			if (start + tokencount - 2u > REGISTER_BASE) {
-				printf("Overflow into reg region by %u bytes - truncating overflow\n",
-				       start + tokencount - 2u - REGISTER_BASE);
-				copy(OUTWARDS, REGISTER_BASE - start, start, buffer);
-			} else
-				copy(OUTWARDS, tokencount - 2, start, buffer);
-		} else {
-			printf("Modifying system registers, so provoking callbacks\n");
-			for (uint16_t i = 0u; i < tokencount - 2u; i++) {
-				registers::write(start + i) = buffer[i];
-				write_location = (start + i) & registers::register_mask;
-				write_irq_received = true;
-				printf("%04X: %02X %02X %u\n", ADDRESS(start + i), static_cast<uint8_t>(registers::write(start + i)), static_cast<uint8_t>(reg[start + i]), write_irq_received);
-			}
-		}
-	}
-	break;
-	case STATUS: {
-		if (tokencount != 1u) {
-			printf("Usage:\n\n> status\n\n");
-			return;
-		}
+		break;
+
+	case CMD_STATUS: {
 #ifdef NO_ADC_YET
-		// correction factor tweaked from empirical measurement
 		constexpr float conversion_factor = ((2.5334f*2.0f)/5.0f)*3.3f/(1 << 12);
 		adc_select_input(7);
 		uint16_t raw_vcc = adc_read();
 		printf("External Vcc = %.1f V\n", 2.0f * conversion_factor * static_cast<float>(raw_vcc));
 		adc_select_input(8);
 		uint16_t raw_temp = adc_read();
-		float voltage_temp;
-		voltage_temp = conversion_factor * static_cast<float>(raw_temp);
+		float voltage_temp = conversion_factor * static_cast<float>(raw_temp);
 		float temperature = 27.0f - (voltage_temp - 0.706f)/0.001721f;
 		printf("Pico2 temperature = %.1f C\n", temperature);
 #endif
@@ -735,259 +563,215 @@ process_command(char *buf)
 		printf("UART: Control: %5u\tTx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
 		printf("UART: Status:  %5u\tRx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
 #endif
+		break;
 	}
-	break;
-	case SNIPPET: {
-		if (tokencount > 18u || tokencount < 2u) {
-			printf("Usage:\n\n> snippet <byte> [ <byte> ... ]\n\n");
-			return;
-		}
-		for (uint16_t i = 1u; i < tokencount; i++) {
-			const uint32_t hexnum = hex(tokenlist[i], 0);
-			if (hexnum > 0xFF) {
-				printf("Invalid byte '%s'\n", tokenlist[i]);
-				return;
+
+	case CMD_RESET:
+		peripheral_clear(false);
+		break;
+
+	case CMD_EXAMINE_DAT: {
+		const uint16_t start = 0xFD00u;
+		const uint16_t end   = 0xFFC0u;
+		if (!MC6809.assert_stopped())
+			break;
+		MC6809.preserve_state();
+		const uint16_t display_start = start & 0xFFF0u;
+		const uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
+		absolute_time_t next_usb = get_absolute_time();
+		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
+			copy(INWARDS, 16u, loc, buffer);
+			printf("%04X:", loc);
+			for (uint16_t i = 0; i < 16u; i++) {
+				if (loc + i >= start && loc + i < end)
+					printf(" %02X", buffer[i]);
+				else
+					printf("   ");
+				if (i == 7u)
+					printf(" ");
 			}
-			buffer[i - 1u] = hexnum;
+			printf(" |");
+			for (uint16_t i = 0; i < 16u; i++) {
+				if (loc + i >= start && loc + i < end) {
+					auto ch = static_cast<unsigned char>(buffer[i]) & 0x7Fu;
+					printf("%c", isprint(ch) ? ch : '.');
+				} else
+					printf(" ");
+				if (i == 7u)
+					printf("|");
+			}
+			printf("|\n");
+			if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
+				usb_poll();
+				next_usb = make_timeout_time_ms(1u);
+			}
 		}
+		MC6809.restore_state();
+		break;
+	}
+
+	case CMD_EXAMINE: {
+		const uint16_t start = cmd.examine.start;
+		const uint16_t end   = cmd.examine.end;
+		if (!MC6809.assert_stopped())
+			break;
+		MC6809.preserve_state();
+		const uint16_t display_start = start & 0xFFF0u;
+		const uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
+		absolute_time_t next_usb = get_absolute_time();
+		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
+			copy(INWARDS, 16u, loc, buffer);
+			printf("%04X:", loc);
+			for (uint16_t i = 0; i < 16u; i++) {
+				if (loc + i >= start && loc + i < end)
+					printf(" %02X", buffer[i]);
+				else
+					printf("   ");
+				if (i == 7u)
+					printf(" ");
+			}
+			printf(" |");
+			for (uint16_t i = 0; i < 16u; i++) {
+				if (loc + i >= start && loc + i < end) {
+					auto ch = static_cast<unsigned char>(buffer[i]) & 0x7Fu;
+					printf("%c", isprint(ch) ? ch : '.');
+				} else
+					printf(" ");
+				if (i == 7u)
+					printf("|");
+			}
+			printf("|\n");
+			if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
+				usb_poll();
+				next_usb = make_timeout_time_ms(1u);
+			}
+		}
+		MC6809.restore_state();
+		break;
+	}
+
+	case CMD_MODIFY: {
+		const uint16_t start = cmd.modify.start;
+		const uint8_t  count = cmd.modify.count;
+		memcpy(buffer, cmd.modify.data, count);
+		if (start < REGISTER_BASE) {
+			if (static_cast<uint32_t>(start) + count > REGISTER_BASE) {
+				printf("Overflow into reg region by %u bytes - truncating overflow\n",
+				       start + count - REGISTER_BASE);
+				copy(OUTWARDS, REGISTER_BASE - start, start, buffer);
+			} else
+				copy(OUTWARDS, count, start, buffer);
+		} else {
+			printf("Modifying system registers, so provoking callbacks\n");
+			for (uint16_t i = 0u; i < count; i++) {
+				registers::write(start + i) = buffer[i];
+				write_location    = (start + i) & registers::register_mask;
+				write_irq_received = true;
+				printf("%04X: %02X %02X %u\n",
+				       ADDRESS(start + i),
+				       static_cast<uint8_t>(registers::write(start + i)),
+				       static_cast<uint8_t>(reg[start + i]),
+				       write_irq_received);
+			}
+		}
+		break;
+	}
+
+	case CMD_SNIPPET: {
+		const uint8_t count = cmd.snippet.count;
 		printf("%04X:", 0xFFE0u);
-		for (uint16_t i = 0; i < tokencount - 1u; i++) {
-			reg[REGISTER_SNIPPET_OFFSET + i] = buffer[i];
+		for (uint16_t i = 0; i < count; i++) {
+			reg[REGISTER_SNIPPET_OFFSET + i] = cmd.snippet.data[i];
 			printf(" %02X", static_cast<uint8_t>(reg[REGISTER_SNIPPET_OFFSET + i]));
 		}
 		printf("\n");
 		reg[REGISTER_VECTOR_RESET_OFFSET] = REGISTER_SNIPPET;
 		MC6809.start();
+		break;
 	}
-	break;
-	case LOOP: {
-		if (tokencount != 3u) {
-			printf("Usage:\n\n>  loop { r | R | w | W | rw } <address>\n\n");
-			return;
-		}
-		uint8_t opcode;
-		if (strcmp(tokenlist[1], "r") == 0)
-			opcode = 0xB6; // LDA >ADDRESS
-		else if (strcmp(tokenlist[1], "R") == 0)
-			opcode = 0xFC; // LDD >ADDRESS
-		else if (strcmp(tokenlist[1], "w") == 0)
-			opcode = 0xB7; // STA >ADDRESS
-		else if (strcmp(tokenlist[1], "W") == 0)
-			opcode = 0xFD; // STD >ADDRESS
-		else if (strcasecmp(tokenlist[1], "rw") == 0)
-			opcode = 0x70; // NEG >ADDRESS
-		else {
-			printf("Invalid loop type '%s'\n", tokenlist[1]);
-			return;
-		}
-		uint32_t hexnum = hex(tokenlist[2], 0);
-		if (hexnum > 0xFFFF) {
-			printf("Invalid address '%s'\n", tokenlist[2]);
-			return;
-		}
-		uint16_t address = hexnum;
+
+	case CMD_LOOP:
 		snippet_copy(LOOP_RW);
-		reg[REGISTER_SNIPPET_OFFSET + 0u] = opcode;
-		reg[REGISTER_SNIPPET_OFFSET + 1u] = address;
+		reg[REGISTER_SNIPPET_OFFSET + 0u] = cmd.loop.opcode;
+		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.loop.address;
 		MC6809.start();
-	}
-	break;
-	case VECTOR: {
-		static constexpr uint16_t vector_count = 8u;
-		uint16_t temp[vector_count];
-		if (tokencount != vector_count + 1u) {
-			printf("Usage:\n\n> vector <vec0> ... <vec7>\n\n");
-			return;
-		}
-		for (int i = 0; i < vector_count; i++) {
-			const uint32_t hexnum = hex(tokenlist[i], 0);
-			if (hexnum > 0xFFFF) {
-				printf("Invalid address '%s'\n", tokenlist[i]);
-				return;
-			}
-			temp[i] = hexnum;
-		}
+		break;
+
+	case CMD_VECTOR:
 		printf("%04X:", 0xFFF0u);
-		for (uint16_t i = 0; i < 8; i++) {
-			reg[REGISTER_VECTORS_OFFSET + 2u*i] = temp[i];
+		for (uint16_t i = 0; i < 8u; i++) {
+			reg[REGISTER_VECTORS_OFFSET + 2u*i] = cmd.vector.vec[i];
 			printf(" %04X", static_cast<uint16_t>(reg[REGISTER_VECTORS_OFFSET + 2u*i]));
 		}
 		printf("\n");
-	}
-	break;
-	case FILL: {
-		if (tokencount < 2u || tokencount > 4u) {
-			printf("Usage:\n\n> fill { <start> <end> | all } [ <value> ]\n\n");
-			return;
-		}
-		uint32_t hexnum;
-		uint16_t start, end;
-		uint8_t filler;
-		if (strcasecmp(tokenlist[1], "all") == 0u) {
-			start = 0x0000u;
-			end = 0xFE00u;
-			if (tokencount == 2u)
-				filler = 0x00u;
-			else {
-				hexnum = hex(tokenlist[2], 0);
-				if (hexnum > 0xFFu) {
-					printf("Invalid fill byte '%s'\n", tokenlist[2]);
-					return;
-				}
-				filler = hexnum;
-			}
-		} else {
-			hexnum = hex(tokenlist[1], 0);
-			if (hexnum >= 0xFFFFu) {
-				printf("Invalid start address '%s'\n", tokenlist[1]);
-				return;
-			}
-			start = hexnum;
-			hexnum = hex(tokenlist[2], 0);
-			if (hexnum > 0xFFFFu || hexnum <= start) {
-				printf("Invalid end address '%s'\n", tokenlist[2]);
-				return;
-			}
-			end = hexnum;
-			if (tokencount > 3u) {
-				hexnum = hex(tokenlist[3], 0);
-				if (hexnum > 0xFF) {
-					printf("Invalid fill byte '%s'\n", tokenlist[3]);
-					return;
-				}
-				filler = hexnum;
-			} else
-				filler = 0x00u;
-		}
+		break;
+
+	case CMD_FILL_ALL:
+	case CMD_FILL_ALL_VALUE:
+	case CMD_FILL:
+	case CMD_FILL_VALUE:
 		if (!MC6809.assert_stopped())
-			return;
+			break;
 		snippet_copy(BLOCK_FILL);
-		reg[REGISTER_SNIPPET_OFFSET + 1u] = filler;
-		reg[REGISTER_SNIPPET_OFFSET + 3u] = start;
-		reg[REGISTER_SNIPPET_OFFSET + 8u] = end;
+		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.fill.value;
+		reg[REGISTER_SNIPPET_OFFSET + 3u] = cmd.fill.start;
+		reg[REGISTER_SNIPPET_OFFSET + 8u] = cmd.fill.end;
 		MC6809.start_with_timeout(10000u, true);
-	}
-	break;
-	case TIME: {
-		if (tokencount > 7u) {
-			printf("Usage:\n\n> time [ <Year> [ <Mon> [ <Day> [ <Hour> [ <Min> [ <Sec> ] ] ] ] ] ]\n\n");
-			return;
-		}
-		// Define the current calendar time (UTC)
+		break;
+
+	case CMD_TIME_QUERY:
+		print_time();
+		break;
+
+	case CMD_TIME_SET: {
 		tm tm = {
-			.tm_sec = 0,
-			.tm_min = 0,
-			.tm_hour = 0,
-			.tm_mday = 1,
-			.tm_mon = 0, // (0 = Jan)
-			.tm_year = 2000 - 1900,
+			.tm_sec   = 0,
+			.tm_min   = 0,
+			.tm_hour  = 0,
+			.tm_mday  = 1,
+			.tm_mon   = 0,
+			.tm_year  = 2000 - 1900,
 			.tm_isdst = 0,
 		};
-		int num;
-		if (tokencount >= 2) {
-			num = strtol(tokenlist[1], nullptr, 10);
-			if (num < 2025 || num > 2061) {
-				printf("Invalid year '%s'\n", tokenlist[1]);
-				return;
-			}
-			tm.tm_year = num - 1900;
-		}
-		if (tokencount >= 3) {
-			num = strtol(tokenlist[2], nullptr, 10);
-			if (num < 0 || num > 11) {
-				printf("Invalid month '%s'\n", tokenlist[2]);
-				return;
-			}
-			tm.tm_mon = num;
-		}
-		if (tokencount >= 4) {
-			num = strtol(tokenlist[3], nullptr, 10);
-			if (num < 1 || num > 31) {
-				printf("Invalid day '%s'\n", tokenlist[3]);
-				return;
-			}
-			tm.tm_mday = num;
-		}
-		if (tokencount >= 5) {
-			num = strtol(tokenlist[4], nullptr, 10);
-			if (num < 0 || num > 23) {
-				printf("Invalid hour '%s'\n", tokenlist[4]);
-				return;
-			}
-			tm.tm_hour = num;
-		}
-		if (tokencount >= 6) {
-			num = strtol(tokenlist[5], nullptr, 10);
-			if (num < 0 || num > 59) {
-				printf("Invalid minute '%s'\n", tokenlist[5]);
-				return;
-			}
-			tm.tm_min = num;
-		}
-		if (tokencount == 7) {
-			num = strtol(tokenlist[6], nullptr, 10);
-			if (num < 0 || num > 59) {
-				printf("Invalid second '%s'\n", tokenlist[6]);
-				return;
-			}
-			tm.tm_sec = num;
-		}
-		if (tokencount > 1)
-			aon_timer_set_time_calendar(&tm);
+		tm.tm_year = cmd.time.year - 1900;
+		if (cmd.time.count >= 2) tm.tm_mon  = cmd.time.month; /* already 0-based from grammar */
+		if (cmd.time.count >= 3) tm.tm_mday = cmd.time.day;
+		if (cmd.time.count >= 4) tm.tm_hour = cmd.time.hour;
+		if (cmd.time.count >= 5) tm.tm_min  = cmd.time.minute;
+		if (cmd.time.count >= 6) tm.tm_sec  = cmd.time.second;
+		aon_timer_set_time_calendar(&tm);
 		print_time();
+		break;
 	}
-	break;
-	case GO: {
-		if (tokencount >= 3u) {
-			printf("Usage:\n\n> go [ <start> ]\n\n");
-			return;
-		}
-		if (tokencount == 2) {
-			const uint32_t hexnum = hex(tokenlist[1], 0);
-			if (hexnum > 0xFFFF) {
-				printf("Invalid hex start address '%s'\n", tokenlist[1]);
-				return;
-			}
-			const uint16_t start = hexnum;
-			reg[REGISTER_VECTOR_RESET_OFFSET] = start;
-		}
+
+	case CMD_GO:
 		MC6809.start();
-	}
-	break;
-	case TASK: {
-		uint8_t task = MC6809.task;
-		if (tokencount > 2u) {
-			printf("Usage:\n\n> task [ <tasknum> ]\n\n");
-			return;
-		}
-		if (tokencount == 2u) {
-			const uint32_t hexnum = hex(tokenlist[1], 0);
-			if (hexnum > 15u) {
-				printf("Invalid hex task number '%s'\n", tokenlist[1]);
-				return;
-			}
-			task = hexnum;
-			task = MC6809.task_change(task);
-		}
+		break;
+
+	case CMD_GO_ADDR:
+		reg[REGISTER_VECTOR_RESET_OFFSET] = cmd.go.address;
+		MC6809.start();
+		break;
+
+	case CMD_TASK_QUERY:
+		printf("Task = %u\n", MC6809.task);
+		break;
+
+	case CMD_TASK_SET: {
+		uint8_t task = MC6809.task_change(cmd.task.tasknum);
 		printf("Task = %u\n", task);
+		break;
 	}
-	break;
-	case IRQ: {
+
+	case CMD_IRQ: {
 		uint32_t timeout = 0u;
-		const uint8_t *final_stack;
-		uint16_t final_stack_length;
-		const char *test_name;
-		if (tokencount != 2u) {
-			printf("Usage:\n\n> irq 0|1|2|3|4|5\n\n");
-			return;
-		}
-		const uint32_t hexnum = hex(tokenlist[1], 0);
-		if (hexnum > 5) {
-			printf("Bad IRQ test ID '%s'\n", tokenlist[1]);
-			return;
-		}
+		const uint8_t *final_stack = nullptr;
+		uint16_t final_stack_length = 0u;
+		const char *test_name = nullptr;
+		const uint8_t hexnum = cmd.irq.testnum;
+
 		if (!MC6809.assert_stopped())
-			return;
+			break;
 		for (int i = 0; i < 16; i++) {
 			registers::write(REGISTER_BUFFER_OFFSET + i) = static_cast<uint8_t>(0x00);
 			reg[REGISTER_BUFFER_OFFSET + i] = static_cast<uint8_t>(0x00);
@@ -996,6 +780,7 @@ process_command(char *buf)
 			reg[REGISTER_VECTORS_OFFSET + i] = static_cast<uint16_t>(0x0000);
 		snippet_copy(ZERO);
 		MC6809.start_with_timeout(10000u, true);
+
 		if (hexnum == 0) {
 			printf("Interrupt strobe test. Hit any key to continue.\n");
 			for (;;) {
@@ -1015,7 +800,6 @@ process_command(char *buf)
 				console_set_interrupt(INTERRUPT_NONE);
 				sleep_ms(5u);
 			}
-			final_stack_length = 0u;
 		} else if (hexnum == 1) {
 			static constexpr const char *testname = "SWI";
 			static constexpr uint16_t stack_result_length = 12u;
@@ -1026,15 +810,9 @@ process_command(char *buf)
 			snippet_copy(TEST_SWI);
 			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 14);
 			MC6809.start();
-			while (!MC6809.is_synced()) {
-				sleep_us(1);
-				if (++timeout > 1000000u)
-					break;
-			}
+			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
-			test_name = testname;
-			final_stack_length = stack_result_length;
-			final_stack = stack_result;
+			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
 		} else if (hexnum == 2) {
 			static constexpr const char *testname = "NMI";
 			static constexpr uint16_t stack_result_length = 12u;
@@ -1047,16 +825,10 @@ process_command(char *buf)
 			MC6809.start();
 			sleep_us(100u);
 			console_set_interrupt(INTERRUPT_NMI);
-			while (!MC6809.is_synced()) {
-				sleep_us(1);
-				if (++timeout > 1000000u)
-					break;
-			}
+			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
 			console_set_interrupt(INTERRUPT_NONE);
-			test_name = testname;
-			final_stack_length = stack_result_length;
-			final_stack = stack_result;
+			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
 		} else if (hexnum == 3) {
 			static constexpr const char *testname = "IRQ";
 			static constexpr uint16_t stack_result_length = 12u;
@@ -1069,16 +841,10 @@ process_command(char *buf)
 			MC6809.start();
 			sleep_us(100u);
 			console_set_interrupt(INTERRUPT_IRQ);
-			while (!MC6809.is_synced()) {
-				sleep_us(1);
-				if (++timeout > 1000000u)
-					break;
-			}
+			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
 			console_set_interrupt(INTERRUPT_NONE);
-			test_name = testname;
-			final_stack_length = stack_result_length;
-			final_stack = stack_result;
+			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
 		} else if (hexnum == 4) {
 			static constexpr const char *testname = "FIRQ";
 			static constexpr uint16_t stack_result_length = 3u;
@@ -1091,16 +857,10 @@ process_command(char *buf)
 			MC6809.start();
 			sleep_us(100u);
 			console_set_interrupt(INTERRUPT_FIRQ);
-			while (!MC6809.is_synced()) {
-				sleep_us(1);
-				if (++timeout > 1000000u)
-					break;
-			}
+			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
 			console_set_interrupt(INTERRUPT_NONE);
-			test_name = testname;
-			final_stack_length = stack_result_length;
-			final_stack = stack_result;
+			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
 		} else {
 			static constexpr const char *testname = "RTI";
 			static constexpr uint16_t stack_result_length = 12u;
@@ -1114,45 +874,36 @@ process_command(char *buf)
 			reg[REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN - 1] = static_cast<uint8_t>(0xE6);
 			snippet_copy(TEST_RTI);
 			MC6809.start();
-			while (!MC6809.is_synced()) {
-				sleep_us(1);
-				if (++timeout > 1000000u)
-					break;
-			}
+			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
-			test_name = testname;
-			final_stack_length = stack_result_length;
-			final_stack = stack_result;
+			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
 		}
+
 		if (final_stack_length) {
 			bool success = true;
 			for (uint16_t i = 0; i < final_stack_length; i++)
 				if (reg[REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i] != final_stack[i]) {
-					printf("mismatch %04X %02X %02X\n", REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i, static_cast<uint8_t>(reg.write(REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i)), final_stack[i]);
+					printf("mismatch %04X %02X %02X\n",
+					       REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i,
+					       static_cast<uint8_t>(reg.write(REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i)),
+					       final_stack[i]);
 					success = false;
 				}
 			if (timeout > 1000000u) {
 				printf("Timeout reached\n");
 				success = false;
 			}
-			printf("%s: Timeout counter: %u  Test result: %s\n", test_name, timeout, success ? "PASS" : "FAIL");
+			printf("%s: Timeout counter: %u  Test result: %s\n",
+			       test_name, timeout, success ? "PASS" : "FAIL");
 		}
+		break;
 	}
-	break;
-	case TRACE:
+
+	case CMD_TRACE:
+	case CMD_TRACE_LEN:
 #ifdef DEBUG_NOT_NOW
 	{
-		if (tokencount > 2u) {
-			printf("Usage:\n\n> trace [<len>]\n\n");
-			return;
-		}
-		uint32_t len;
-		if (tokencount == 1)
-			len = trace_pos;
-		else {
-			len = strtoul(tokenlist[1], nullptr, 10);
-			len = MIN(len, trace_pos);
-		}
+		uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, trace_pos) : trace_pos;
 		if (len > 0)
 			for (uint32_t i = 0; i < len; i++) {
 				BLA bla{}; bla.byte = static_cast<uint8_t>(trace[i][2] >> 8);
@@ -1161,162 +912,137 @@ process_command(char *buf)
 				       (trace[i][2] & TRACE_WRITE) ? "W" : " ",
 				       trace[i][1],
 				       bla.bit.AVMA ? "AVMA" : "    ",
-				       bla.bit.LIC ? "LIC " : "    ",
+				       bla.bit.LIC  ? "LIC " : "    ",
 				       bla.bit.BUSY ? "BUSY" : "    ",
 				       ba_bs_string[(trace[i][2] >> 4) & 0x0F],
 				       run_state_string[trace[i][2] & 0x0F],
 				       trace[i][3]);
 			}
+		break;
 	}
-	break;
 #else
 		printf("To enable trace, build with DEBUG defined\n\n");
 		break;
 #endif
-	case RUN: {
-		if (tokencount > 3u || tokencount < 1u) {
-			printf("Usage:\n\n> run [ <snippetnum>|<chunknum> ] [ ! ]\n\n");
-			return;
-		}
-		if (tokencount == 1u) {
-			for (uint16_t i = DAT_INIT; i < SNIPPET_LEN; i++)
-				printf("%d: %s\n", i, snippet_string[i]);
-			for (uint16_t i = 0; i < CHUNK_LEN; i++)
-				printf("%d: %s\n", i + SNIPPET_LEN, chunk_string[i]);
-			return;
-		}
-		bool stop = true;
-		if (tokencount == 3u) {
-			if (strncmp(tokenlist[2], "!", 1u) == 0)
-				stop = false;
-		}
-		uint32_t hexnum = hex(tokenlist[1], 0);
+
+	case CMD_RUN_LIST:
+		for (uint16_t i = DAT_INIT; i < SNIPPET_LEN; i++)
+			printf("%d: %s\n", i, snippet_string[i]);
+		for (uint16_t i = 0; i < CHUNK_LEN; i++)
+			printf("%d: %s\n", i + SNIPPET_LEN, chunk_string[i]);
+		break;
+
+	case CMD_RUN:
+	case CMD_RUN_NOWAIT: {
+		const bool stop = (cmd.tag == CMD_RUN);
+		uint32_t idx = cmd.run.index;
 		snippet snippet_num;
 		chunk chunk_num;
-		if (hexnum >= SNIPPET_LEN) {
-			snippet_num = SNIPPET_LEN;
-			hexnum -= SNIPPET_LEN;
-			if (hexnum >= CHUNK_LEN) {
-				printf("Invalid snippet/chunk index '%s' %x\n", tokenlist[1], hexnum);
-				return;
+		if (idx >= SNIPPET_LEN) {
+			snippet_num = SNIPPET_LEN; /* sentinel: it's a chunk */
+			idx -= SNIPPET_LEN;
+			if (idx >= CHUNK_LEN) {
+				printf("Invalid snippet/chunk index\n");
+				break;
 			}
-			chunk_num = static_cast<chunk>(hexnum);
-		} else
-			snippet_num = static_cast<snippet>(hexnum);
-		if (MC6809.assert_stopped()) {
-			if (snippet_num < SNIPPET_LEN) {
-				printf("Running snippet %u = %s\n", snippet_num, snippet_string[snippet_num]);
-				snippet_copy(snippet_num);
-			} else {
-				printf("Running chunk %u = %s\n", chunk_num, chunk_string[chunk_num]);
-				copy(OUTWARDS, chunk_len[chunk_num], 0x0130u, chunk_code[chunk_num]);
-				reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
-			}
-		} else
-			return;
+			chunk_num = static_cast<chunk>(idx);
+		} else {
+			snippet_num = static_cast<snippet>(idx);
+		}
+		if (!MC6809.assert_stopped())
+			break;
+		if (snippet_num < SNIPPET_LEN) {
+			printf("Running snippet %u = %s\n", snippet_num, snippet_string[snippet_num]);
+			snippet_copy(snippet_num);
+		} else {
+			printf("Running chunk %u = %s\n", chunk_num, chunk_string[chunk_num]);
+			copy(OUTWARDS, chunk_len[chunk_num], 0x0130u, chunk_code[chunk_num]);
+			reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
+		}
 		if (stop)
 			MC6809.start_with_timeout(1000u);
 		else
 			MC6809.start();
+		break;
 	}
-	break;
-	case STOP: {
-		if (tokencount < 1u || tokencount > 2u) {
-			printf("Usage:\n\n> stop [halt|restart|stop]\n\n");
-			return;
-		}
-		if (tokencount == 1u)
-			MC6809.stop();
-		else {
-			if (strcasecmp(tokenlist[1], "halt") == 0)
-				MC6809.halt();
-			else if (strcasecmp(tokenlist[1], "restart") == 0)
-				MC6809.release();
-			else if (strcasecmp(tokenlist[1], "stop") == 0)
-				MC6809.stop();
-			else
-				printf("Usage:\n\n> stop [halt|restart|stop]\n\n");
-		}
-	}
-	break;
-	case FREQ: {
-		if (tokencount != 2u) {
-			printf("Usage:\n\n> freq <freqMHz>\n\n");
-			return;
-		}
-		const float mhz = strtof(tokenlist[1], nullptr);
-		if (mhz == 0.0f) {
-			printf("Invalid frequency '%s'\n", tokenlist[1]);
-			return;
-		}
-		if (mhz < 0.8f || mhz > 3.0f) {
-			printf("Frequency %f out of range [0.8 .. 3.0]\n", mhz);
-			return;
-		}
-		MC6809.set_e_frequency(mhz, pio_clock);
+
+	case CMD_STOP:
+		MC6809.stop();
+		break;
+
+	case CMD_STOP_HALT:
+		MC6809.halt();
+		break;
+
+	case CMD_STOP_RESTART:
+		MC6809.release();
+		break;
+
+	case CMD_STOP_STOP:
+		MC6809.stop();
+		break;
+
+	case CMD_FREQ:
+		MC6809.set_e_frequency(cmd.freq.mhz, pio_clock);
 		printf("Set E to %.1f MHz\n", MC6809.get_e_frequency());
-	}
-	break;
-	case RESET: {
-		if (tokencount != 1u) {
-			printf("Usage:\n\n> reset\n\n");
-			return;
-		}
-		peripheral_clear(false);
-	}
-	break;
-	case USB: {
-		if (tokencount < 2u) {
-			printf("Usage:\n\n> usb ... \n\n");
-			return;
-		}
-		for (unsigned i = 1; i < tokencount; i++) {
-			snprintf(reinterpret_cast<char *>(buffer), 64u, "%s\r\n", tokenlist[i]);
+		break;
+
+	case CMD_USB: {
+		/* Send each space-separated word as a separate USB CDC write */
+		char args[sizeof(cmd.usb.args)];
+		memcpy(args, cmd.usb.args, sizeof(args));
+		char *ptr = args;
+		char *word;
+		while ((word = strsep(&ptr, " \t")) != nullptr) {
+			if (*word == '\0')
+				continue;
+			snprintf(reinterpret_cast<char *>(buffer), 64u, "%s\r\n", word);
 			usb_cdc_write(buffer, strlen(reinterpret_cast<char *>(buffer)));
 		}
+		break;
 	}
-	break;
-	case S19: {
-		if (tokencount != 1u) {
-			printf("Usage:\n\nThis should be a single valid S0, S1, S5 or S9 record\n\n");
-			return;
-		}
+
+	case CMD_SRECORD: {
 		uint8_t count;
 		uint16_t address;
 		uint8_t checksum;
-		if (process_srecord(tokenlist[0], &count, &address, buffer, &checksum)) {
-			if (tokenlist[0][1] == '0') {
+		const char *line = cmd.srecord.line;
+		if (process_srecord(line, &count, &address, buffer, &checksum)) {
+			if (line[1] == '0') {
 				printf("S0 data = \"");
-				for (uint16_t i = 0; i < count - 3; i++) {
+				for (uint16_t i = 0; i < count - 3u; i++) {
 					const uint8_t c = buffer[i];
 					printf("%c", isprint(c) ? c : ' ');
 				}
 				printf("\"\n");
-			} else if (tokenlist[0][1] == '1') {
+			} else if (line[1] == '1') {
 				if (verbose) {
 					printf("S1 address = %04X, length = %u\n", address, count);
 					printf("%04X:", address);
-					for (uint16_t i = 0; i < count - 3; i++)
+					for (uint16_t i = 0; i < count - 3u; i++)
 						printf(" %02X", buffer[i]);
 					printf("\n");
 				}
-				if (address + count < 0xFE00) // Don't mess with the DAT RAM or the Pico-supplied registers
+				if (address + count < 0xFE00u)
 					copy(OUTWARDS, count - 3u, address, buffer);
-				else if (address >= 0xFFF0) // Allow the reset and interrupt vectors to be set up
-					for (uint16_t i = 0; i < count - 3; i++)
+				else if (address >= 0xFFF0u)
+					for (uint16_t i = 0; i < count - 3u; i++)
 						reg[address + i] = buffer[i];
-			} else if (tokenlist[0][1] == '5') {
+			} else if (line[1] == '5') {
 				if (verbose)
 					printf("S5 record count = %u\n", address);
-			} else if (tokenlist[0][1] == '9') {
+			} else if (line[1] == '9') {
 				if (verbose)
 					printf("S9 start = %04X\n", address);
 				reg[REGISTER_VECTOR_RESET_OFFSET] = address;
 			}
 		} else
 			printf("Invalid S record\n");
+		break;
 	}
-	break;
+
+	default:
+		break;
 	}
 }
 

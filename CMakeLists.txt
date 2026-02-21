@@ -1,6 +1,27 @@
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.14)  # 3.14+ for BISON_TARGET DEFINES_FILE
 set(PICO_BOARD pimoroni_pga2350)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+
+# Flex and bison run on the BUILD HOST; the generated .c files are
+# cross-compiled for RP2350 by arm-none-eabi-gcc.
+#
+# macOS ships bison 2.3 which is too old.  Use Homebrew's bison 3.x.
+# Install with: brew install bison
+if(APPLE)
+    find_program(_bison_homebrew
+        NAMES bison
+        PATHS /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin
+        NO_DEFAULT_PATH
+    )
+    if(NOT _bison_homebrew)
+        message(FATAL_ERROR
+            "Bison 3.x not found.  Install with: brew install bison")
+    endif()
+    # Force-set so CLion's stale cache (pointing at /usr/bin/bison 2.3) is overridden.
+    set(BISON_EXECUTABLE "${_bison_homebrew}" CACHE FILEPATH "Bison executable" FORCE)
+endif()
+find_package(FLEX  REQUIRED)
+find_package(BISON 3.0 REQUIRED)
 
 project(pico-thing C CXX ASM)
 set(CMAKE_C_STANDARD 11)
@@ -12,6 +33,24 @@ add_custom_target(clion_host_dummy ALL)
 add_compile_definitions(DEBUG)
 
 pico_sdk_init()
+
+# ----- Flex / Bison targets -----
+# flex/bison run on the BUILD HOST; the generated .c files are
+# cross-compiled for RP2350 by arm-none-eabi-gcc (newlib has all needed symbols).
+# DEFINES_FILE pins the header name to command_parser.tab.h to avoid a
+# circular-include collision with our project header command_parser.h.
+FLEX_TARGET(CmdLexer
+	${CMAKE_CURRENT_LIST_DIR}/src/command_lexer.l
+	${CMAKE_CURRENT_BINARY_DIR}/command_lexer.c
+)
+
+BISON_TARGET(CmdParser
+	${CMAKE_CURRENT_LIST_DIR}/src/command_parser.y
+	${CMAKE_CURRENT_BINARY_DIR}/command_parser.c
+	DEFINES_FILE ${CMAKE_CURRENT_BINARY_DIR}/command_parser.tab.h
+)
+
+ADD_FLEX_BISON_DEPENDENCY(CmdLexer CmdParser)
 
 add_executable(pico-thing
 		src/pico_thing.cpp
@@ -54,6 +93,8 @@ set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/api.inc PROPERTIES GENER
 target_sources(pico-thing
 	PRIVATE
 		${CMAKE_CURRENT_BINARY_DIR}/api.inc
+		${FLEX_CmdLexer_OUTPUTS}
+		${BISON_CmdParser_OUTPUTS}
 )
 
 target_link_libraries(pico-thing
