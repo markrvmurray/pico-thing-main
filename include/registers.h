@@ -25,6 +25,8 @@ public:
 	static constexpr uint16_t register_address_bits = 6u;
 	static constexpr uint16_t register_length = 1u << register_address_bits;
 	static constexpr uint16_t register_mask = register_length - 1u;
+
+
 private:
 	__scratch_y("")
 	__attribute__((aligned(register_length)))
