@@ -253,18 +253,24 @@ mc6809::uart_task()
 	static uint16_t bytes_read = 0u, bytes_read_index = 0u, bytes_write = 0u, bytes_write_index = 0u;
 
 	if (MC6809.run_state == RS_STARTED || MC6809.run_state == RS_SYNCED) {
-		// READ USB -> Guest
-		if (bytes_read == 0u) {
-			bytes_read = usb_cdc_read(receive_buffer, USB_BUFFER_SIZE);
-			bytes_read_index = 0u;
+		// READ USB -> Guest (only if 6809 has asserted RTS)
+		{
+			mc6850_control cr = {registers::write(CONSOLE_CONTROL)};
+			bool rts_deasserted = (cr.tx_irq == 0b10u || cr.tx_irq == 0b11u);
+			if (!rts_deasserted) {
+				if (bytes_read == 0u) {
+					bytes_read = usb_cdc_read(receive_buffer, USB_BUFFER_SIZE);
+					bytes_read_index = 0u;
+				}
+				uint uart_level_avail = fast_serial.host_transmit_level_avail();
+				uint transmit_amount = MIN(uart_level_avail, bytes_read - bytes_read_index);
+				for (uint i = 0u; i < transmit_amount; i++)
+					fast_serial.host_transmit(receive_buffer[bytes_read_index + i]);
+				bytes_read_index += transmit_amount;
+				if (bytes_read_index >= bytes_read)
+					bytes_read = 0u;
+			}
 		}
-		uint uart_level_avail = fast_serial.host_transmit_level_avail();
-		uint transmit_amount = MIN(uart_level_avail, bytes_read - bytes_read_index);
-		for (uint i = 0u; i < transmit_amount; i++)
-			fast_serial.host_transmit(receive_buffer[bytes_read_index + i]);
-		bytes_read_index += transmit_amount;
-		if (bytes_read_index >= bytes_read)
-			bytes_read = 0u;
 		// WRITE Guest -> USB
 		if (bytes_write == 0u) {
 			while (fast_serial.host_receive_avail() && bytes_write < USB_BUFFER_SIZE)

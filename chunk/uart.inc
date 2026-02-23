@@ -9,6 +9,7 @@ C_NONE		EQU	%00000000
 C_RESET		EQU	%00000011
 C_TX_IRQ	EQU	%00100000
 C_RX_IRQ	EQU	%10000000
+C_RTS_OFF	EQU	%01000000	; tx_irq=0b10: RTS deasserted, no TX irq
 
 
 * Status (read)

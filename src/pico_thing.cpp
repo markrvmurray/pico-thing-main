@@ -141,10 +141,13 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
+		// BUSY/LIC/AVMA are stable at Q-rising (this is the latest valid capture point;
+		// by Q-falling the 6809 has already updated them for the next cycle). Unpack
+		// immediately so that vma is valid before the DMA read ISR fires (~20 cycles later).
+		MC6809.set_busy_lic_avma(static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA));
 		ba_bs_u new_bus_state{};
 		new_bus_state.byte = ((bus_pins.bits.BS_BA) & 0b00000011u);
 		new_bus_state.bit.RESET = RESET_IS_ASSERTED;
-		MC6809.unpack_busy_lic_avma(); // Previous cycle's advance notice
 #ifdef DEBUG
 		MC6809.count_lic();
 #endif
@@ -169,8 +172,9 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// I want to catch RTI (0x3B).
 		if (MC6809.get_lic() && bus_pins.bits.RW && !bus_pins.bits.CS && bus_pins.bits.A == ((REGISTER_SNIPPET + REGISTER_SNIPPET_LEN - 1) & registers::register_mask) && bus_pins.bits.D == 0x3Bu)
 			MC6809.apply_rti();
-		// These 3 signals are all predictive; they indicate the status of the _next_ memory access
-		MC6809.set_busy_lic_avma(static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA));
+		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
+		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
+		// we do NOT capture them here.
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, false); // OINQUE DEBUG to time this function on the scope
@@ -188,6 +192,13 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 
 static volatile bool read_irq_received = false;
 static volatile uint8_t read_location;
+// Dedicated lossless counter for CONSOLE_RX_DATA reads.
+// The shared read_irq_received slot can be overwritten before Core 1 processes
+// it (e.g. a CONSOLE_STATUS read ISR fires right after a CONSOLE_RX_DATA read
+// ISR), which would silently skip guest_receive() and cause byte duplication.
+// A wrapping counter survives any number of overwrites of the shared slot.
+static volatile uint8_t rx_read_count = 0;
+static          uint8_t rx_processed_count = 0;
 
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
@@ -199,11 +210,21 @@ __time_critical_func(dma_bus_read_irq_handler())
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
 	if (!MC6809.bus_state.bit.RESET && MC6809.get_vma()) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
-		read_location = read_addr & registers::register_mask;
-		read_irq_received = true;
+		const uint8_t loc = read_addr & registers::register_mask;
+		if (loc == CONSOLE_RX_DATA) {
+			// Use a dedicated wrapping counter so that a rapid CONSOLE_STATUS
+			// ISR cannot overwrite this notification before Core 1 processes it.
+			// A single read_irq_received flag would be silently lost if a second
+			// ISR fired before Core 1 drained it, causing guest_receive() to be
+			// skipped and RDRF to stay set with a stale byte.
+			rx_read_count++;
+		} else {
+			read_location = loc;
+			read_irq_received = true;
+		}
 #ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
-			trace[trace_pos][0] = read_location;
+			trace[trace_pos][0] = loc;
 			trace[trace_pos][1] = *reinterpret_cast<volatile std::uint8_t *>(read_addr);
 			trace[trace_pos][2] = TRACE_READ | (MC6809.get_busy_lic_avma() << 8) | (MC6809.bus_state.byte << 4) | MC6809.run_state;
 			trace[trace_pos][3] = 0u;
@@ -1058,7 +1079,6 @@ poll_console()
 	static char buf[COMMAND_BUFFER_LEN];
 	static int idx = 0;
 	static bool prompted = false;
-	absolute_time_t next_usb = get_absolute_time();
 
 	while (!core1_initialised) {
 		sleep_ms(1u);
@@ -1096,11 +1116,10 @@ poll_console()
 		}
 
 
-		// Run TinyUSB service task every 1 ms (non-blocking)
-		if (absolute_time_diff_us(get_absolute_time(), next_usb) <= 0) {
-			usb_poll();
-			next_usb = make_timeout_time_ms(1u);
-		}
+		// TinyUSB must be polled as often as possible; if there are no events
+		// tud_task() returns immediately. Throttling to 1 ms delays TX-complete
+		// acknowledgement, causing TDRE to drop and the 6809 to stall.
+		usb_poll();
 		MC6809.uart_task();
 	}
 }
@@ -1160,18 +1179,12 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	sysreq_initialise();
 	mc6840 timer(reg, 1);
-	absolute_time_t next_ms = get_absolute_time();
 
 	printf("Pico2 MC6809E core1 process started\n");
 
 	core1_initialised = true;
 
 	for (;;) {
-		if (absolute_time_diff_us(get_absolute_time(), next_ms) <= 0) {
-			fast_serial.task();
-			next_ms = make_timeout_time_ms(1u);
-		}
-
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {
 			q_rising_edge = false;
@@ -1373,6 +1386,16 @@ __no_inline_not_in_flash_func(main_core1)()
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		} // if (write_irq_received)
 
+		// Drain the CONSOLE_RX_DATA counter before checking the shared slot.
+		// Each ISR-detected RX data read must call guest_receive() exactly once.
+		while (rx_processed_count != rx_read_count) {
+#ifdef DEBUG
+			UART_RX_DATA_COUNT++;
+#endif
+			fast_serial.guest_receive();
+			rx_processed_count++;
+		}
+
 		if (read_irq_received) {
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
@@ -1401,16 +1424,10 @@ __no_inline_not_in_flash_func(main_core1)()
 #ifdef DEBUG
 				UART_STATUS_COUNT++;
 #endif
-				fast_serial.guest_status();
+				fast_serial.update_task();
 				break;
 
-			case CONSOLE_RX_DATA: // UART Rx data
-#ifdef DEBUG
-				UART_RX_DATA_COUNT++;
-#endif
-				// The guest already got the byte, now get the next one
-				fast_serial.guest_receive();
-				break;
+			// CONSOLE_RX_DATA is handled via rx_read_count above.
 
 			case SYSTEM_TIMER_CONTROL_13:
 			case SYSTEM_TIMER_STATUS:

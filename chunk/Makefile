@@ -1,4 +1,4 @@
-all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw
+all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin
 
 assist09.s19: assist09.asm
 	lwasm --list=assist09.lst --map=assist09.map --format=srec --output=$@ $^
@@ -22,7 +22,16 @@ put.bin: put.obj io.obj bss.obj syslib.obj
 	lwlink --script=chunk.ld --map=put.map --format=decb --output=$@ $^
 
 put.obj: put.asm ascii.inc uart.inc syslib.inc
-	lwasm --format=obj --list=put.lst --output=$@ $<
+	lwasm --format=obj --list=get.lst --output=$@ $<
+
+test_send.s19: test_send.obj io.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_send.map --format=srec --output=$@ $^
+
+test_send.bin: test_send.obj io.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_send.map --format=decb --output=$@ $^
+
+test_send.obj: test_send.asm ascii.inc uart.inc syslib.inc
+	lwasm --format=obj --list=test_send.lst --output=$@ $<
 
 loop.s19: loop.obj bss.obj syslib.obj
 	lwlink --script=chunk.ld --map=loop.map --format=srec --output=$@ $^
@@ -32,6 +41,24 @@ loop.bin: loop.obj bss.obj syslib.obj
 
 loop.obj: loop.asm bss.obj
 	lwasm --format=obj --list=loop.lst --output=$@ $<
+
+test_echo_fast.s19: test_echo_fast.obj io.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_echo_fast.map --format=srec --output=$@ $^
+
+test_echo_fast.bin: test_echo_fast.obj io.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_echo_fast.map --format=decb --output=$@ $^
+
+test_echo_fast.obj: test_echo_fast.asm uart.inc syslib.inc
+	lwasm --format=obj --list=test_echo_fast.lst --output=$@ $<
+
+test_echo.s19: test_echo.obj io.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_echo.map --format=srec --output=$@ $^
+
+test_echo.bin: test_echo.obj io.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_echo.map --format=decb --output=$@ $^
+
+test_echo.obj: test_echo.asm ascii.inc uart.inc syslib.inc
+	lwasm --format=obj --list=test_echo.lst --output=$@ $<
 
 io.obj: io.asm uart.inc ascii.inc
 	lwasm --format=obj --list=io.lst --output=$@ $<

@@ -143,9 +143,14 @@ public:
 	}
 	mc6809(const mc6809&) = delete;
 	mc6809& operator=(const mc6809&) = delete;
-	void set_busy_lic_avma(uint8_t value) { busy_lic_avma.byte = value; }
+	void set_busy_lic_avma(uint8_t value)
+	{
+		busy_lic_avma.byte = value;
+		busy = busy_lic_avma.bit.BUSY;
+		lic = busy_lic_avma.bit.LIC;
+		vma = busy_lic_avma.bit.AVMA;
+	}
 	[[nodiscard]] uint8_t get_busy_lic_avma() const { return busy_lic_avma.byte; }
-	void unpack_busy_lic_avma() { busy = busy_lic_avma.bit.BUSY; lic = busy_lic_avma.bit.LIC; vma = busy_lic_avma.bit.AVMA; }
 	[[nodiscard]] bool get_busy() const { return busy; }
 	[[nodiscard]] bool get_lic() const { return lic; }
 	[[nodiscard]] bool get_vma() const { return vma; }

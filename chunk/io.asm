@@ -17,7 +17,7 @@ OUTCH	EXPORT
 GETS	EXPORT
 INCH	EXPORT
 
-;NO_IRQ	EQU	1
+NO_IRQ	EQU	1
 
 	SECTION	TEXT
 
@@ -159,16 +159,27 @@ I@0	PULS	CC
 INCH	PSHS	CC,B,U
 	LDB	RX_P_OU
 	CMPB	RX_P_IN
-	BEQ	I@0		branch if buffer empty
+	BEQ	I@2		branch if buffer empty
 	LDU	#RX_BUF
 	LDA	B,U		get the byte from the buffer
 	INCB
 	ANDB	#%00001111	gives MOD 16
 	STB	RX_P_OU
-	PULS	CC
+	TST	RX_FULL_FLAG	was RTS deasserted?
+	BEQ	I@1		no → nothing to do
+	CLR	RX_FULL_FLAG	yes → re-assert RTS
+	LDB	TX_P_IN
+	CMPB	TX_P_OU
+	BEQ	I@0		TX buffer empty → IQ_RX
+	LDB	IQ_RXTX		TX has data → IQ_RXTX
+	STB	UARTC
+	BRA	I@1
+I@0	LDB	IQ_RX
+	STB	UARTC
+I@1	PULS	CC
 	ORCC	C		carry set means got a byte
 	PULS	B,U,PC
-I@0	PULS	CC
+I@2	PULS	CC
 	ANDCC	C		carry clear means no byte
 	PULS	B,U,PC
 
@@ -195,10 +206,10 @@ IRQ_ISR	RTI
 
 IRQ_ISR	ORCC	I
 	LDA	UARTS		this doesn't clear the interrupt
+	BITA	#S_RDRF		receiver interrupt (checked first: Pico TDRE is always 1)
+	BNE	RXIRQ
 	BITA	#S_TDRE		transmitter interrupt
 	BNE	TXIRQ
-	BITA	#S_RDRF		receiver interrupt
-	BNE	RXIRQ
 * FALLTHROUGH
 	RTI
 
@@ -233,9 +244,13 @@ RXIRQ	LDB	RX_P_IN
 	STB	RX_P_IN
 	RTI
 
-RXFULL	LDA	UARTRX		clear the interrupt
+RXFULL	LDA	UARTRX		clear the interrupt (read to dismiss RDRF)
 	LDA	#$BE		set errno for the user
 	STA	ERRNO
+	LDA	#1
+	STA	RX_FULL_FLAG	mark RTS as deasserted
+	LDA	IQ_NOCTS
+	STA	UARTC		 deassert ~RTS → Pico stops sending
 	RTI
 
 	ENDC
@@ -248,6 +263,7 @@ RXFULL	LDA	UARTRX		clear the interrupt
 
 IQ_RX	FCB	C_RX_IRQ
 IQ_RXTX	FCB	C_RX_IRQ|C_TX_IRQ
+IQ_NOCTS	FCB	C_RX_IRQ|C_RTS_OFF	; rx irq on, rts deasserted (pauses Pico→6809)
 
 	ENDC
 
@@ -262,6 +278,8 @@ TX_P_OU RMB     1
 
 RX_P_IN	RMB	1
 RX_P_OU	RMB	1
+
+RX_FULL_FLAG	RMB	1	; non-zero when RXFULL fired and RTS is deasserted
 
 TX_BUF	RMB	16
 RX_BUF	RMB	16
