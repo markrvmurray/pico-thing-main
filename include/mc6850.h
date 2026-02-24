@@ -82,6 +82,7 @@ class mc6850 {
 	bool assert_transmit_irq = false;
 	bool assert_receive_irq = false;
 	bool cts_deasserted = false;
+	bool rts_deasserted = false;
 	void sync_transmit();
 public:
 	mc6850();

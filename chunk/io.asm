@@ -17,7 +17,7 @@ OUTCH	EXPORT
 GETS	EXPORT
 INCH	EXPORT
 
-NO_IRQ	EQU	1
+; NO_IRQ	EQU	1
 
 	SECTION	TEXT
 
@@ -100,6 +100,7 @@ G@1	CLR	,Y
 * IRQ_ISR [ ] TX_P_IN != TX_P_OU  : next byte to transfer is at TX_P_OU, then TX_P_OU+
 * OUTCH   [*] TX_P_IN+ == TX_P_OU : buffer full, so spinwait
 * OUTCH   [*] TX_P_IN+ != TX_P_OU : Store byte in TX_P_IN, then TX_P_IN+
+* OUTCH   [*] RX_FULL_FLAG != 0   : RTS deasserted, drain TX ring directly (no IQ_RXTX)
 
 	IFDEF	NO_IRQ
 
@@ -124,9 +125,21 @@ O@0	CMPB	TX_P_OU
 	STA	B,U
 	PULS	B
 	STB	TX_P_IN
+	TST	RX_FULL_FLAG	RTS deasserted? drain TX ring buffer directly
+	BNE	O@D
 	LDB	IQ_RXTX		receive and transmit are both irq-driven
 	STB	UARTC
 	PULS	CC,B,U,PC
+O@D	LDB	TX_P_OU		drain TX ring buffer directly (Pico TDRE always 1)
+	CMPB	TX_P_IN
+	BEQ	O@X
+	LDA	B,U
+	STA	UARTTX
+	INCB
+	ANDB	#%00001111
+	STB	TX_P_OU
+	BRA	O@D
+O@X	PULS	CC,B,U,PC
 
 	ENDC
 
@@ -165,21 +178,21 @@ INCH	PSHS	CC,B,U
 	INCB
 	ANDB	#%00001111	gives MOD 16
 	STB	RX_P_OU
-	TST	RX_FULL_FLAG	was RTS deasserted?
-	BEQ	I@1		no → nothing to do
-	CLR	RX_FULL_FLAG	yes → re-assert RTS
-	LDB	TX_P_IN
-	CMPB	TX_P_OU
-	BEQ	I@0		TX buffer empty → IQ_RX
-	LDB	IQ_RXTX		TX has data → IQ_RXTX
-	STB	UARTC
-	BRA	I@1
-I@0	LDB	IQ_RX
-	STB	UARTC
 I@1	PULS	CC
 	ORCC	C		carry set means got a byte
 	PULS	B,U,PC
-I@2	PULS	CC
+I@2	TST	RX_FULL_FLAG	buffer empty: was RTS deasserted?
+	BEQ	I@3		no → nothing to do
+	CLR	RX_FULL_FLAG	yes → re-assert RTS now that buffer has drained
+	LDB	TX_P_IN
+	CMPB	TX_P_OU
+	BEQ	I@2A		TX empty → IQ_RX
+	LDB	IQ_RXTX		TX has data → IQ_RXTX
+	STB	UARTC
+	BRA	I@3
+I@2A	LDB	IQ_RX
+	STB	UARTC
+I@3	PULS	CC
 	ANDCC	C		carry clear means no byte
 	PULS	B,U,PC
 
@@ -235,8 +248,16 @@ RXIRQ	LDB	RX_P_IN
 	ANDB	#%00001111	gives MOD 16
 	CMPB	RX_P_OU
 	BEQ	RXFULL		if the input buffer is full
-	PSHS	B
-	LDA	UARTRX		clears the interrupt
+	PSHS	B		save next_in
+	INCB			check: will buffer be full after this store?
+	ANDB	#%00001111
+	CMPB	RX_P_OU
+	BNE	R@0		no room pressure → normal
+	LDA	#1		buffer will be full: deassert RTS NOW, before LDA UARTRX
+	STA	RX_FULL_FLAG	so guest_receive() sees rts_deasserted and skips staging
+	LDA	IQ_RTSOFF
+	STA	UARTC
+R@0	LDA	UARTRX		clears the interrupt (no next-byte staged if rts_deasserted)
 	LDB	RX_P_IN
 	LDX	#RX_BUF
 	STA	B,X
@@ -244,14 +265,25 @@ RXIRQ	LDB	RX_P_IN
 	STB	RX_P_IN
 	RTI
 
-RXFULL	LDA	UARTRX		clear the interrupt (read to dismiss RDRF)
+RXFULL	LDA	#1		safety net: RXIRQ should have caught this earlier
+	STA	RX_FULL_FLAG
+	LDA	IQ_RTSOFF
+	STA	UARTC		deassert RTS BEFORE LDA UARTRX so guest_receive() skips staging
+	LDA	UARTRX		clear the interrupt (no next-byte staged since rts_deasserted)
 	LDA	#$BE		set errno for the user
 	STA	ERRNO
-	LDA	#1
-	STA	RX_FULL_FLAG	mark RTS as deasserted
-	LDA	IQ_NOCTS
-	STA	UARTC		 deassert ~RTS → Pico stops sending
-	RTI
+* Drain TX ring buffer: Pico TDRE is always 1, direct STA UARTTX is safe.
+	LDX	#TX_BUF
+F@0	LDB	TX_P_OU
+	CMPB	TX_P_IN
+	BEQ	F@1		TX ring buffer empty
+	LDA	B,X		get byte
+	STA	UARTTX		send it
+	INCB
+	ANDB	#%00001111
+	STB	TX_P_OU
+	BRA	F@0
+F@1	RTI
 
 	ENDC
 
@@ -263,7 +295,7 @@ RXFULL	LDA	UARTRX		clear the interrupt (read to dismiss RDRF)
 
 IQ_RX	FCB	C_RX_IRQ
 IQ_RXTX	FCB	C_RX_IRQ|C_TX_IRQ
-IQ_NOCTS	FCB	C_RX_IRQ|C_RTS_OFF	; rx irq on, rts deasserted (pauses Pico→6809)
+IQ_RTSOFF	FCB	C_RX_IRQ|C_RTS_OFF	; rx irq on, rts deasserted (pauses Pico→6809)
 
 	ENDC
 

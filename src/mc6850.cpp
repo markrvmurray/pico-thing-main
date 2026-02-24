@@ -42,6 +42,7 @@ mc6850::reset()
 	assert_transmit_irq = false;
 	assert_receive_irq = false;
 	cts_deasserted = false;
+	rts_deasserted = false;
 	//tx.reset();
 	//rx.reset();
 	reg[CONSOLE_STATUS] = reset_status.byte;
@@ -77,6 +78,7 @@ mc6850::guest_control()
 	} else {
 		transmit_irq = cr.tx_irq == 0b01u;
 		receive_irq = cr.rx_irq;
+		rts_deasserted = (cr.tx_irq == 0b10u || cr.tx_irq == 0b11u);
 		sync_transmit();
 	}
 }
@@ -92,6 +94,15 @@ mc6850::guest_transmit()
 void
 mc6850::guest_receive()
 {
+	// If RTS is deasserted (6809 ring buffer full) do not stage the next byte;
+	// leave it in the rx queue so it is delivered once RTS is re-asserted.
+	if (rts_deasserted) {
+		receive_buffer_full = false;
+		mc6850_status sr = {reg[CONSOLE_STATUS]};
+		sr.rdrf = 0;
+		reg[CONSOLE_STATUS] = sr.byte;
+		return;
+	}
 	receive_buffer_full = rx.has_bytes();
 	if (receive_buffer_full)
 		reg[CONSOLE_RX_DATA] = rx.get();
@@ -108,7 +119,7 @@ mc6850::has_interrupt()
 	// inherent one-cycle lag (the DMA already served the previous value for
 	// this cycle), but that is harmless: the 6809 sees the updated RDRF on
 	// the very next UARTS read.
-	if (!receive_buffer_full && rx.has_bytes()) {
+	if (!receive_buffer_full && rx.has_bytes() && !rts_deasserted) {
 		receive_buffer_full = true;
 		reg[CONSOLE_RX_DATA] = rx.get();
 		mc6850_status sr = {reg[CONSOLE_STATUS]};
