@@ -14,7 +14,7 @@ ifeq ($(PKG_CFLAGS),)
     PKG_LIBS   = -lusb-1.0
 endif
 
-all: vendor_host server server1
+all: vendor_host server vendor_server
 
 vendor_host: vendor_host.c
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o vendor_host vendor_host.c $(PKG_LIBS)
@@ -22,8 +22,8 @@ vendor_host: vendor_host.c
 server: server.c
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o server server.c $(PKG_LIBS)
 
-server1: server1.c
-	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o server1 server1.c $(PKG_LIBS)
+vendor_server: vendor_server.c
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o vendor_server vendor_server.c $(PKG_LIBS)
 
 clean:
-	rm -f vendor_host server server1
+	rm -f vendor_host server vendor_server
