@@ -132,6 +132,6 @@ mc6850::has_interrupt()
 	sr.irq = assert_receive_irq || assert_transmit_irq;
 	reg[CONSOLE_STATUS] = sr.byte;
 	if (assert_transmit_irq || assert_receive_irq)
-		return INTERRUPT_IRQ;
+		return INTERRUPT_FIRQ;
 	return INTERRUPT_NONE;
 }
