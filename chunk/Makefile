@@ -1,3 +1,11 @@
+# Path to the cmoc standard library (derived from the cmoc binary location).
+CMOC_LIBDIR := $(patsubst %/bin/cmoc,%/share/cmoc/lib,$(shell which cmoc))
+# Libraries required by all cmoc-compiled programs.
+CMOC_LIBS   := -lcmoc-crt-void -lcmoc-std-void \
+               $(CMOC_LIBDIR)/float-ctor.mc6839_o -lcmoc-float-mc6839
+# Object files added to every C program link for interrupt-driven I/O.
+C_IO_OBJS   := io.obj syslib.obj cstart.obj
+
 all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin test_timer.s19 test_timer.bin
 
 assist09.s19: assist09.asm
@@ -90,26 +98,33 @@ syslib.obj: syslib.asm
 stub.obj: stub.asm
 	lwasm --format=obj --list=stub.lst --output=$@ $<
 
-disk_test.srec: disk_test.o pico.o ide_lib.o
-	cmoc --void-target --org=0x0130 --initial-s=0xf000 --srec --mc6839 -o $@ $^
+disk_test.srec: disk_test.o pico.o ide_lib.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=disk_test.map --format=srec \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
 
-disk_test.raw: disk_test.o pico.o ide_lib.o
-	cmoc --void-target --org=0x0130 --initial-s=0xf000 --raw --mc6839 -o $@ $^
+disk_test.raw: disk_test.o pico.o ide_lib.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=disk_test.map --format=raw \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
 
 disk_test.o: disk_test.c pico.h
 	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<
 
-hello.srec: hello.o pico.o 
-	cmoc --void-target --org=0x0130 --initial-s=0xf000 --srec --mc6839 -o $@ $^
+hello.srec: hello.o pico.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=hello.map --format=srec \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
 
-hello.raw: hello.o pico.o
-	cmoc --void-target --org=0x0130 --initial-s=0xf000 --raw --mc6839 -o $@ $^
+hello.raw: hello.o pico.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=hello.map --format=raw \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
 
 hello.o: hello.c pico.h
 	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<
 
 pico.o: pico.c pico.h
 	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<
+
+cstart.obj: cstart.asm
+	lwasm --format=obj --output=$@ $<
 
 ide.o: ide.c ide.h pico.h
 	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<

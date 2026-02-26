@@ -9,8 +9,8 @@ void
 initialiseFastSerial(void)
 {
 	asm {
-		lda	#$03		; complete uart reset
-		sta	$FFC3
+		EXTERN	INIT
+		lbsr	INIT		; UART reset + install FIRQ ISR + enable FIRQ
 	}
 }
 
@@ -18,20 +18,8 @@ void
 newOutputRoutine(void)
 {
 	asm {
-		pshs	b
-		cmpa	#$0a
-		bne	O@0
-		lda	#$0d
-		bsr	O@1
-		lda	#$0a
-O@0		bsr	O@1
-		bra	O@2
-O@1		ldb	$FFC3
-		bitb	#%00000010
-		beq	O@1		; branch if transmitter not empty
-		sta	$FFC4
-		rts
-O@2		puls	b
+		EXTERN	PUTCHAR
+		lbsr	PUTCHAR		; LF→CR+LF conversion, then interrupt-driven OUTCH
 	}
 }
 
