@@ -94,3 +94,21 @@ target_include_directories(test_mc6840 PRIVATE
 target_compile_features(test_mc6840 PRIVATE cxx_std_17)
 target_link_libraries(test_mc6840 PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_mc6840)
+
+# ---------------------------------------------------------------------------
+# test_mc6850: host-native build using fake/ stub headers.
+#
+# fake/pico/util/queue.h provides a simple ring-buffer queue_t in place of
+# the SDK's spinlock-protected multicore queue.
+# ---------------------------------------------------------------------------
+add_executable(test_mc6850
+    test_mc6850.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mc6850.cpp
+)
+target_include_directories(test_mc6850 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake   # fake Pico/registers stubs (first!)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_features(test_mc6850 PRIVATE cxx_std_17)
+target_link_libraries(test_mc6850 PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_mc6850)

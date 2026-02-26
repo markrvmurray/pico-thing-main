@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include <pico/mutex.h>
-
 #include "pico/util/queue.h"
 
 #define CONSOLE_QUEUE_LEN	256
@@ -69,7 +67,6 @@ union mc6850_status {
 };
 
 class mc6850 {
-	//mutex_t reset_lock;
 	Queue tx;
 	Queue rx;
 	registers &reg;
