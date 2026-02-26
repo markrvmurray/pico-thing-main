@@ -43,6 +43,7 @@ mc6850::reset()
 	assert_receive_irq = false;
 	cts_deasserted = false;
 	rts_deasserted = false;
+	tx_write_pending = false;
 	//tx.reset();
 	//rx.reset();
 	reg[CONSOLE_STATUS] = reset_status.byte;
@@ -56,7 +57,21 @@ mc6850::sync_transmit()
 	cts_deasserted = tx.get_level() > CTS_THRESHOLD;
 	mc6850_status sr = {reg[CONSOLE_STATUS]};
 	sr.cts  = cts_deasserted ? 1u : 0u;
-	sr.tdre = (transmit_buffer_empty && !cts_deasserted) ? 1u : 0u;
+	sr.tdre = (transmit_buffer_empty && !cts_deasserted && !tx_write_pending) ? 1u : 0u;
+	reg[CONSOLE_STATUS] = sr.byte;
+}
+
+// Called from Core 1 write ISR when CONSOLE_TX_DATA is written.
+// Immediately clears TDRE so the 6809's OUTCH poll-loop stalls until
+// guest_transmit() runs on the next for(;;) iteration.  This prevents
+// back-to-back writes (e.g. CR then LF from PUTCHAR) from overwriting
+// write_registers[CONSOLE_TX_DATA] before the for(;;) loop reads it.
+void
+mc6850::write_received()
+{
+	tx_write_pending = true;
+	mc6850_status sr = {reg[CONSOLE_STATUS]};
+	sr.tdre = 0;
 	reg[CONSOLE_STATUS] = sr.byte;
 }
 
@@ -86,9 +101,10 @@ mc6850::guest_control()
 void
 mc6850::guest_transmit()
 {
+	tx_write_pending = false;		// acknowledge: for(;;) loop has taken ownership
 	if (tx.has_space())
 		tx.put(registers::write(CONSOLE_TX_DATA));
-	sync_transmit();
+	sync_transmit();			// restores TDRE=1 (tx_write_pending is now false)
 }
 
 void

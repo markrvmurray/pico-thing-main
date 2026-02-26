@@ -107,6 +107,10 @@ static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
 
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
+// ISR-accessible pointer to the mc6840 timer.  Set by core1_task() before
+// the for(;;) loop starts.  The Q-falling ISR calls tick() directly so
+// that every Q-falling edge is counted regardless of for(;;) loop latency.
+static mc6840 *timer_isr_ptr = nullptr;
 
 union bus_pins {
 	struct {
@@ -165,6 +169,12 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 	} else {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
+		// Tick the timer on every Q-falling edge directly from the ISR.
+		// The for(;;) loop is too slow to call tick() reliably at 1 MHz
+		// due to GPIO ISR overhead (~68% of Core 1 time), causing ~3×
+		// under-counting.  Running tick() here guarantees 1:1 rate.
+		if (timer_isr_ptr)
+			timer_isr_ptr->tick(1u);
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
 		// Grab the current 8 D pins if this is a read cycle, and the LIC timing lets us
@@ -260,6 +270,8 @@ __time_critical_func(dma_bus_write_irq_handler())
 		write_location = written_addr & registers::register_mask;
 		if (write_location >= REGISTER_BUFFER_OFFSET && write_location < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
 			reg[write_location] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
+		if (write_location == CONSOLE_TX_DATA)
+			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
 		write_irq_received = true;
 #ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
@@ -1179,6 +1191,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	sysreq_initialise();
 	mc6840 timer(reg, 1);
+	timer_isr_ptr = &timer;	// expose to GPIO ISR before the loop starts
 
 	printf("Pico2 MC6809E core1 process started\n");
 
@@ -1202,12 +1215,8 @@ __no_inline_not_in_flash_func(main_core1)()
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
 
-		if (q_falling_edge) {
-			q_falling_edge = false;
-			//gpio_put(GPIO_TRACE_CORE1, true);
-			timer.tick(1u);
-			//gpio_put(GPIO_TRACE_CORE1, false);
-		}
+		// timer.tick(1u) is now called from the Q-falling ISR (see
+		// gpio_clock_eq_irq_handler) to guarantee 1:1 edge→tick rate.
 
 		if (write_irq_received) {
 			//gpio_put(GPIO_TRACE_CORE1, true);
@@ -1437,7 +1446,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			case SYSTEM_TIMER_2_LSB:
 			case SYSTEM_TIMER_3_MSB:
 			case SYSTEM_TIMER_3_LSB:
-				// All content provided by mc6840::tick()
+				timer.read(read_location - SYSTEM_TIMER_BASE);
 				break;
 
 			}

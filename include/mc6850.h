@@ -83,10 +83,12 @@ class mc6850 {
 	bool assert_receive_irq = false;
 	bool cts_deasserted = false;
 	bool rts_deasserted = false;
+	volatile bool tx_write_pending = false;	// set by write ISR, cleared by guest_transmit()
 	void sync_transmit();
 public:
 	mc6850();
 	void reset();
+	void write_received();		// called from Core 1 write ISR: clears TDRE until guest_transmit() runs
 	void update_task();
 	uint host_transmit_level_avail() { return CONSOLE_QUEUE_LEN - rx.get_level(); }
 	uint transmit_level() { return rx.get_level(); }

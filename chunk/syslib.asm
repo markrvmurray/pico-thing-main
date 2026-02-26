@@ -12,6 +12,13 @@ UARTS	EXPORT
 UARTTX	EXPORT
 UARTRX	EXPORT
 
+PTMC13	EXPORT
+PTMC2	EXPORT
+PTMSTA	EXPORT
+PTMTM1	EXPORT
+PTMTM2	EXPORT
+PTMTM3	EXPORT
+
 Start 	EXTERN
 
 RSRVD	EXPORT
@@ -24,11 +31,53 @@ NMI	EXPORT
 RESET	EXPORT
 
 INITIRQ	EXPORT
+INITFIRQ	EXPORT
 
 	SECTION	TEXT
 
-INITIRQ	STX	IRQ+1		This address is one past a JMP instruction
-	RTS
+INITIRQ	PSHS	A,U
+	LDA	IRQ_CN
+	LDU	#IRQ_HN
+	STX	A,U
+	INCA
+	INCA
+	STA	IRQ_CN
+	PULS	A,U,PC
+
+INITFIRQ	PSHS	A,U
+	LDA	FIRQ_CN
+	LDU	#FIRQ_HN
+	STX	A,U
+	INCA
+	INCA
+	STA	FIRQ_CN
+	PULS	A,U,PC
+
+IRQISR	LDA	IRQ_CN
+	LDU	#IRQ_HN
+I@0	TSTA
+	BEQ	I@99
+	DECA
+	DECA
+	PSHS	A		; protect counter: handler may clobber A
+	JSR	[A,U]
+	PULS	A		; restore counter
+	BRA	I@0
+I@99	RTI
+
+FIRQISR	PSHS	A,U
+	LDA	FIRQ_CN
+	LDU	#FIRQ_HN
+I@0	TSTA
+	BEQ	I@99
+	DECA
+	DECA
+	PSHS	A		; protect counter: handler may clobber A
+	JSR	[A,U]
+	PULS	A		; restore counter
+	BRA	I@0
+I@99	PULS	A,U
+	RTI
 
 	ENDSECTION
 
@@ -37,11 +86,17 @@ INITIRQ	STX	IRQ+1		This address is one past a JMP instruction
 RSRVD	jmp	>0
 SWI3	jmp	>0
 SWI2	jmp	>0
-FIRQ	jmp	>0
-IRQ	jmp	>0
+FIRQ	jmp	>FIRQISR
+IRQ	jmp	>IRQISR
 SWI	jmp	>0
 NMI	jmp	>0
-RESET	jmp	Start
+RESET	jmp	>Start
+
+IRQ_CN	FCB	0	Handler count
+IRQ_HN	FDB	0,0,0,0,0,0,0,0	Enough for 8 handlers
+
+FIRQ_CN	FCB	0	Handler count
+FIRQ_HN	FDB	0,0,0,0,0,0,0,0	Enough for 8 handlers
 
 	ENDSECTION
 

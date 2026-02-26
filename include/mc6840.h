@@ -6,8 +6,12 @@
 
 #pragma once
 
-#define UPPER 0
-#define LOWER 1
+// Counters are stored big-endian: byte[UPPER=0] holds the MSB, byte[LOWER=1]
+// the LSB.  Do NOT use .word for arithmetic — on a LE machine it is byte-swapped.
+// For writes to the register array, construct (byte[UPPER]<<8 | byte[LOWER])
+// explicitly so the WriteProxy bswap16() produces the correct register bytes.
+#define UPPER 0	// MSB — written by the MC6840 MSB register
+#define LOWER 1	// LSB — written by the MC6840 LSB register
 
 union mc6840_counter {
 	uint16_t word;
@@ -52,7 +56,9 @@ class mc6840 {
 	mc6840_status status = {0x00u};
 	mc6840_counter counter[3] = {0x0000u, 0x0000u, 0x0000u};
 	mc6840_counter ctr_latch[3] = {0xFFFFu, 0xFFFFu, 0xFFFFu};
+	mc6840_counter read_latch[3] = {0x0000u, 0x0000u, 0x0000u};
 	bool running[3] = {false, false, false};
+	bool latch_active[3] = {false, false, false};	// MSB read pending LSB
 
 	uint16_t interval;	// how often to poll
 	uint16_t cycles = 0u;	// cycles since last poll
@@ -67,8 +73,7 @@ public:
 	mc6840(registers &reg, uint16_t interval);
 	~mc6840() = default;
 
-	// TODO: MarkM: Implement read() as it is used to clear interrupt bits. See datasheet, page 7
-	// uint8_t read(uint16_t offset);
+	void read(uint16_t offset);
 	void write(uint16_t offset, uint8_t val);
 	[[nodiscard]] interrupt has_interrupt();
 	void tick(uint8_t);

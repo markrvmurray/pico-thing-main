@@ -42,7 +42,7 @@ SHORT	FCN	"Hi!"
 LONG	FCC	"Hello, World! 1\n"
 	FCC	"Hello, World! 2\n"
 	FCC	"Hello, World! 3\n"
-	FCC	"Hello, World! 4\n"
+	FCN	"Hello, World! 4\n"
 
 	ENDSECTION
 

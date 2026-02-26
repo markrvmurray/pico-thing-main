@@ -76,11 +76,21 @@ target_link_libraries(test_command_parser PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_command_parser)
 
 # ---------------------------------------------------------------------------
-# Future test targets for hardware-emulation classes (mc6850, mc6840, …)
-# should be built in a separate cmake invocation with PICO_PLATFORM=host so
-# the pico-sdk provides stub/no-op implementations of gpio_*, pio_*, etc.
-# See: https://github.com/raspberrypi/pico-sdk/tree/master/test
-# Build command:
-#   cmake -S .. -B ../build/host-tests -DPICO_PLATFORM=host
-#   cmake --build ../build/host-tests
+# test_mc6840: host-native build using fake/ stub headers.
+#
+# fake/ is placed first in the include path so that mc6840.cpp gets stub
+# versions of pico/*, hardware/pio.h, registers.h, pico_thing.h, and
+# mc6809.h in place of the real Pico-SDK-dependent headers.
+# mc6840.h itself has no Pico includes and is taken from ../include.
 # ---------------------------------------------------------------------------
+add_executable(test_mc6840
+    test_mc6840.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mc6840.cpp
+)
+target_include_directories(test_mc6840 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake   # fake Pico/registers stubs (first!)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_features(test_mc6840 PRIVATE cxx_std_17)
+target_link_libraries(test_mc6840 PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_mc6840)

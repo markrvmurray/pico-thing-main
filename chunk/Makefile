@@ -1,4 +1,4 @@
-all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin
+all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin test_timer.s19 test_timer.bin
 
 assist09.s19: assist09.asm
 	lwasm --list=assist09.lst --map=assist09.map --format=srec --output=$@ $^
@@ -32,6 +32,18 @@ test_send.bin: test_send.obj io.obj bss.obj syslib.obj
 
 test_send.obj: test_send.asm ascii.inc uart.inc syslib.inc
 	lwasm --format=obj --list=test_send.lst --output=$@ $<
+
+test_timer.s19: test_timer.obj io_noirq.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_timer.map --format=srec --output=$@ $^
+
+test_timer.bin: test_timer.obj io_noirq.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=test_timer.map --format=decb --output=$@ $^
+
+test_timer.obj: test_timer.asm ascii.inc uart.inc syslib.inc
+	lwasm --format=obj --list=test_timer.lst --output=$@ $<
+
+io_noirq.obj: io.asm uart.inc ascii.inc
+	lwasm -DNO_IRQ --format=obj --list=io_noirq.lst --output=$@ $<
 
 loop.s19: loop.obj bss.obj syslib.obj
 	lwlink --script=chunk.ld --map=loop.map --format=srec --output=$@ $^
