@@ -143,7 +143,7 @@ mc6850::has_interrupt()
 		reg[CONSOLE_STATUS] = sr.byte;
 	}
 	assert_receive_irq = receive_irq && receive_buffer_full;
-	assert_transmit_irq = transmit_irq && transmit_buffer_empty;
+	assert_transmit_irq = transmit_irq && transmit_buffer_empty && !tx_write_pending;
 	mc6850_status sr = {reg[CONSOLE_STATUS]};
 	sr.irq = assert_receive_irq || assert_transmit_irq;
 	reg[CONSOLE_STATUS] = sr.byte;
