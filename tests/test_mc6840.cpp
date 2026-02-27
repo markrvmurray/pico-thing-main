@@ -429,3 +429,70 @@ TEST_CASE("MC6840 Timer1 SINGLE_0 dual-8bit: single shot (does not repeat)", "[m
 	// After the single shot completes, NMI must stay clear.
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 }
+
+TEST_CASE("MC6840 Timer1 SINGLE_0 dual-8bit: re-arm fires again (ASSIST09 single-step pattern)", "[mc6840][nmi]")
+{
+	// ASSIST09 re-arms Timer 1 at the end of every NMI handler by writing
+	// $07 then $01 to PTMTM1.  Verify that the second shot is identical to
+	// the first: 6 ticks quiet, tick 7 = NMI, clears after the pulse.
+
+	auto t = make_nmi_timer();
+
+	// --- First shot ---
+	tw(t, SYSTEM_TIMER_1_MSB, 0x07u);
+	tw(t, SYSTEM_TIMER_1_LSB, 0x01u);
+
+	// Run well past the end of the pulse so the timer has fully stopped.
+	for (int i = 0; i < 12; i++)
+		t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);  // clean starting state
+
+	// --- Re-arm (mirrors what ASSIST09 does at the end of its NMI handler) ---
+	tw(t, SYSTEM_TIMER_1_MSB, 0x07u);
+	tw(t, SYSTEM_TIMER_1_LSB, 0x01u);
+
+	// Ticks 1-6: delay phase, NMI must not fire.
+	for (int i = 0; i < 6; i++) {
+		t.tick(1u);
+		REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+	}
+
+	// Tick 7: UPPER reaches 0 → NMI asserts.
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NMI);
+
+	// Run past the end of the pulse → NMI must clear.
+	t.tick(1u);
+	t.tick(1u);
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+}
+
+TEST_CASE("MC6840 Timer1 SINGLE_0 dual-8bit: re-arm during NMI pulse resets cleanly", "[mc6840][nmi]")
+{
+	// Edge case: if the Pico re-arms the timer while the NMI pulse is still
+	// active (tick 8 in the $0701 sequence), initialise() must clear
+	// nmi_pending and restart the delay counter correctly.
+
+	auto t = make_nmi_timer();
+	tw(t, SYSTEM_TIMER_1_MSB, 0x07u);
+	tw(t, SYSTEM_TIMER_1_LSB, 0x01u);
+
+	// Advance to tick 8: NMI pulse is active (UPPER=0, LOWER just hit 0).
+	for (int i = 0; i < 8; i++)
+		t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NMI);  // in the pulse
+
+	// Re-arm while NMI is still pending — initialise() must clear it.
+	tw(t, SYSTEM_TIMER_1_MSB, 0x07u);
+	tw(t, SYSTEM_TIMER_1_LSB, 0x01u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);  // cleared by initialise()
+
+	// The new delay must run for the correct 7 ticks.
+	for (int i = 0; i < 6; i++) {
+		t.tick(1u);
+		REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+	}
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NMI);
+}
