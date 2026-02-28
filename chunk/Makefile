@@ -6,7 +6,7 @@ CMOC_LIBS   := -lcmoc-crt-void -lcmoc-std-void \
 # Object files added to every C program link for interrupt-driven I/O.
 C_IO_OBJS   := io.obj syslib.obj cstart.obj
 
-all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin test_timer.s19 test_timer.bin
+all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw diskload.srec diskload.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin test_timer.s19 test_timer.bin
 
 assist09.s19: assist09.asm
 	lwasm --list=assist09.lst --map=assist09.map --format=srec --output=$@ $^
@@ -97,6 +97,17 @@ syslib.obj: syslib.asm
 
 stub.obj: stub.asm
 	lwasm --format=obj --list=stub.lst --output=$@ $<
+
+diskload.srec: diskload.o pico.o ide_lib.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=diskload.map --format=srec \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
+
+diskload.raw: diskload.o pico.o ide_lib.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=diskload.map --format=raw \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
+
+diskload.o: diskload.c pico.h ide_lib.h
+	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<
 
 disk_test.srec: disk_test.o pico.o ide_lib.o $(C_IO_OBJS)
 	lwlink --script=cchunk.ld --map=disk_test.map --format=srec \

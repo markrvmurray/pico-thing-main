@@ -27,7 +27,6 @@ uint8_t
 inb(uint8_t *addr)
 {
 	uint8_t ret = *addr;
-	//printf(" inb: %04X %02X\n", addr, ret);
 	return ret;
 }
 
@@ -51,7 +50,6 @@ void
 outb(uint8_t *addr, uint8_t val)
 {
 	*addr = val;
-	//printf("outb: %04X %02X\n", addr, val);
 }
 
 void
