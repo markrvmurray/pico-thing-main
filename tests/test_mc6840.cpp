@@ -55,7 +55,9 @@ static inline void tr(mc6840 &t, uint16_t reg_addr)
 
 // CR2 value for CONT_0 16-bit mode, IRQ enabled.
 // bit6=irq_en, bit1=clk_sel (harmless; E clock is always used), rest=0 → 0x42
-static constexpr uint8_t CR2_CONT0_IRQ = 0x42u;
+static constexpr uint8_t CR2_CONT0_IRQ    = 0x42u;
+// Same mode with IRQ disabled (bit6=0).
+static constexpr uint8_t CR2_CONT0_NOIRQ  = 0x02u;
 
 // Helper: construct a fresh mc6840 with cleared register state.
 static mc6840 make_timer()
@@ -845,4 +847,24 @@ TEST_CASE("MC6840 SINGLE_0 16-bit on Timer 2: no NMI asserted", "[mc6840][single
 	interrupt irq = t.has_interrupt();
 	REQUIRE(irq == INTERRUPT_IRQ);
 	REQUIRE(irq != INTERRUPT_NMI);
+}
+
+TEST_CASE("CONT_0 irq_en=0: status flag set, no IRQ asserted", "[mc6840][status]")
+{
+	// The datasheet specifies that per-timer status bits are set at terminal
+	// count regardless of irq_en.  Only the composite bit (bit7) and the
+	// interrupt output are gated by irq_en.
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_NOIRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 0x04u);  // N=4, fires after N+1=5 ticks
+
+	for (int i = 0; i < 5; i++) {
+		t.tick(1u);
+		REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+	}
+
+	// Timer 2 bit (bit1) set; composite bit7 not set (irq_en=0).
+	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x02u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 }

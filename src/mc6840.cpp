@@ -62,6 +62,20 @@ mc6840::initialise(uint ctr)
 	}
 }
 
+// Recompute the composite IRQ flag (status.irq) and write the status register.
+// Per the datasheet, the composite bit is the OR of (per-timer flag AND irq_en);
+// per-timer flags are set at terminal count regardless of irq_en.
+void
+mc6840::sync_status()
+{
+	uint8_t irq_mask = (control[CTR1].irq_en ? 0x01u : 0u)
+	                 | (control[CTR2].irq_en ? 0x02u : 0u)
+	                 | (control[CTR3].irq_en ? 0x04u : 0u);
+	status.irq = static_cast<bool>(status.irqs & irq_mask);
+	reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(
+	    (status.irqs & 0x07u) | (status.irq ? 0x80u : 0x00u));
+}
+
 void
 mc6840::tick(uint8_t ticks)
 {
@@ -96,8 +110,7 @@ mc6840::tick(uint8_t ticks)
 						if (i == CTR1)
 							nmi_pending = false;
 						running[i] = false;
-						if (control[i].irq_en)
-							status.irqs |= (0b00000001u << i);
+						status.irqs |= (0b00000001u << i);
 					}
 				}
 				reg[SYSTEM_TIMER_1_MSB + i*2] = counter[i].byte[UPPER];
@@ -112,8 +125,7 @@ mc6840::tick(uint8_t ticks)
 					if (i == CTR1)
 						nmi_pending = true;
 					running[i] = false;
-					if (control[i].irq_en)
-						status.irqs |= (0b00000001u << i);
+					status.irqs |= (0b00000001u << i);
 				} else {
 					if (counter[i].byte[LOWER]-- == 0)
 						counter[i].byte[UPPER]--;
@@ -131,8 +143,7 @@ mc6840::tick(uint8_t ticks)
 			// wrong result on a little-endian host).
 			if (counter[i].word == 0u) {
 				counter[i].word = ctr_latch[i].word;
-				if (control[i].irq_en)
-					status.irqs |= (0b00000001u << i);
+				status.irqs |= (0b00000001u << i);
 			} else {
 				if (counter[i].byte[LOWER]-- == 0)
 					counter[i].byte[UPPER]--;
@@ -143,11 +154,7 @@ mc6840::tick(uint8_t ticks)
 		}
 	}
 	cycles = 0;
-	status.irq = static_cast<bool>(status.irqs);
-	// Write status explicitly — avoid relying on union byte-alias of bitfields
-	// which may not pack identically across all compilers.
-	reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(
-	    (status.irqs & 0x07u) | (status.irq ? 0x80u : 0x00u));
+	sync_status();
 }
 
 void
@@ -225,9 +232,7 @@ mc6840::read(uint16_t offset)
 	case SYSTEM_TIMER_1_LSB - SYSTEM_TIMER_BASE:	// 3: clear timer 1 IRQ
 		latch_active[CTR1] = false;
 		status.irq1 = 0;
-		status.irq = static_cast<bool>(status.irqs);
-		reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(
-		    (status.irqs & 0x07u) | (status.irq ? 0x80u : 0x00u));
+		sync_status();
 		break;
 	case SYSTEM_TIMER_2_MSB - SYSTEM_TIMER_BASE:	// 4: latch counter 2 MSB
 		read_latch[CTR2].word = counter[CTR2].word;
@@ -237,9 +242,7 @@ mc6840::read(uint16_t offset)
 	case SYSTEM_TIMER_2_LSB - SYSTEM_TIMER_BASE:	// 5: clear timer 2 IRQ
 		latch_active[CTR2] = false;
 		status.irq2 = 0;
-		status.irq = static_cast<bool>(status.irqs);
-		reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(
-		    (status.irqs & 0x07u) | (status.irq ? 0x80u : 0x00u));
+		sync_status();
 		break;
 	case SYSTEM_TIMER_3_MSB - SYSTEM_TIMER_BASE:	// 6: latch counter 3 MSB
 		read_latch[CTR3].word = counter[CTR3].word;
@@ -249,9 +252,7 @@ mc6840::read(uint16_t offset)
 	case SYSTEM_TIMER_3_LSB - SYSTEM_TIMER_BASE:	// 7: clear timer 3 IRQ
 		latch_active[CTR3] = false;
 		status.irq3 = 0;
-		status.irq = static_cast<bool>(status.irqs);
-		reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(
-		    (status.irqs & 0x07u) | (status.irq ? 0x80u : 0x00u));
+		sync_status();
 		break;
 	}
 }

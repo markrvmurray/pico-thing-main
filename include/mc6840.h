@@ -67,6 +67,7 @@ class mc6840 {
 
 	void hard_reset();
 	void initialise(uint ctr);
+	void sync_status();
 
 public:
 	mc6840(registers &reg, uint16_t interval);
