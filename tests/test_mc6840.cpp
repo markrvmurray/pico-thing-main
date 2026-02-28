@@ -868,3 +868,172 @@ TEST_CASE("CONT_0 irq_en=0: status flag set, no IRQ asserted", "[mc6840][status]
 	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x02u);
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 }
+
+// ============================================================
+//  Spec-aligned tests (Groups T1–T7)
+//  T1.2, T1.3, T1.4, T2.1, T3.1–T3.3, T4.1–T4.2, T5.1–T5.2,
+//  T6.1, T6.3 are covered by earlier tests above.
+// ============================================================
+
+TEST_CASE("T1.1 status register reads $00 with no timers running", "[mc6840][plumbing][spec]")
+{
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);  // write CR2 = $00
+	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x00u);
+}
+
+TEST_CASE("T2.2 TR does not assert NMI or IRQ", "[mc6840][reset][spec]")
+{
+	// Even with Timer 1 (the NMI timer) loaded and running, asserting TR
+	// must not generate an NMI pulse or set the IRQ line.
+	auto t = make_nmi_timer();
+	tw(t, SYSTEM_TIMER_1_MSB, 0x07u);
+	tw(t, SYSTEM_TIMER_1_LSB, 0x01u);  // Timer 1 running; CR2.bit0=0 → TR goes to CR3
+
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);  // CR3.bit0=1 = TR asserted
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x00u);  // TR deasserted
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+}
+
+TEST_CASE("T2.3 timer does not restart when TR is deasserted", "[mc6840][reset][spec]")
+{
+	// Clearing TR (CR3.bit0=0) must not auto-restart halted timers.
+	// A new LSB write is required to restart.
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 5u);   // starts Timer 2; period = 6 ticks
+
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);  // CR3.bit0=1 — assert TR, stops timer
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x00u);  // CR3.bit0=0 — deassert TR
+
+	for (int i = 0; i < 20; i++)  // well past one period
+		t.tick(1u);
+
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x00u);
+}
+
+TEST_CASE("T4.3 Timer 2 ack does not disturb Timer 1 or Timer 3", "[mc6840][multi][spec]")
+{
+	// Three timers running simultaneously.  Acknowledging Timer 2 must
+	// leave Timer 1 and Timer 3 flags and counters completely unaffected.
+	auto t = make_timer();
+
+	// Timer 1: latch=10, CONT_0, irq_en via CR1 (fires at tick 11).
+	tw(t, SYSTEM_TIMER_CONTROL_2, 0x01u);           // route CONTROL_13 → CR1
+	tw(t, SYSTEM_TIMER_CONTROL_13, CR2_CONT0_IRQ);  // CR1 = $42
+	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);           // restore CR3 routing
+	tw(t, SYSTEM_TIMER_1_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_1_LSB, 10u);
+
+	// Timer 2: latch=3, CONT_0 via CR2 (fires at tick 4).
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 3u);
+
+	// Timer 3: latch=7, CONT_0 via CR3 (fires at tick 8).
+	tw(t, SYSTEM_TIMER_CONTROL_13, CR2_CONT0_IRQ);  // CR2.bit0=0 → CR3
+	tw(t, SYSTEM_TIMER_3_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_3_LSB, 7u);
+
+	// Tick 4: Timer 2 fires; T1 and T3 still counting.
+	for (int i = 0; i < 4; i++)
+		t.tick(1u);
+
+	uint8_t s = registers::peek(SYSTEM_TIMER_STATUS);
+	REQUIRE((s & 0x02u) != 0);  // irq2 set
+	REQUIRE((s & 0x01u) == 0);  // irq1 not yet
+	REQUIRE((s & 0x04u) == 0);  // irq3 not yet
+
+	// Acknowledge Timer 2.
+	tr(t, SYSTEM_TIMER_2_MSB);
+	tr(t, SYSTEM_TIMER_2_LSB);
+
+	s = registers::peek(SYSTEM_TIMER_STATUS);
+	REQUIRE((s & 0x02u) == 0);  // irq2 cleared
+	REQUIRE((s & 0x01u) == 0);  // irq1 unaffected
+	REQUIRE((s & 0x04u) == 0);  // irq3 unaffected
+
+	// 4 more ticks (total 8): Timer 3 fires.  T1 still counting.
+	for (int i = 0; i < 4; i++)
+		t.tick(1u);
+
+	s = registers::peek(SYSTEM_TIMER_STATUS);
+	REQUIRE((s & 0x04u) != 0);  // irq3 now set
+	REQUIRE((s & 0x01u) == 0);  // irq1 not yet (8 of 11 ticks elapsed)
+
+	// 3 more ticks (total 11): Timer 1 fires.
+	for (int i = 0; i < 3; i++)
+		t.tick(1u);
+
+	s = registers::peek(SYSTEM_TIMER_STATUS);
+	REQUIRE((s & 0x01u) != 0);  // irq1 now set
+}
+
+TEST_CASE("T6.2 Timer 1 16-bit SINGLE_0 fires NMI, not IRQ", "[mc6840][nmi][spec]")
+{
+	// CR1: mode=SINGLE_0 (bits 3-5 = 0b100 → bit5=1 → $20), bits_8=0 (16-bit),
+	// irq_en=0.  Only the NMI output (wired from Timer 1) should assert.
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, 0x01u);           // route CONTROL_13 → CR1
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x20u);          // CR1: SINGLE_0, 16-bit, irq_en=0
+	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);
+
+	tw(t, SYSTEM_TIMER_1_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_1_LSB, 0x01u);  // latch=1; fires at tick 2 (N+1)
+
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	t.tick(1u);  // terminal count — NMI asserts
+	interrupt irq = t.has_interrupt();
+	REQUIRE(irq == INTERRUPT_NMI);
+	REQUIRE(irq != INTERRUPT_IRQ);
+
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);  // one-shot, nothing left
+}
+
+TEST_CASE("T7.1 50 Hz: 50 IRQs fire in exactly 1,000,000 ticks", "[mc6840][timing][spec]")
+{
+	// Latch = $4E1F = 19999; period = 20000 ticks.
+	// 50 × 20000 = 1,000,000; 51st fire would be at tick 1,020,000.
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x4Eu);
+	tw(t, SYSTEM_TIMER_2_LSB, 0x1Fu);
+
+	int fires = 0;
+	for (int i = 0; i < 1000000; i++) {
+		t.tick(1u);
+		if (t.has_interrupt() == INTERRUPT_IRQ) {
+			fires++;
+			tr(t, SYSTEM_TIMER_2_MSB);
+			tr(t, SYSTEM_TIMER_2_LSB);
+		}
+	}
+	REQUIRE(fires == 50);
+}
+
+TEST_CASE("T7.2 60 Hz: 60 IRQs fire within 1,000,000 ticks", "[mc6840][timing][spec]")
+{
+	// Latch = $4119 = 16665; period = 16666 ticks.
+	// 60 × 16666 = 999,960 ≤ 1,000,000; 61st fire at tick 1,016,626 (outside window).
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x41u);
+	tw(t, SYSTEM_TIMER_2_LSB, 0x19u);
+
+	int fires = 0;
+	for (int i = 0; i < 1000000; i++) {
+		t.tick(1u);
+		if (t.has_interrupt() == INTERRUPT_IRQ) {
+			fires++;
+			tr(t, SYSTEM_TIMER_2_MSB);
+			tr(t, SYSTEM_TIMER_2_LSB);
+		}
+	}
+	REQUIRE(fires == 60);
+}
