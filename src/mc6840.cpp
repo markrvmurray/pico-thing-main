@@ -237,5 +237,5 @@ mc6840::has_interrupt()
 		nmi_pending = false;
 		return INTERRUPT_NMI;
 	}
-	return status.irq ? INTERRUPT_FIRQ : INTERRUPT_NONE;
+	return status.irq ? INTERRUPT_IRQ : INTERRUPT_NONE;
 }

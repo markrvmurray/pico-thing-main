@@ -115,7 +115,7 @@ TEST_CASE("MC6840 CONT_0 fires after exactly N ticks", "[mc6840][cont0]")
 
 	// 20th tick — must fire
 	t.tick(1u);
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 }
 
 TEST_CASE("MC6840 CONT_0 fires with a 16-bit period", "[mc6840][cont0]")
@@ -130,14 +130,14 @@ TEST_CASE("MC6840 CONT_0 fires with a 16-bit period", "[mc6840][cont0]")
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 
 	t.tick(1u);
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 }
 
 // ============================================================
-//  has_interrupt() returns FIRQ (not IRQ — mc6840 uses FIRQ, same as UART)
+//  has_interrupt() returns IRQ (not FIRQ — mc6840 uses IRQ; FIRQ is for the UART)
 // ============================================================
 
-TEST_CASE("MC6840 has_interrupt() returns INTERRUPT_FIRQ", "[mc6840][interrupt]")
+TEST_CASE("MC6840 has_interrupt() returns INTERRUPT_IRQ", "[mc6840][interrupt]")
 {
 	auto t = make_timer();
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
@@ -148,8 +148,8 @@ TEST_CASE("MC6840 has_interrupt() returns INTERRUPT_FIRQ", "[mc6840][interrupt]"
 		t.tick(1u);
 
 	interrupt irq = t.has_interrupt();
-	REQUIRE(irq == INTERRUPT_FIRQ);
-	REQUIRE(irq != INTERRUPT_IRQ);
+	REQUIRE(irq == INTERRUPT_IRQ);
+	REQUIRE(irq != INTERRUPT_FIRQ);
 	REQUIRE(irq != INTERRUPT_NONE);
 }
 
@@ -167,9 +167,9 @@ TEST_CASE("MC6840 IRQ stays pending until LSB is read", "[mc6840][interrupt]")
 	for (int i = 0; i < 5; i++)
 		t.tick(1u);
 
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);  // still pending
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);  // still pending
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);  // still pending
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);  // still pending
 }
 
 // ============================================================
@@ -186,7 +186,7 @@ TEST_CASE("MC6840 read() timer LSB clears IRQ", "[mc6840][read]")
 	for (int i = 0; i < 5; i++)
 		t.tick(1u);
 
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 
 	// Reading the LSB is the MC6840 IRQ-acknowledge mechanism.
 	tr(t, SYSTEM_TIMER_2_LSB);
@@ -209,9 +209,9 @@ TEST_CASE("MC6840 reading MSB alone does not clear IRQ", "[mc6840][read]")
 	for (int i = 0; i < 5; i++)
 		t.tick(1u);
 
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 	tr(t, SYSTEM_TIMER_2_MSB);  // latch snapshot only — must not clear
-	REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 }
 
 // ============================================================
@@ -228,7 +228,7 @@ TEST_CASE("MC6840 CONT_0 fires continuously", "[mc6840][cont0]")
 	for (int fire = 0; fire < 5; fire++) {
 		for (int i = 0; i < 10; i++)
 			t.tick(1u);
-		REQUIRE(t.has_interrupt() == INTERRUPT_FIRQ);
+		REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 		tr(t, SYSTEM_TIMER_2_LSB);  // acknowledge
 		REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 	}
