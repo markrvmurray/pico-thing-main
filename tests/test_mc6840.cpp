@@ -1037,3 +1037,30 @@ TEST_CASE("T7.2 60 Hz: 60 IRQs fire within 1,000,000 ticks", "[mc6840][timing][s
 	}
 	REQUIRE(fires == 60);
 }
+
+// ============================================================
+//  write() calls sync_status() — irq_en change takes effect immediately
+// ============================================================
+
+TEST_CASE("write() irq_en=1 immediately asserts IRQ when flag already set", "[mc6840][status]")
+{
+	// Let Timer 2 reach terminal count with irq_en=0 (flag set, no IRQ).
+	// Then write CR2 with irq_en=1 — composite IRQ must assert immediately
+	// without waiting for the next tick().
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_NOIRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 2u);   // period = 3 ticks
+
+	for (int i = 0; i < 3; i++)
+		t.tick(1u);
+
+	// Flag set, but no IRQ yet (irq_en=0).
+	REQUIRE((registers::peek(SYSTEM_TIMER_STATUS) & 0x02u) != 0);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	// Enable IRQ via CR2 write — must take effect without any tick.
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
+	REQUIRE((registers::peek(SYSTEM_TIMER_STATUS) & 0x80u) != 0);
+}

@@ -169,6 +169,7 @@ mc6840::write(uint16_t offset, uint8_t val)
 		if (control[CTR2].bit0) { // CR1
 			// bit0 of CR1 is the T1 prescaler on the real chip; no reset side-effect.
 			control[CTR1].byte = val;
+			sync_status();
 		} else { // CR3
 			control[CTR3].byte = val;
 			if (control[CTR3].bit0) {
@@ -180,11 +181,14 @@ mc6840::write(uint16_t offset, uint8_t val)
 					running[i] = false;
 				cycles = 0;
 				reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(0x00u);
+			} else {
+				sync_status();
 			}
 		}
 		break;
 	case SYSTEM_TIMER_CONTROL_2 - SYSTEM_TIMER_BASE:	// 1
 		control[CTR2].byte = val;
+		sync_status();
 		break;
 	case SYSTEM_TIMER_1_MSB - SYSTEM_TIMER_BASE:		// 2
 		ctr_latch[CTR1].byte[UPPER] = val;
