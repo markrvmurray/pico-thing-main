@@ -6,8 +6,8 @@
  * mc6840.cpp picks up stub Pico headers and the simplified registers class.
  *
  * Control register bit layout (mc6840_control):
- *   bit0  — soft-reset / CR1-CR3 select
- *   bit1  — e_clk (internal E clock; must be 1 to start counter)
+ *   bit0  — special: CR3 = Timer Reset (TR); CR2 = CR1/CR3 select; CR1 = T1 prescaler
+ *   bit1  — clk_sel (0 = E clock, 1 = external; both work in the emulation)
  *   bit2  — bits_8 (0 = 16-bit, 1 = dual 8-bit)
  *   bit3-5 — mode  (CONT_0=0, SINGLE_0=4, …)
  *   bit6  — irq_en
@@ -18,10 +18,14 @@
  *   1 — CONTROL_2
  *   2..7 — Timer MSB/LSB for timers 1/2/3
  *
+ * Timer reset: write CR3.bit0=1 via CONTROL_13 (with CR2.bit0=0).
+ *   Clears all IRQ flags, stops all timers.  Re-write timer LSBs to restart.
+ *
  * To run Timer N in CONT_0 16-bit mode with IRQ:
- *   Write CR2 = 0x42  (e_clk=1, irq_en=1, mode=CONT_0, 16-bit)
+ *   Write CR2 = 0x42  (irq_en=1, mode=CONT_0, 16-bit; clk_sel bit is ignored)
  *   Write Timer-N MSB
  *   Write Timer-N LSB  ← triggers initialise(), sets running=true
+ *   Period = latch_value + 1 ticks (datasheet N+1 rule)
  */
 
 #include <sys/types.h>  // uint (POSIX, matches how test_srec.cpp handles it)
@@ -49,8 +53,8 @@ static inline void tr(mc6840 &t, uint16_t reg_addr)
 	t.read(reg_addr - SYSTEM_TIMER_BASE);
 }
 
-// CR2 value for CONT_0 16-bit mode, IRQ enabled, internal E clock.
-// bit6=irq_en, bit1=e_clk, rest=0 → 0x42
+// CR2 value for CONT_0 16-bit mode, IRQ enabled.
+// bit6=irq_en, bit1=clk_sel (harmless; E clock is always used), rest=0 → 0x42
 static constexpr uint8_t CR2_CONT0_IRQ = 0x42u;
 
 // Helper: construct a fresh mc6840 with cleared register state.
@@ -85,35 +89,35 @@ TEST_CASE("MC6840 write() offsets are correct", "[mc6840][offset]")
 	// never have started and the counter would stay at 0.
 	t.tick(1u);
 
-	// After 1 tick the status register must NOT yet show irq (fires at 10).
+	// After 1 tick the status register must NOT yet show irq (fires at 11, N+1=10+1).
 	uint8_t status = registers::peek(SYSTEM_TIMER_STATUS);
 	REQUIRE((status & 0x80u) == 0);  // composite irq flag not set
 
-	// Tick the remaining 9 — timer should fire.
-	for (int i = 0; i < 9; i++)
+	// Tick the remaining 10 — timer should fire on the 11th tick total.
+	for (int i = 0; i < 10; i++)
 		t.tick(1u);
 
 	status = registers::peek(SYSTEM_TIMER_STATUS);
-	REQUIRE((status & 0x80u) != 0);  // irq flag set after 10 ticks
+	REQUIRE((status & 0x80u) != 0);  // irq flag set after 11 ticks
 }
 
 // ============================================================
 //  CONT_0 fires at the correct interval
 // ============================================================
 
-TEST_CASE("MC6840 CONT_0 fires after exactly N ticks", "[mc6840][cont0]")
+TEST_CASE("MC6840 CONT_0 fires after exactly N+1 ticks", "[mc6840][cont0]")
 {
 	auto t = make_timer();
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
-	tw(t, SYSTEM_TIMER_2_LSB, 20u);   // period = 20
+	tw(t, SYSTEM_TIMER_2_LSB, 20u);   // latch = 20; fires at tick 21 (N+1)
 
-	// 19 ticks — must not fire
-	for (int i = 0; i < 19; i++)
+	// 20 ticks — must not fire
+	for (int i = 0; i < 20; i++)
 		t.tick(1u);
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 
-	// 20th tick — must fire
+	// 21st tick — must fire
 	t.tick(1u);
 	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 }
@@ -122,10 +126,10 @@ TEST_CASE("MC6840 CONT_0 fires with a 16-bit period", "[mc6840][cont0]")
 {
 	auto t = make_timer();
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
-	tw(t, SYSTEM_TIMER_2_MSB, 0x01u);   // period = 0x0100 = 256
+	tw(t, SYSTEM_TIMER_2_MSB, 0x01u);   // latch = 0x0100 = 256; fires at tick 257 (N+1)
 	tw(t, SYSTEM_TIMER_2_LSB, 0x00u);
 
-	for (int i = 0; i < 255; i++)
+	for (int i = 0; i < 256; i++)
 		t.tick(1u);
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 
@@ -144,7 +148,7 @@ TEST_CASE("MC6840 has_interrupt() returns INTERRUPT_IRQ", "[mc6840][interrupt]")
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6 ticks for latch=5
 		t.tick(1u);
 
 	interrupt irq = t.has_interrupt();
@@ -164,7 +168,7 @@ TEST_CASE("MC6840 IRQ stays pending until LSB is read", "[mc6840][interrupt]")
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6
 		t.tick(1u);
 
 	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
@@ -183,7 +187,7 @@ TEST_CASE("MC6840 read() timer LSB clears IRQ", "[mc6840][read]")
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6
 		t.tick(1u);
 
 	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
@@ -206,7 +210,7 @@ TEST_CASE("MC6840 reading MSB alone does not clear IRQ", "[mc6840][read]")
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6
 		t.tick(1u);
 
 	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
@@ -226,7 +230,7 @@ TEST_CASE("MC6840 CONT_0 fires continuously", "[mc6840][cont0]")
 	tw(t, SYSTEM_TIMER_2_LSB, 10u);
 
 	for (int fire = 0; fire < 5; fire++) {
-		for (int i = 0; i < 10; i++)
+		for (int i = 0; i < 11; i++)  // N+1 = 11 ticks per period
 			t.tick(1u);
 		REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 		tr(t, SYSTEM_TIMER_2_LSB);  // acknowledge
@@ -244,19 +248,19 @@ TEST_CASE("MC6840 Timer 2 and Timer 3 are independent", "[mc6840][multi]")
 	// We need CR1 to configure CTR3.  Write CR2.bit0=0 (selects CR3 via CONTROL_13).
 	auto t = make_timer();
 
-	// Timer 2: CONT_0, 16-bit, irq_en, e_clk via CR2
+	// Timer 2: CONT_0, 16-bit, irq_en via CR2
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 10u);
 
-	// Timer 3: CONT_0, 16-bit, irq_en, e_clk via CONTROL_13 (CR2.bit0=0 → CR3)
+	// Timer 3: CONT_0, 16-bit, irq_en via CONTROL_13 (CR2.bit0=0 → CR3)
 	// CR2.bit0 is 0 (CR2_CONT0_IRQ & 1 = 0), so CONTROL_13 writes → CR3.
 	tw(t, SYSTEM_TIMER_CONTROL_13, CR2_CONT0_IRQ);  // sets control[CTR3]
 	tw(t, SYSTEM_TIMER_3_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_3_LSB, 30u);
 
-	// After 10 ticks: Timer 2 fired, Timer 3 has not.
-	for (int i = 0; i < 10; i++)
+	// After 11 ticks: Timer 2 fired (N+1=11), Timer 3 has not (fires at 31).
+	for (int i = 0; i < 11; i++)
 		t.tick(1u);
 
 	uint8_t status = registers::peek(SYSTEM_TIMER_STATUS);
@@ -266,7 +270,7 @@ TEST_CASE("MC6840 Timer 2 and Timer 3 are independent", "[mc6840][multi]")
 	// Acknowledge Timer 2.
 	tr(t, SYSTEM_TIMER_2_LSB);
 
-	// After 20 more ticks (total 30): Timer 2 fired twice more, Timer 3 fired once.
+	// After 20 more ticks (total 31): Timer 2 re-fired at tick 22, Timer 3 fired at 31.
 	for (int i = 0; i < 20; i++)
 		t.tick(1u);
 
@@ -283,7 +287,7 @@ TEST_CASE("MC6840 timer with irq_en=0 does not generate IRQ", "[mc6840][irq]")
 {
 	auto t = make_timer();
 
-	// CR2 without irq_en: e_clk=1, irq_en=0 → 0x02
+	// CR2 without irq_en: clk_sel=1 (harmless), irq_en=0 → 0x02
 	tw(t, SYSTEM_TIMER_CONTROL_2, 0x02u);
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);
@@ -306,7 +310,7 @@ TEST_CASE("MC6840 status register irq bits", "[mc6840][status]")
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 3u);
 
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 4; i++)  // N+1 = 4 ticks for latch=3
 		t.tick(1u);
 
 	// bit7 = composite irq, bit1 = irq2 (Timer 2)
@@ -326,8 +330,8 @@ TEST_CASE("MC6840 status register irq bits", "[mc6840][status]")
 // ============================================================
 //  Timer 1 SINGLE_0 dual 8-bit — NMI single-step mode
 //
-//  Control register $A6: out_en=1, SINGLE_0, bits_8=1, e_clk=1, irq_en=0
-//  (bit layout: bit7=out_en bit6=irq_en bits3-5=mode bit2=bits_8 bit1=e_clk bit0=reset)
+//  Control register $A6: out_en=1, SINGLE_0, bits_8=1, clk_sel=1, irq_en=0
+//  (bit layout: bit7=out_en bit6=irq_en bits3-5=mode bit2=bits_8 bit1=clk_sel bit0=special)
 //
 //  Dual 8-bit SINGLE_0 semantics (real MC6840 and our emulation):
 //    Phase 1 — UPPER counts the delay before NMI asserts.
@@ -336,7 +340,7 @@ TEST_CASE("MC6840 status register irq bits", "[mc6840][status]")
 //
 //  Setup sequence mirrors ASSIST09 ZMONT2:
 //    Write CR2=0x01 (bit0=1 → next CONTROL_13 write goes to CR1)
-//    Write CONTROL_13=0xA6 (→ CR1: single-shot, dual 8-bit, e_clk, out_en)
+//    Write CONTROL_13=0xA6 (→ CR1: single-shot, dual 8-bit, clk_sel, out_en)
 //    Write CR2=0x00 (clear bit0)
 // ============================================================
 
@@ -345,7 +349,7 @@ static mc6840 make_nmi_timer()
 	registers::clear();
 	mc6840 t(registers::getInstance(), 1u);
 	tw(t, SYSTEM_TIMER_CONTROL_2, 0x01u);   // CR2.bit0=1 → route CONTROL_13 to CR1
-	tw(t, SYSTEM_TIMER_CONTROL_13, 0xA6u);  // CR1: SINGLE_0, bits_8, e_clk, out_en
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0xA6u);  // CR1: SINGLE_0, bits_8, clk_sel, out_en
 	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);   // clear CR2
 	return t;
 }
@@ -512,9 +516,9 @@ TEST_CASE("MC6840 CR2.bit0=1 routes CONTROL_13 write to CR1", "[mc6840][routing]
 	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);           // clear routing bit
 
 	tw(t, SYSTEM_TIMER_1_MSB, 0x00u);
-	tw(t, SYSTEM_TIMER_1_LSB, 5u);  // starts CTR1 (control[CTR1].e_clk=1)
+	tw(t, SYSTEM_TIMER_1_LSB, 5u);  // starts CTR1
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6 ticks for latch=5
 		t.tick(1u);
 
 	uint8_t status = registers::peek(SYSTEM_TIMER_STATUS);
@@ -534,7 +538,7 @@ TEST_CASE("MC6840 CR2.bit0=0 routes CONTROL_13 write to CR3", "[mc6840][routing]
 	tw(t, SYSTEM_TIMER_3_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_3_LSB, 5u);  // starts CTR3
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6 ticks for latch=5
 		t.tick(1u);
 
 	uint8_t status = registers::peek(SYSTEM_TIMER_STATUS);
@@ -552,7 +556,7 @@ TEST_CASE("MC6840 Timer 2 counter registers reflect written latch after initiali
 	// latch into the counter and writes it back to the read registers.
 	auto t = make_timer();
 
-	tw(t, SYSTEM_TIMER_CONTROL_2, 0x02u);  // e_clk=1 (bit1), irq_en=0
+	tw(t, SYSTEM_TIMER_CONTROL_2, 0x02u);  // clk_sel=1 (bit1), irq_en=0
 	tw(t, SYSTEM_TIMER_2_MSB, 0x4Eu);
 	tw(t, SYSTEM_TIMER_2_LSB, 0x1Fu);     // triggers initialise()
 
@@ -565,33 +569,31 @@ TEST_CASE("MC6840 Timer 2 counter registers reflect written latch after initiali
 // ============================================================
 
 
-TEST_CASE("MC6840 soft reset clears pending IRQ", "[mc6840][reset]")
+TEST_CASE("MC6840 timer reset clears pending IRQ", "[mc6840][reset]")
 {
-	// Trigger soft reset via the CONTROL_13/CR1.bit0=1 path and verify
-	// that has_interrupt() returns INTERRUPT_NONE immediately after.
+	// Timer reset (CR3.bit0=1) clears all IRQ flags immediately.
 	auto t = make_timer();
 
-	// Let Timer 2 fire.
+	// Let Timer 2 fire (latch=3, fires at tick 4 with N+1).
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 3u);
 
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 4; i++)  // N+1 = 4 ticks
 		t.tick(1u);
 
 	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 
-	// Soft reset: route CONTROL_13 to CR1, write CR1.bit0=1.
-	tw(t, SYSTEM_TIMER_CONTROL_2, 0x01u);    // CR2.bit0=1 → route to CR1
-	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);  // CR1.bit0=1 → soft_reset()
-	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);    // clear routing
+	// Timer reset: write CR3.bit0=1 via CONTROL_13.
+	// CR2 was written with CR2_CONT0_IRQ (bit0=0) so CONTROL_13 routes to CR3.
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);  // CR3.bit0=1 → timer reset
 
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 }
 
-TEST_CASE("MC6840 soft reset does not itself assert any interrupt", "[mc6840][reset]")
+TEST_CASE("MC6840 timer reset does not itself assert any interrupt", "[mc6840][reset]")
 {
-	// Soft reset of an idle timer must not spuriously assert IRQ or NMI.
+	// Timer reset of an idle timer must not spuriously assert IRQ or NMI.
 	auto t = make_timer();
 
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
@@ -600,10 +602,8 @@ TEST_CASE("MC6840 soft reset does not itself assert any interrupt", "[mc6840][re
 
 	t.tick(5u);  // a few ticks, well before underflow
 
-	// Trigger soft reset.
-	tw(t, SYSTEM_TIMER_CONTROL_2, 0x01u);
-	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);
-	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);
+	// Timer reset: CR3.bit0=1 via CONTROL_13 (CR2.bit0=0 routes there).
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);  // CR3.bit0=1 → timer reset
 
 	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
 }
@@ -634,20 +634,21 @@ TEST_CASE("MC6840 writing T2MSB alone does not start Timer 2", "[mc6840][start]"
 
 TEST_CASE("MC6840 MSB read latches coherent LSB against concurrent tick", "[mc6840][latch]")
 {
-	// Period = 5.  After 4 ticks the counter is at 1 (MSB=0x00, LSB=0x01).
+	// Latch = 5; period = 6 ticks (N+1).  After 4 ticks the counter is at 1.
 	// Simulating what the 6809 does:
 	//   1. DMA reads T2MSB (already in register as 0x00).
 	//   2. ISR calls timer.read(T2MSB) which snapshots {0x00,0x01} and
 	//      pre-loads the T2LSB register with the latched 0x01.
-	//   3. Tick fires: counter reloads to 5 (LSB becomes 0x05).
+	//   3. Tick 5 fires: counter decrements 1 → 0 (NOT yet reloaded).
 	//      Because latch_active=true, the T2LSB register is NOT updated.
 	//   4. 6809 reads T2LSB — gets 0x01 (coherent with the snapshot MSB).
+	//   5. After latch release, tick 6 detects counter==0 → reloads to 5.
 	auto t = make_timer();
 	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
-	tw(t, SYSTEM_TIMER_2_LSB, 5u);         // period = 5
+	tw(t, SYSTEM_TIMER_2_LSB, 5u);         // latch = 5
 
-	// Count down to 1.
+	// Count down to 1 (4 ticks: 5→4→3→2→1).
 	for (int i = 0; i < 4; i++)
 		t.tick(1u);
 
@@ -657,17 +658,18 @@ TEST_CASE("MC6840 MSB read latches coherent LSB against concurrent tick", "[mc68
 	// ISR response: latch snapshot, pre-load T2LSB register.
 	tr(t, SYSTEM_TIMER_2_MSB);
 
-	// One more tick: counter underflows and reloads to 5.
-	// T2MSB is updated freely; T2LSB is protected by latch_active.
+	// One more tick: counter decrements 1 → 0 (not yet reloaded; latch protects LSB).
 	t.tick(1u);
 
-	REQUIRE(registers::peek(SYSTEM_TIMER_2_MSB) == 0x00u);  // 5's MSB
-	REQUIRE(registers::peek(SYSTEM_TIMER_2_LSB) == 0x01u);  // latched — NOT 0x05
+	REQUIRE(registers::peek(SYSTEM_TIMER_2_MSB) == 0x00u);  // 0's MSB
+	REQUIRE(registers::peek(SYSTEM_TIMER_2_LSB) == 0x01u);  // latched — NOT 0x00
 
-	// Release latch; next tick now updates T2LSB freely.
+	// Release latch.  Next tick detects counter==0 → reload to 5.
 	tr(t, SYSTEM_TIMER_2_LSB);
 	t.tick(1u);
-	REQUIRE(registers::peek(SYSTEM_TIMER_2_LSB) == 0x04u);  // 5 - 1 tick = 4
+	REQUIRE(registers::peek(SYSTEM_TIMER_2_LSB) == 0x05u);  // just reloaded
+	t.tick(1u);
+	REQUIRE(registers::peek(SYSTEM_TIMER_2_LSB) == 0x04u);  // first decrement: 5 → 4
 }
 
 // ============================================================
@@ -694,13 +696,13 @@ TEST_CASE("MC6840 Timer 2 IRQ ack does not affect Timer 1", "[mc6840][multi]")
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);   // starts CTR2
 
-	// Tick 5: Timer 2 fires.
-	for (int i = 0; i < 5; i++)
+	// Tick 6: Timer 2 fires (latch=5, N+1=6).
+	for (int i = 0; i < 6; i++)
 		t.tick(1u);
 
 	uint8_t status = registers::peek(SYSTEM_TIMER_STATUS);
 	REQUIRE((status & 0x02u) != 0);  // irq2 set
-	REQUIRE((status & 0x01u) == 0);  // irq1 not yet (only 5 of 20 ticks)
+	REQUIRE((status & 0x01u) == 0);  // irq1 not yet (only 6 of 21 ticks)
 
 	// Acknowledge Timer 2.
 	tr(t, SYSTEM_TIMER_2_MSB);
@@ -710,7 +712,7 @@ TEST_CASE("MC6840 Timer 2 IRQ ack does not affect Timer 1", "[mc6840][multi]")
 	REQUIRE((status & 0x02u) == 0);  // irq2 cleared
 	REQUIRE((status & 0x01u) == 0);  // irq1 still not set
 
-	// Tick 15 more (total 20): Timer 1 fires.
+	// Tick 15 more (total 21): Timer 1 fires (latch=20, N+1=21).
 	for (int i = 0; i < 15; i++)
 		t.tick(1u);
 
@@ -733,7 +735,7 @@ TEST_CASE("MC6840 CONT_0 latch value is preserved across multiple reloads", "[mc
 	tw(t, SYSTEM_TIMER_2_LSB, 10u);  // latch = 10
 
 	for (int fire = 0; fire < 3; fire++) {
-		for (int i = 0; i < 10; i++)
+		for (int i = 0; i < 11; i++)  // N+1 = 11 ticks per period (latch=10)
 			t.tick(1u);
 		REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 		tr(t, SYSTEM_TIMER_2_MSB);
@@ -741,7 +743,7 @@ TEST_CASE("MC6840 CONT_0 latch value is preserved across multiple reloads", "[mc
 	}
 
 	// Snapshot immediately after the third ack (no additional ticks).
-	// The counter was just reloaded from the latch to 10 on the 10th tick.
+	// The counter was just reloaded from the latch to 10 on the 11th tick.
 	tr(t, SYSTEM_TIMER_2_MSB);
 	REQUIRE(registers::peek(SYSTEM_TIMER_2_MSB) == 0x00u);
 	REQUIRE(registers::peek(SYSTEM_TIMER_2_LSB) == 0x0Au);  // latch = 10
@@ -759,10 +761,88 @@ TEST_CASE("MC6840 Timer 2 CONT_0 IRQ does not assert NMI", "[mc6840][isolation]"
 	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
 	tw(t, SYSTEM_TIMER_2_LSB, 5u);
 
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)  // N+1 = 6
 		t.tick(1u);
 
 	interrupt irq = t.has_interrupt();
 	REQUIRE(irq == INTERRUPT_IRQ);
 	REQUIRE(irq != INTERRUPT_NMI);   // NMI line must remain deasserted
+}
+
+// ============================================================
+//  SINGLE_0 16-bit mode (newly implemented)
+// ============================================================
+
+// Control byte for SINGLE_0 16-bit mode with IRQ enabled:
+//   bits 3-5 = mode = SINGLE_0 = 4 = 0b100 → bit5=1 → 0x20
+//   bit6 = irq_en → 0x40
+//   bit1 = clk_sel = 0 (E clock, verifies e_clk gate is gone)
+// 0x20 | 0x40 = 0x60
+static constexpr uint8_t CR_SINGLE0_16_IRQ = 0x60u;
+
+TEST_CASE("MC6840 SINGLE_0 16-bit: IRQ fires after N+1 ticks and timer stops", "[mc6840][single0]")
+{
+	// latch = 4; fires at tick 5 (N+1).  Timer must stop and not repeat.
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR_SINGLE0_16_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 4u);   // latch=4, fires at tick 5 (N+1)
+
+	// 4 ticks — must not fire yet
+	for (int i = 0; i < 4; i++)
+		t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	// 5th tick — terminal count detected, IRQ fires
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
+}
+
+TEST_CASE("MC6840 SINGLE_0 16-bit: does not repeat after firing", "[mc6840][single0]")
+{
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR_SINGLE0_16_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 3u);   // latch=3, fires at tick 4
+
+	// Run well past the firing point
+	for (int i = 0; i < 20; i++)
+		t.tick(1u);
+
+	// Consume the single IRQ then verify no further interrupts
+	tr(t, SYSTEM_TIMER_2_LSB);  // acknowledge
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+}
+
+TEST_CASE("MC6840 SINGLE_0 16-bit: 16-bit latch fires at correct count", "[mc6840][single0]")
+{
+	// latch = 0x0010 = 16; fires at tick 17 (N+1)
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR_SINGLE0_16_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 0x10u);
+
+	for (int i = 0; i < 16; i++)
+		t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
+}
+
+TEST_CASE("MC6840 SINGLE_0 16-bit on Timer 2: no NMI asserted", "[mc6840][single0]")
+{
+	// Only Timer 1 is wired to NMI.  A 16-bit single-shot on Timer 2
+	// must fire IRQ only.
+	auto t = make_timer();
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR_SINGLE0_16_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 5u);
+
+	for (int i = 0; i < 6; i++)  // N+1 = 6
+		t.tick(1u);
+
+	interrupt irq = t.has_interrupt();
+	REQUIRE(irq == INTERRUPT_IRQ);
+	REQUIRE(irq != INTERRUPT_NMI);
 }

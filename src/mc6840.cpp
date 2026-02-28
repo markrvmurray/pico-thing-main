@@ -42,21 +42,15 @@ mc6840::hard_reset()
 }
 
 void
-mc6840::soft_reset()
-{
-	status.irqs = 0;
-	status.irq = 0;
-	for (uint i = CTR1; i <= CTR3; i++)
-		initialise(i);
-	cycles = 0;
-}
-
-void
 mc6840::initialise(uint ctr)
 {
 	assert(ctr < 3 && "Invalid MC6840 counter");
 
-	if (control[ctr].e_clk) {
+	// Start the timer when the LSB latch is written, provided the global
+	// timer reset (CR3.bit0 = TR) is not asserted.  The real MC6840 has two
+	// clock sources (E clock and external); since we only emulate E clock,
+	// clk_sel (bit1) is stored but not used as an enable gate.
+	if (!control[CTR3].bit0) {
 		latch_active[ctr] = false;
 		counter[ctr].word = ctr_latch[ctr].word;
 		reg[SYSTEM_TIMER_1_MSB + ctr*2] = static_cast<uint16_t>((ctr_latch[ctr].byte[UPPER] << 8) | ctr_latch[ctr].byte[LOWER]);
@@ -77,53 +71,75 @@ mc6840::tick(uint8_t ticks)
 	if (control[CTR3].bit0) // RESET
 		return;
 	for (uint i = CTR1; i <= CTR3; i++) {
-		if (running[i]) {
-			if (control[i].mode == SINGLE_0) {
-				if (control[i].bits_8) {
-					// Dual 8-bit single-shot (MC6840 datasheet mode 4):
-					// Phase 1 — UPPER counts the delay before NMI asserts.
-					// Phase 2 — LOWER counts the NMI pulse width.
-					// ASSIST09 programs $0701: 7 cycles delay, 1 cycle NMI.
-					if (counter[i].byte[UPPER] != 0x00u) {
-						// Phase 1: delay counting (NMI not yet asserted).
-						counter[i].byte[UPPER]--;
-						if (counter[i].byte[UPPER] == 0x00u && i == CTR1)
-							nmi_pending = true;  // NMI asserts as UPPER hits 0
-					} else {
-						// Phase 2: NMI pulse counting (UPPER already at 0).
-						// I'm simulating the output of the first timer being
-						// wired to !NMI through an inverter.
-						if (i == CTR1)
-							nmi_pending = true;
-						if (counter[i].byte[LOWER] != 0x00u)
-							counter[i].byte[LOWER]--;
-						else {
-							if (i == CTR1)
-								nmi_pending = false;
-							running[i] = false;
-							if (control[i].irq_en)
-								status.irqs |= (0b00000001u << i);
-						}
-					}
-					reg[SYSTEM_TIMER_1_MSB + i*2] = counter[i].byte[UPPER];
-					if (!latch_active[i])
-						reg[SYSTEM_TIMER_1_MSB + i*2 + 1] = counter[i].byte[LOWER];
-				}
-			} else if (control[i].mode == CONT_0 && !control[i].bits_8) {
-				// 16-bit continuous: reload and fire on each underflow.
-				// Bytes are big-endian (UPPER=MSB at [0], LOWER=LSB at [1]);
-				// do NOT use word-- (LE arithmetic gives wrong result).
-				if (counter[i].byte[LOWER]-- == 0)
+		if (!running[i])
+			continue;
+		if (control[i].mode == SINGLE_0) {
+			if (control[i].bits_8) {
+				// Dual 8-bit single-shot (MC6840 datasheet mode 4):
+				// Phase 1 — UPPER counts the delay before NMI asserts.
+				// Phase 2 — LOWER counts the NMI pulse width.
+				// ASSIST09 programs $0701: 7 cycles delay, 1 cycle NMI.
+				if (counter[i].byte[UPPER] != 0x00u) {
+					// Phase 1: delay counting (NMI not yet asserted).
 					counter[i].byte[UPPER]--;
+					if (counter[i].byte[UPPER] == 0x00u && i == CTR1)
+						nmi_pending = true;  // NMI asserts as UPPER hits 0
+				} else {
+					// Phase 2: NMI pulse counting (UPPER already at 0).
+					// I'm simulating the output of the first timer being
+					// wired to !NMI through an inverter.
+					if (i == CTR1)
+						nmi_pending = true;
+					if (counter[i].byte[LOWER] != 0x00u)
+						counter[i].byte[LOWER]--;
+					else {
+						if (i == CTR1)
+							nmi_pending = false;
+						running[i] = false;
+						if (control[i].irq_en)
+							status.irqs |= (0b00000001u << i);
+					}
+				}
+				reg[SYSTEM_TIMER_1_MSB + i*2] = counter[i].byte[UPPER];
+				if (!latch_active[i])
+					reg[SYSTEM_TIMER_1_MSB + i*2 + 1] = counter[i].byte[LOWER];
+			} else {
+				// 16-bit single-shot: count down to 0 then stop.
+				// Period = latch_value + 1 (N+1, consistent with CONT_0).
 				if (counter[i].word == 0u) {
-					counter[i].word = ctr_latch[i].word;
+					// I'm simulating the output of the first timer being
+					// wired to !NMI through an inverter.
+					if (i == CTR1)
+						nmi_pending = true;
+					running[i] = false;
 					if (control[i].irq_en)
 						status.irqs |= (0b00000001u << i);
+				} else {
+					if (counter[i].byte[LOWER]-- == 0)
+						counter[i].byte[UPPER]--;
 				}
 				reg[SYSTEM_TIMER_1_MSB + i*2] = counter[i].byte[UPPER];
 				if (!latch_active[i])
 					reg[SYSTEM_TIMER_1_MSB + i*2 + 1] = counter[i].byte[LOWER];
 			}
+		} else if (control[i].mode == CONT_0 && !control[i].bits_8) {
+			// 16-bit continuous: reload and fire on terminal count.
+			// Period = latch_value + 1 (datasheet: "N+1 clock periods").
+			// Check-before-decrement: fire when counter is already 0,
+			// then reload.  Bytes are big-endian (UPPER=MSB at [0],
+			// LOWER=LSB at [1]); do NOT use word-- (LE arithmetic gives
+			// wrong result on a little-endian host).
+			if (counter[i].word == 0u) {
+				counter[i].word = ctr_latch[i].word;
+				if (control[i].irq_en)
+					status.irqs |= (0b00000001u << i);
+			} else {
+				if (counter[i].byte[LOWER]-- == 0)
+					counter[i].byte[UPPER]--;
+			}
+			reg[SYSTEM_TIMER_1_MSB + i*2] = counter[i].byte[UPPER];
+			if (!latch_active[i])
+				reg[SYSTEM_TIMER_1_MSB + i*2 + 1] = counter[i].byte[LOWER];
 		}
 	}
 	cycles = 0;
@@ -144,11 +160,21 @@ mc6840::write(uint16_t offset, uint8_t val)
 		break;
 	case SYSTEM_TIMER_CONTROL_13 - SYSTEM_TIMER_BASE:	// 0
 		if (control[CTR2].bit0) { // CR1
+			// bit0 of CR1 is the T1 prescaler on the real chip; no reset side-effect.
 			control[CTR1].byte = val;
-			if (control[CTR1].bit0) // RESET
-				soft_reset();
-		} else
+		} else { // CR3
 			control[CTR3].byte = val;
+			if (control[CTR3].bit0) {
+				// TR=1: global timer reset — halt all timers, clear all IRQ flags.
+				status.irqs = 0;
+				status.irq = 0;
+				nmi_pending = false;
+				for (uint i = CTR1; i <= CTR3; i++)
+					running[i] = false;
+				cycles = 0;
+				reg[SYSTEM_TIMER_STATUS] = static_cast<uint8_t>(0x00u);
+			}
+		}
 		break;
 	case SYSTEM_TIMER_CONTROL_2 - SYSTEM_TIMER_BASE:	// 1
 		control[CTR2].byte = val;

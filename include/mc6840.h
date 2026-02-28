@@ -22,7 +22,7 @@ union mc6840_control {
 	uint8_t byte;
 	struct {
 		uint8_t bit0 : 1;
-		uint8_t e_clk : 1;
+		uint8_t clk_sel : 1;	// 0 = E clock (system), 1 = external; both work in emulation
 		uint8_t bits_8 : 1;
 		uint8_t mode : 3;
 		uint8_t irq_en : 1;
@@ -66,7 +66,6 @@ class mc6840 {
 	bool nmi_pending = false;
 
 	void hard_reset();
-	void soft_reset();
 	void initialise(uint ctr);
 
 public:
