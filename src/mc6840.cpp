@@ -33,7 +33,8 @@ mc6840::hard_reset()
 		running[i] = false;
 		latch_active[i] = false;
 	}
-	status.byte = 0x00;
+	status.irqs = 0;
+	status.irq = 0;
 	cycles = 0;
 	// I'm simulating the output of the first timer being
 	// wired to !NMI through an inverter.
@@ -43,7 +44,8 @@ mc6840::hard_reset()
 void
 mc6840::soft_reset()
 {
-	status.byte = 0x00;
+	status.irqs = 0;
+	status.irq = 0;
 	for (uint i = CTR1; i <= CTR3; i++)
 		initialise(i);
 	cycles = 0;
