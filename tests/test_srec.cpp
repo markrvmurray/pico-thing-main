@@ -203,3 +203,123 @@ TEST_CASE("process_srecord() parses Motorola S1 records", "[srec]")
         CHECK_FALSE(process_srecord(rec, &count, &address, data, &checksum));
     }
 }
+
+// ============================================================
+//  S0 header record tests
+// ============================================================
+
+TEST_CASE("process_srecord() parses Motorola S0 header records", "[srec][s0]")
+{
+    uint8_t  data[64] = {};
+    uint8_t  count    = 0;
+    uint8_t  checksum = 0;
+    uint16_t address  = 0;
+
+    SECTION("minimal S0 — no data bytes, address $0000")
+    {
+        // CC=03 AAAA=0000 (no data)  sum=03 → CS=FC
+        const char *rec = "S0030000FC";
+        REQUIRE(process_srecord(rec, &count, &address, data, &checksum));
+        CHECK(count    == 3);
+        CHECK(address  == 0x0000);
+        CHECK(checksum == 0xFC);
+        CHECK((count - 3) == 0);
+    }
+
+    SECTION("specific NitrOS-9 S0 header (CC=0x32, 47 data bytes) — user-reported")
+    {
+        // S03200005069636F2D5468696E67204E6974724F532D3920626F6F74
+        //   20696D61676520323032362D30322D32382032313A33302F
+        // CC=50, addr=0x0000, data="Pico-Thing NitrOS-9 boot image 2026-02-28 21:30"
+        // checksum verified: 0xFF - ((uint8_t)(50 + sum_of_47_bytes)) = 0x2F
+        const char *rec =
+            "S03200005069636F2D5468696E67204E6974724F532D3920626F6F74"
+            "20696D61676520323032362D30322D32382032313A33302F";
+        REQUIRE(process_srecord(rec, &count, &address, data, &checksum));
+        CHECK(count    == 0x32);          // CC = 50
+        CHECK(address  == 0x0000);
+        CHECK(checksum == 0x2F);
+        CHECK((count - 3) == 47);
+        // First four decoded bytes: 'P','i','c','o'
+        CHECK(data[0] == 0x50);
+        CHECK(data[1] == 0x69);
+        CHECK(data[2] == 0x63);
+        CHECK(data[3] == 0x6F);
+        // Last decoded byte: '0' (0x30)
+        CHECK(data[46] == 0x30);
+    }
+
+    SECTION("truncated S0 — NUL injected inside checksum field returns false")
+    {
+        // Simulate what poll_console does when an S0 record is longer than
+        // COMMAND_BUFFER_LEN-1 = 127 chars: the string is NUL-terminated mid-record.
+        // CC=0x3E=62, addr=0000, 59 zero data bytes, full checksum "C1".
+        // Build the 128-char full record then cut it to 127 (drop the trailing '1').
+        // At pos=126 hex() sees 'C' then '\0' → returns (uint)-1 → false.
+        const char *full =
+            "S03E0000"
+            "00000000000000000000000000000000"  /* 32 chars = 16 bytes */
+            "00000000000000000000000000000000"  /* 32 chars = 16 bytes */
+            "000000000000000000000000000000"    /* 30 chars = 15 bytes */
+            "000000"                            /* 6 chars  =  3 bytes, total 50 */
+            "000000000000000000"                /* 18 chars =  9 bytes, total 59 */
+            "C1";
+        // The full record above is 8+118+2 = 128 chars.
+        // Truncate by copying only the first 127 chars (drop the final '1').
+        char buf[128];
+        for (int i = 0; i < 127; i++) buf[i] = full[i];
+        buf[127] = '\0';
+        CHECK_FALSE(process_srecord(buf, &count, &address, data, &checksum));
+    }
+}
+
+// ============================================================
+//  S0 → S1 sequence: same data buffer
+// ============================================================
+
+TEST_CASE("process_srecord() S0 header does not corrupt subsequent S1 data", "[srec][sequence]")
+{
+    // process_command() in pico_thing.cpp uses a single static buffer[256] for
+    // both S0 and S1 records.  This test verifies that parsing S0 (which fills
+    // data[0..CC-4]) followed by S1 (which fills data[0..CC-4]) leaves the
+    // S1 data intact and returns the correct S1 address and byte count.
+    uint8_t  data[64] = {};
+    uint8_t  count    = 0;
+    uint8_t  checksum = 0;
+    uint16_t address  = 0;
+
+    // Step 1 — parse the user-reported S0 header (writes data[0..46])
+    const char *s0 =
+        "S03200005069636F2D5468696E67204E6974724F532D3920626F6F74"
+        "20696D61676520323032362D30322D32382032313A33302F";
+    REQUIRE(process_srecord(s0, &count, &address, data, &checksum));
+    REQUIRE(count == 0x32);
+    REQUIRE(data[0] == 0x50);  // 'P' — confirm S0 was parsed
+
+    // Step 2 — parse first S1 from assist09.s19 using the same buffer
+    // S113F400308DE7BE1F101F8B979D3384318C35EFF1
+    // CC=0x13=19, addr=0xF400, 16 data bytes, checksum=0xF1
+    const char *s1 = "S113F400308DE7BE1F101F8B979D3384318C35EFF1";
+    REQUIRE(process_srecord(s1, &count, &address, data, &checksum));
+    CHECK(count    == 0x13);
+    CHECK(address  == 0xF400);
+    CHECK(checksum == 0xF1);
+    CHECK((count - 3) == 16);
+    // data[0..15] must contain S1 bytes, NOT stale S0 ('P','i','c','o'…)
+    CHECK(data[0]  == 0x30);
+    CHECK(data[1]  == 0x8D);
+    CHECK(data[2]  == 0xE7);
+    CHECK(data[3]  == 0xBE);
+    CHECK(data[4]  == 0x1F);
+    CHECK(data[5]  == 0x10);
+    CHECK(data[6]  == 0x1F);
+    CHECK(data[7]  == 0x8B);
+    CHECK(data[8]  == 0x97);
+    CHECK(data[9]  == 0x9D);
+    CHECK(data[10] == 0x33);
+    CHECK(data[11] == 0x84);
+    CHECK(data[12] == 0x31);
+    CHECK(data[13] == 0x8C);
+    CHECK(data[14] == 0x35);
+    CHECK(data[15] == 0xEF);
+}

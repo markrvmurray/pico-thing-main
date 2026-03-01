@@ -880,10 +880,24 @@ TEST_CASE("srecord command", "[parser][srecord]")
 		CHECK(cmd.tag == CMD_SRECORD);
 		CHECK(std::strncmp(cmd.srecord.line, "S1030000FC", 10) == 0);
 	}
-	SECTION("S0 header record")
+	SECTION("S0 header record — minimal")
 	{
 		REQUIRE(parse("S0030000FC", &cmd));
 		CHECK(cmd.tag == CMD_SRECORD);
+		CHECK(std::strncmp(cmd.srecord.line, "S0030000FC", 10) == 0);
+	}
+	SECTION("S0 header record — 104 chars, user-reported NitrOS-9 boot image")
+	{
+		// CC=0x32=50, addr=0000, "Pico-Thing NitrOS-9 boot image 2026-02-28 21:30"
+		// 104 chars total — within poll_console's COMMAND_BUFFER_LEN-1=127
+		const char *s0 =
+			"S03200005069636F2D5468696E67204E6974724F532D3920626F6F74"
+			"20696D61676520323032362D30322D32382032313A33302F";
+		REQUIRE(parse(s0, &cmd));
+		CHECK(cmd.tag == CMD_SRECORD);
+		// Verify the full 104-char record is stored intact in srecord.line
+		CHECK(std::strncmp(cmd.srecord.line, s0, 104) == 0);
+		CHECK(cmd.srecord.line[104] == '\0');
 	}
 	SECTION("S9 end record")
 	{

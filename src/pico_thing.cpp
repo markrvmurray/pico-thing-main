@@ -112,28 +112,6 @@ static volatile bool q_falling_edge = false;
 // that every Q-falling edge is counted regardless of for(;;) loop latency.
 static mc6840 *timer_isr_ptr = nullptr;
 
-union bus_pins {
-	struct {
-		uint32_t E : 1;
-		uint32_t Q : 1;
-		uint32_t RW : 1;
-		uint32_t A : 6;
-		uint32_t D : 8;
-		uint32_t CS : 1;
-		uint32_t BS_BA : 2;
-		uint32_t BUSY_LIC_AVMA : 3;
-		uint32_t HALT : 1;
-		uint32_t NMI : 1;
-		uint32_t FIRQ : 1;
-		uint32_t IRQ : 1;
-		uint32_t TRACE_RW : 2;
-		uint32_t RESET : 1;
-		uint32_t UART : 2;
-	} bits;
-	uint32_t word;
-};
-
-
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
 {
@@ -1081,7 +1059,7 @@ process_command(char *buf)
 
 static volatile bool core1_initialised = false;
 
-#define COMMAND_BUFFER_LEN 128u
+#define COMMAND_BUFFER_LEN 256u
 
 static constexpr char prompt[] =  ">>> ";
 
@@ -1104,6 +1082,14 @@ poll_console()
 			printf(prompt);
 			prompted = true;
 		}
+		// Poll USB before reading a character so that all chars delivered
+		// by this tud_task() call are visible to getchar_timeout_us()
+		// before uart_task() can consume them.  Since tud_task() is the
+		// only path that moves data from the USB hardware FIFO into the
+		// TinyUSB CDC ring buffer, this guarantees that any char available
+		// in the ring buffer after usb_poll() is read by getchar first
+		// (advancing idx), causing uart_task() to be suppressed.
+		usb_poll();
 		const int ch = getchar_timeout_us(0);
 		if (ch != PICO_ERROR_TIMEOUT) {
 			if (ch == '\r' || ch == '\n') {
@@ -1126,13 +1112,7 @@ poll_console()
 				}
 			}
 		}
-
-
-		// TinyUSB must be polled as often as possible; if there are no events
-		// tud_task() returns immediately. Throttling to 1 ms delays TX-complete
-		// acknowledgement, causing TDRE to drop and the 6809 to stall.
-		usb_poll();
-		MC6809.uart_task();
+		MC6809.uart_task(idx > 0);
 	}
 }
 
@@ -1680,6 +1660,7 @@ main()
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
+	// NOTE: Start of power-up process
 	POWER_ASSERT;
 
 	// Setup !Reset, !Halt, and the interrupt pins.
@@ -1698,6 +1679,7 @@ main()
 	printf("Pico2 MC6809E emulated RAM and reg initialised\n");
 
 	multicore_launch_core1(main_core1);
+	// NOTE: End of power-up process
 
 	tm tm = build_time_tm();
 	aon_timer_stop();

@@ -81,6 +81,42 @@ struct pio_dma {
 	uint32_t irq;
 };
 
+union bus_pins {
+	struct {
+		uint32_t E : 1;
+		uint32_t Q : 1;
+		uint32_t RW : 1;
+		uint32_t A : 6;
+		uint32_t D : 8;
+		uint32_t CS : 1;
+		uint32_t BS_BA : 2;
+		uint32_t BUSY_LIC_AVMA : 3;
+		uint32_t HALT : 1;
+		uint32_t NMI : 1;
+		uint32_t FIRQ : 1;
+		uint32_t IRQ : 1;
+		uint32_t TRACE_RW : 2;
+		uint32_t RESET : 1;
+		uint32_t UART : 2;
+	} bits;
+	uint32_t word;
+};
+
+union high_bus_pins {
+	struct {
+		uint16_t PIX : 4;
+		uint16_t TRACE_CORE1 : 1;
+		uint16_t TRACE_EQ : 1;
+		uint16_t TRACE_RD : 1;
+		uint16_t TRACE_RW : 1;
+		uint16_t TASK : 5;
+		uint16_t TASK0 : 1;
+		uint16_t POWER : 1;
+		uint16_t POWER_ADC : 1;
+	} bits;
+	uint16_t hword;
+};
+
 // Chunks are like snippets, except they are too big for snippet space, so they go into RAM
 #define	CHUNK_ADDRESS	uint16_t(0x0130u)
 // === Device addresses ===

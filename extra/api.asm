@@ -12,6 +12,8 @@ VECTORS	EQU	$FFF0	CPU reset and interrupt vectors
 
 CHUNK	EQU	$0130
 
+TASK	EQU	DEVICE+$00
+
 UARTC	equ	$FFC3
 UARTS	equ	$FFC3
 UARTTX	equ	$FFC4
@@ -26,6 +28,7 @@ ESC	equ	$1B
 * Initialise the DAT RAM. Essential for anything outside the Pico
 * Do this automatically?
 DATInit	ORG	START
+	CLR	TASK
 	LDX	#DATRAM
 	CLRA
 D@0	STA	,X+
