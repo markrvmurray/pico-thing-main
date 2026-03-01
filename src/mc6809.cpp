@@ -64,7 +64,8 @@ mc6809::task_change(uint8_t new_task)
 {
 	new_task &= TASK_PINS_MASK;
 	task = new_task;
-	gpio_put_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE, static_cast<uint64_t>(new_task) << GPIO_TASK_BASE);
+	gpio_clr_mask64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE);
+	gpio_set_mask64(static_cast<uint64_t>(new_task) << GPIO_TASK_BASE);
 	gpio_put(GPIO_TASK_0, new_task == 0u);
 	return new_task;
 }
@@ -247,7 +248,7 @@ mc6809::apply_rti()
 #define USB_BUFFER_SIZE 64
 
 void
-mc6809::uart_task()
+mc6809::uart_task(bool suppress_cdc_read)
 {
 	static uint8_t receive_buffer[USB_BUFFER_SIZE], transmit_buffer[USB_BUFFER_SIZE];
 	static uint16_t bytes_read = 0u, bytes_read_index = 0u, bytes_write = 0u, bytes_write_index = 0u;
@@ -257,7 +258,7 @@ mc6809::uart_task()
 		{
 			mc6850_control cr = {registers::write(CONSOLE_CONTROL)};
 			bool rts_deasserted = (cr.tx_irq == 0b10u || cr.tx_irq == 0b11u);
-			if (!rts_deasserted) {
+			if (!rts_deasserted && !suppress_cdc_read) {
 				if (bytes_read == 0u) {
 					bytes_read = usb_cdc_read(receive_buffer, USB_BUFFER_SIZE);
 					bytes_read_index = 0u;

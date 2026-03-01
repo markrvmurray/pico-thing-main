@@ -174,7 +174,7 @@ public:
 	static void halt();
 	static void release();
 	static void apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS]);
-	static void uart_task();
+	static void uart_task(bool suppress_cdc_read = false);
 	void preserve_state();
 	void restore_state();
 	void set_e_frequency(float target_mhz, const pio_dma &pio_clock);
