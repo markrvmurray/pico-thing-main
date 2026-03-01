@@ -94,7 +94,6 @@ mc6809::setup(enum run_state rs)
 	old_bus_state.state = BS_RUNNING_RESET;
 	bus_state.state = BS_RUNNING_RESET;
 	busy_lic_avma.byte = 0x00u;
-	task = 0u;
 	task_stack_ptr = 0u;
 	vma = false;
 #ifdef DEBUG
@@ -102,7 +101,6 @@ mc6809::setup(enum run_state rs)
 	_count_rti = 0u;
 	trace_pos = 0u;
 #endif
-	task_initialise();
 }
 
 void
@@ -135,6 +133,7 @@ mc6809::init()
 	DEASSERT_IRQ;
 
 	setup(RS_STOPPED);
+	task_initialise();
 }
 
 void
