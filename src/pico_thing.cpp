@@ -116,7 +116,7 @@ void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
 {
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_EQ_IRQ, true); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_EQ_IRQ, true); // scope timing
 #endif
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
 		q_rising_edge = true;
@@ -165,7 +165,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// we do NOT capture them here.
 	}
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_EQ_IRQ, false); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_EQ_IRQ, false); // scope timing
 #endif
 }
 
@@ -192,7 +192,7 @@ void __isr
 __time_critical_func(dma_bus_read_irq_handler())
 {
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_READ_IRQ, true); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_READ_IRQ, true); // scope timing
 #endif
 	//if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
@@ -222,7 +222,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 	}
 	//}
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_READ_IRQ, false); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_READ_IRQ, false); // scope timing
 #endif
 }
 
@@ -239,7 +239,7 @@ void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_WRITE_IRQ, true); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_WRITE_IRQ, true); // scope timing
 #endif
 	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
@@ -263,7 +263,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 	}
 	// }
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_WRITE_IRQ, false); // OINQUE DEBUG to time this function on the scope
+	gpio_put(GPIO_TRACE_WRITE_IRQ, false); // scope timing
 #endif
 }
 
@@ -1128,7 +1128,7 @@ __no_inline_not_in_flash_func(main_core1)()
 {
 	printf("Pico2 MC6809E core1 process starting\n");
 
-	init_pins_range(GPIO_TRACE_CORE1, 4); // OINQUE DEBUG trace pins - isr set
+	init_pins_range(GPIO_TRACE_CORE1, 4); // trace pins - isr set
 	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_CORE1);
 
 	fast_serial.reset();
