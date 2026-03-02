@@ -3,10 +3,10 @@
 ;
 ; SPDX-License-Identifier: BSD-2-Clause
 ;
-; test_timer.asm — MC6840 Timer 2 FIRQ live test.
+; test_timer.asm — MC6840 Timer 2 IRQ live test.
 ;
 ; Configures Timer 2 in CONT_0 16-bit mode at 50 Hz (20 000 E-clock cycles
-; at the 1 MHz guest clock).  A FIRQ handler acknowledges each tick and
+; at the 1 MHz guest clock).  An IRQ handler acknowledges each tick and
 ; increments a 16-bit TICKS counter.  The main loop prints the hex tick
 ; count every 50 ticks (once per second) for 10 seconds, then stops.
 ;
@@ -17,10 +17,10 @@
 ; CR2 = $42: e_clk=1 (bit1), irq_en=1 (bit6), mode=000 (CONT_0), 16-bit
 ; Period = 20 000 = $4E20 → 50 Hz at 1.0 MHz guest clock.
 ;
-; Install the FIRQ ISR via syslib INITFIRQ.
+; Install the IRQ ISR via syslib INITIRQ.
 ;
-; FIRQ saves only CC+PC (E=0, 3 bytes, 10 cycles entry, 6 cycles RTI).
-; The ISR handler runs under JSR/RTS from FIRQISR dispatcher.
+; IRQ saves full register set (E=1, 12 bytes, 19 cycles entry, 15 cycles RTI).
+; The ISR handler runs under JSR/RTS from IRQISR dispatcher.
 
 	PRAGMA	cescapes
 
@@ -42,14 +42,14 @@ TICKS_PER_SEC	EQU	50	; IRQ fires at 50 Hz
 	SECTION	TEXT
 
 ; -----------------------------------------------------------------------
-; FIRQ handler — registered via INITFIRQ, called by FIRQISR dispatcher.
+; IRQ handler — registered via INITIRQ, called by IRQISR dispatcher.
 ; Poll each device status register in priority order; handle the first
-; active source found.  Spurious FIRQ: return immediately.
+; active source found.  Spurious IRQ: return immediately.
 ;
 ; Extend by inserting additional BITA / BNE pairs before the final RTS.
 ; -----------------------------------------------------------------------
 IRQ_DISPATCH
-	INC	FIRQ_CTR	; diagnostic: count all FIRQ entries
+	INC	IRQ_CTR		; diagnostic: count all IRQ entries
 	LDA	PTMSTA		; read PTM composite status (bit1=timer2)
 	BITA	#$02		; timer 2 IRQ pending?
 	BNE	TMR2_IRQ
@@ -120,10 +120,10 @@ Start
 	LDX	#BannerStr
 	LBSR	PUTS
 
-	; Install FIRQ dispatcher via syslib INITFIRQ.
+	; Install IRQ dispatcher via syslib INITIRQ.
 	LDX	#IRQ_DISPATCH
-	LBSR	INITFIRQ
-	ANDCC	F		; clear F bit — enable FIRQ at the CPU
+	LBSR	INITIRQ
+	ANDCC	I		; clear I bit — enable IRQ at the CPU
 
 	; Configure Timer 2: write CR2, then period MSB, then LSB.
 	; Writing the LSB triggers mc6840::initialise(CTR2) which loads the
@@ -175,8 +175,8 @@ ZTimLoop
 ; -----------------------------------------------------------------------
 ; Wait for TICKS to reach NEXTTICK, print hex count, repeat 10 times.
 ; WInner spins counting iterations.  When LOOPCNT overflows (~2 s) a
-; diagnostic line "D:XX YYYY" is printed (FIRQ_CTR, TICKS) so we can
-; tell whether FIRQ is firing and whether TICKS is advancing.
+; diagnostic line "D:XX YYYY" is printed (IRQ_CTR, TICKS) so we can
+; tell whether IRQ is firing and whether TICKS is advancing.
 ; -----------------------------------------------------------------------
 WaitLoop
 	LDD	#0
@@ -193,8 +193,8 @@ WInner
 	; LOOPCNT wrapped to $0000 — print diagnostic heartbeat
 	LDX	#DiagStr
 	LBSR	PUTS		; "D:"
-	LDA	FIRQ_CTR
-	LBSR	PUTHEX8		; FIRQ entry count as 2 hex digits
+	LDA	IRQ_CTR
+	LBSR	PUTHEX8		; IRQ entry count as 2 hex digits
 	LDA	#' '
 	LBSR	OUTCH
 	LDD	TICKS
@@ -215,9 +215,9 @@ WPrint
 	DEC	ITERS
 	BNE	WaitLoop
 
-	; All done: stop timer and mask FIRQ.
+	; All done: stop timer and mask IRQ.
 	CLR	PTMC2		; e_clk=0 stops timer
-	ORCC	F		; set F bit — disable FIRQ
+	ORCC	I		; set I bit — disable IRQ
 
 	LDX	#DoneStr
 	LBSR	PUTS
@@ -250,7 +250,7 @@ DoneStr
 TICKS		RMB	2	; 16-bit tick counter (big-endian, ISR-maintained)
 NEXTTICK	RMB	2	; tick count at which to print next
 ITERS		RMB	1	; remaining iterations (counts down from 10)
-FIRQ_CTR	RMB	1	; diagnostic: total FIRQ entries (wraps at 256)
+IRQ_CTR		RMB	1	; diagnostic: total IRQ entries (wraps at 256)
 LOOPCNT		RMB	2	; WaitLoop iteration counter (heartbeat)
 
 	ENDSECTION
