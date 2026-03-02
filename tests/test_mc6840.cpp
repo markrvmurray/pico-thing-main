@@ -140,7 +140,7 @@ TEST_CASE("MC6840 CONT_0 fires with a 16-bit period", "[mc6840][cont0]")
 }
 
 // ============================================================
-//  has_interrupt() returns IRQ (not FIRQ — mc6840 uses IRQ; FIRQ is for the UART)
+//  has_interrupt() returns IRQ
 // ============================================================
 
 TEST_CASE("MC6840 has_interrupt() returns INTERRUPT_IRQ", "[mc6840][interrupt]")
@@ -155,7 +155,6 @@ TEST_CASE("MC6840 has_interrupt() returns INTERRUPT_IRQ", "[mc6840][interrupt]")
 
 	interrupt irq = t.has_interrupt();
 	REQUIRE(irq == INTERRUPT_IRQ);
-	REQUIRE(irq != INTERRUPT_FIRQ);
 	REQUIRE(irq != INTERRUPT_NONE);
 }
 
