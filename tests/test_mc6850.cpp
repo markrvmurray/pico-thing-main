@@ -211,7 +211,7 @@ TEST_CASE("guest_receive with rts_deasserted skips staging") {
 	CHECK(status().rdrf == 0);
 }
 
-TEST_CASE("has_interrupt: stages byte and returns FIRQ when rx_irq enabled") {
+TEST_CASE("has_interrupt: stages byte and returns IRQ when rx_irq enabled") {
 	registers::clear();
 	mc6850 uart;
 
@@ -220,7 +220,7 @@ TEST_CASE("has_interrupt: stages byte and returns FIRQ when rx_irq enabled") {
 	uart.guest_control();
 
 	uart.host_transmit('A');
-	CHECK(uart.has_interrupt() == INTERRUPT_FIRQ);
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
 	CHECK(status().rdrf == 1);
 }
 
@@ -232,7 +232,7 @@ TEST_CASE("has_interrupt: returns NONE when no IRQs enabled") {
 	CHECK(uart.has_interrupt() == INTERRUPT_NONE);
 }
 
-TEST_CASE("has_interrupt: tx IRQ fires when tx_irq enabled and buffer empty") {
+TEST_CASE("has_interrupt: tx irq fires when tx_irq enabled and buffer empty") {
 	registers::clear();
 	mc6850 uart;
 
@@ -240,7 +240,7 @@ TEST_CASE("has_interrupt: tx IRQ fires when tx_irq enabled and buffer empty") {
 	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00100000);
 	uart.guest_control();
 
-	CHECK(uart.has_interrupt() == INTERRUPT_FIRQ);
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
 }
 
 // -----------------------------------------------------------------------

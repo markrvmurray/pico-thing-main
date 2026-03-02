@@ -154,7 +154,7 @@ RX_BUF	ZMB	16
 * [ ] RX_P_IN != RX_P_OU => INCH: next byte to return is at RX_P_OU, then RX_P_OU+
 
 ISR	LDA	UARTS
-	BITA	#%00010000
+	BITA	#%00000010
 	BNE	TXIRQ		Tx Interrupt
 	BITA	#%00000001
 	BNE	RXIRQ		Rx Interrupt
