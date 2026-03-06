@@ -199,6 +199,21 @@ RtiSwi	NOP
 	NOP
 t@0	BRA	t@0
 
+* NMI break target: infinite loop. The NMI vector is pointed here
+* by the Pico's 'break' console command. The 6809 pushes its full
+* register set onto the stack and spins. The pico can break the
+* spin by setting the second-last byte to 0.
+	ORG	START
+Break	CLRA
+	LDX	#SHARED
+B@0	LDB	A,S
+	STB	A,X
+	INCA
+	CMPA	#12	all registers on stack after NMI/IRQ/SWI
+	BLT	B@0
+B@1	BRA	B@1
+	RTI
+
 * The test driver will need to copy_out the chunk, set the IRQ vector to ISR5 ($0200),
 * and run the chunk in interactive mode
 	ORG	CHUNK
@@ -318,5 +333,7 @@ EUrtIRQ	EQU	*
 	FCC	"TEST_FIRQ"
 	FCB	' '
 	FCC	"TEST_RTI"
+	FCB	' '
+	FCC	"BREAK"
 	FCB	' '
 	FCC	"UART_IRQ"

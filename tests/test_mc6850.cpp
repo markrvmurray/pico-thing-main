@@ -58,8 +58,8 @@ static mc6850_status status()
 static void uart_write(mc6850 &uart, uint8_t byte)
 {
 	registers::write(CONSOLE_TX_DATA) = byte;
-	uart.write_received();   // ISR step: clears TDRE
-	uart.guest_transmit();   // for(;;) step: queues byte, restores TDRE
+	uart.write_received();        // ISR step: clears TDRE
+	uart.guest_transmit(byte);    // for(;;) step: queues byte, restores TDRE
 }
 
 // -----------------------------------------------------------------------
@@ -120,7 +120,7 @@ TEST_CASE("guest_transmit restores TDRE and queues byte") {
 
 	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('H');
 	uart.write_received();
-	uart.guest_transmit();
+	uart.guest_transmit('H');
 
 	CHECK(status().tdre == 1);
 	REQUIRE(uart.host_receive_avail());
@@ -138,7 +138,7 @@ TEST_CASE("update_task while write_pending does not restore TDRE") {
 	uart.update_task();   // must NOT restore TDRE while tx_write_pending
 	CHECK(status().tdre == 0);
 
-	uart.guest_transmit();
+	uart.guest_transmit('X');
 	CHECK(status().tdre == 1);
 }
 
@@ -349,6 +349,56 @@ TEST_CASE("close loopback: RX IRQ fires on looped byte") {
 	CHECK(status().rdrf == 1);
 }
 
+TEST_CASE("close loopback: S_IRQ set immediately by guest_transmit (no has_interrupt needed)") {
+	registers::clear();
+	mc6850 uart;
+
+	// tx_irq=0b11 (close loopback) + rx_irq=1 (bit 7)
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b11100000);
+	uart.guest_control();
+
+	// Write a byte — guest_transmit must set both RDRF and S_IRQ
+	// WITHOUT requiring has_interrupt() to run first.
+	uart_write(uart, 'Q');
+
+	CHECK(status().rdrf == 1);
+	CHECK(status().irq  == 1);
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Q');
+}
+
+TEST_CASE("close loopback: S_IRQ not set when rx_irq disabled") {
+	registers::clear();
+	mc6850 uart;
+
+	// tx_irq=0b11 (close loopback) but rx_irq=0 (bit 7 clear)
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+
+	uart_write(uart, 'R');
+
+	CHECK(status().rdrf == 1);
+	CHECK(status().irq  == 0);
+}
+
+TEST_CASE("close loopback: rx_read_fast_path clears RDRF immediately") {
+	registers::clear();
+	mc6850 uart;
+
+	// tx_irq=0b11 (close loopback) + rx_irq=1
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b11100000);
+	uart.guest_control();
+
+	uart_write(uart, 'S');
+	CHECK(status().rdrf == 1);
+	CHECK(status().irq  == 1);
+
+	// Simulate 6809 reading UARTRX — read ISR calls rx_read_fast_path
+	uart.rx_read_fast_path();
+
+	CHECK(status().rdrf == 0);
+	CHECK(status().irq  == 0);
+}
+
 TEST_CASE("close loopback: host TX queue is not affected") {
 	registers::clear();
 	mc6850 uart;
@@ -398,13 +448,15 @@ TEST_CASE("queue loopback: multiple bytes queue up") {
 	uart_write(uart, 'Y');
 	uart_write(uart, 'Z');
 
-	// Stage and check each byte in order
+	// Stage and check each byte in order (simulate 6809 reading between stages)
 	uart.guest_receive();
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'X');
 
+	uart.rx_read_fast_path();   // simulate 6809 reading UARTRX
 	uart.guest_receive();
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Y');
 
+	uart.rx_read_fast_path();
 	uart.guest_receive();
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Z');
 }
@@ -488,7 +540,8 @@ TEST_CASE("switching from close to queue loopback") {
 	uart.guest_control();
 	uart_write(uart, 'Q');
 
-	// Byte now in RX queue, needs staging
+	// Byte now in RX queue, needs staging; clear old close-loopback byte first
+	uart.rx_read_fast_path();   // simulate 6809 reading the close-loopback byte
 	uart.guest_receive();
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Q');
 }

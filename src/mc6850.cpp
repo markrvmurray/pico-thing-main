@@ -51,16 +51,28 @@ mc6850::reset()
 	reg[CONSOLE_STATUS] = reset_status.byte;
 }
 
+// Derive the full status register from internal state variables.
+// Must NOT read-modify-write reg[CONSOLE_STATUS] — the read ISR
+// (rx_read_fast_path) can preempt and clear RDRF between our read
+// and write, causing us to clobber the ISR's update.
+inline void
+mc6850::sync_status()
+{
+	mc6850_status sr = {};
+	sr.rdrf = receive_buffer_full ? 1u : 0u;
+	sr.tdre = (transmit_buffer_empty && !cts_deasserted && !tx_write_pending) ? 1u : 0u;
+	sr.cts  = cts_deasserted ? 1u : 0u;
+	sr.irq  = (assert_receive_irq || assert_transmit_irq) ? 1u : 0u;
+	reg[CONSOLE_STATUS] = sr.byte;
+}
+
 // Sync TDRE/CTS status bits from current TX queue state.
 inline void
 mc6850::sync_transmit()
 {
 	transmit_buffer_empty = tx.has_space();
 	cts_deasserted = tx.get_level() > CTS_THRESHOLD;
-	mc6850_status sr = {reg[CONSOLE_STATUS]};
-	sr.cts  = cts_deasserted ? 1u : 0u;
-	sr.tdre = (transmit_buffer_empty && !cts_deasserted && !tx_write_pending) ? 1u : 0u;
-	reg[CONSOLE_STATUS] = sr.byte;
+	sync_status();
 }
 
 // Called from Core 1 write ISR when CONSOLE_TX_DATA is written.
@@ -72,9 +84,7 @@ void
 mc6850::write_received()
 {
 	tx_write_pending = true;
-	mc6850_status sr = {reg[CONSOLE_STATUS]};
-	sr.tdre = 0;
-	reg[CONSOLE_STATUS] = sr.byte;
+	sync_status();
 }
 
 // Called periodically from the Core 1 timer. Keeps TDRE/CTS current for
@@ -105,18 +115,16 @@ mc6850::guest_control()
 }
 
 void
-mc6850::guest_transmit()
+mc6850::guest_transmit(uint8_t data)
 {
 	tx_write_pending = false;		// acknowledge: for(;;) loop has taken ownership
-	uint8_t data = registers::write(CONSOLE_TX_DATA);
 	if (loopback_close) {
 		// Close loopback: TX byte goes directly into the RX register,
-		// bypassing both queues.  RDRF is set immediately.
+		// bypassing both queues.  RDRF and S_IRQ are set immediately
+		// so the 6809 sees correct status without waiting for has_interrupt().
 		reg[CONSOLE_RX_DATA] = data;
 		receive_buffer_full = true;
-		mc6850_status sr = {reg[CONSOLE_STATUS]};
-		sr.rdrf = 1;
-		reg[CONSOLE_STATUS] = sr.byte;
+		assert_receive_irq = receive_irq;
 	} else if (loopback_queue) {
 		// Queue loopback: TX byte enters the RX queue, delivered via
 		// the normal guest_receive()/has_interrupt() staging path.
@@ -130,6 +138,18 @@ mc6850::guest_transmit()
 	sync_transmit();			// restores TDRE=1 (tx_write_pending is now false)
 }
 
+// Called from Core 1 read ISR when the 6809 reads CONSOLE_RX_DATA.
+// Immediately clears RDRF and receive_buffer_full so the next status read
+// sees the correct state, matching real MC6850 behavior (RDRF clears on
+// data register read).  guest_receive() will stage the next byte if available.
+void
+mc6850::rx_read_fast_path()
+{
+	receive_buffer_full = false;
+	assert_receive_irq = false;
+	sync_status();
+}
+
 void
 mc6850::guest_receive()
 {
@@ -137,17 +157,18 @@ mc6850::guest_receive()
 	// leave it in the rx queue so it is delivered once RTS is re-asserted.
 	if (rts_deasserted) {
 		receive_buffer_full = false;
-		mc6850_status sr = {reg[CONSOLE_STATUS]};
-		sr.rdrf = 0;
-		reg[CONSOLE_STATUS] = sr.byte;
+		sync_status();
 		return;
 	}
-	receive_buffer_full = rx.has_bytes();
-	if (receive_buffer_full)
-		reg[CONSOLE_RX_DATA] = rx.get();
-	mc6850_status sr = {reg[CONSOLE_STATUS]};
-	sr.rdrf = receive_buffer_full;
-	reg[CONSOLE_STATUS] = sr.byte;
+	// If has_interrupt() already staged a byte (receive_buffer_full=true),
+	// don't re-stage — that would double-consume from the rx queue,
+	// overwriting the byte has_interrupt() staged before the 6809 reads it.
+	if (!receive_buffer_full) {
+		receive_buffer_full = rx.has_bytes();
+		if (receive_buffer_full)
+			reg[CONSOLE_RX_DATA] = rx.get();
+	}
+	sync_status();
 }
 
 interrupt
@@ -161,15 +182,10 @@ mc6850::has_interrupt()
 	if (!receive_buffer_full && rx.has_bytes() && !rts_deasserted) {
 		receive_buffer_full = true;
 		reg[CONSOLE_RX_DATA] = rx.get();
-		mc6850_status sr = {reg[CONSOLE_STATUS]};
-		sr.rdrf = 1;
-		reg[CONSOLE_STATUS] = sr.byte;
 	}
 	assert_receive_irq = receive_irq && receive_buffer_full;
 	assert_transmit_irq = transmit_irq && transmit_buffer_empty && !tx_write_pending;
-	mc6850_status sr = {reg[CONSOLE_STATUS]};
-	sr.irq = assert_receive_irq || assert_transmit_irq;
-	reg[CONSOLE_STATUS] = sr.byte;
+	sync_status();
 	if (assert_transmit_irq || assert_receive_irq)
 		return INTERRUPT_IRQ;
 	return INTERRUPT_NONE;

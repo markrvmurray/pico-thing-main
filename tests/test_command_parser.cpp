@@ -355,6 +355,39 @@ TEST_CASE("modify command", "[parser][modify]")
 }
 
 // ============================================================
+//  modify! (read registers)
+// ============================================================
+
+TEST_CASE("modify! command (read registers)", "[parser][modify]")
+{
+	parsed_cmd_t cmd;
+
+	SECTION("single byte")
+	{
+		REQUIRE(parse("modify ! FFD0 AB", &cmd));
+		CHECK(cmd.tag          == CMD_MODIFY_READ);
+		CHECK(cmd.modify.start == 0xFFD0);
+		CHECK(cmd.modify.count == 1);
+		CHECK(cmd.modify.data[0] == 0xAB);
+	}
+	SECTION("multiple bytes with alias")
+	{
+		REQUIRE(parse("mo ! FFC0 01 02 03", &cmd));
+		CHECK(cmd.tag          == CMD_MODIFY_READ);
+		CHECK(cmd.modify.start == 0xFFC0);
+		CHECK(cmd.modify.count == 3);
+		CHECK(cmd.modify.data[0] == 0x01);
+		CHECK(cmd.modify.data[1] == 0x02);
+		CHECK(cmd.modify.data[2] == 0x03);
+	}
+	SECTION("without bang is plain CMD_MODIFY")
+	{
+		REQUIRE(parse("mo FFD0 AB", &cmd));
+		CHECK(cmd.tag == CMD_MODIFY);
+	}
+}
+
+// ============================================================
 //  snippet
 // ============================================================
 
@@ -903,6 +936,57 @@ TEST_CASE("srecord command", "[parser][srecord]")
 	{
 		REQUIRE(parse("S9030000FC", &cmd));
 		CHECK(cmd.tag == CMD_SRECORD);
+	}
+}
+
+// ============================================================
+//  break
+// ============================================================
+
+TEST_CASE("break command", "[parser][break]")
+{
+	parsed_cmd_t cmd;
+
+	SECTION("break (no address) -> CMD_BREAK")
+	{
+		REQUIRE(parse("break", &cmd));
+		CHECK(cmd.tag == CMD_BREAK);
+	}
+	SECTION("br (mnemonic) -> CMD_BREAK")
+	{
+		REQUIRE(parse("br", &cmd));
+		CHECK(cmd.tag == CMD_BREAK);
+	}
+	SECTION("break with address -> CMD_BREAK_ADDR")
+	{
+		REQUIRE(parse("break 1234", &cmd));
+		CHECK(cmd.tag == CMD_BREAK_ADDR);
+		CHECK(cmd.brk.address == 0x1234u);
+	}
+	SECTION("br with address -> CMD_BREAK_ADDR")
+	{
+		REQUIRE(parse("br FFFE", &cmd));
+		CHECK(cmd.tag == CMD_BREAK_ADDR);
+		CHECK(cmd.brk.address == 0xFFFEu);
+	}
+	SECTION("break with invalid address is rejected")
+	{
+		CHECK_FALSE(parse("break GGGG", &cmd));
+	}
+	SECTION("break return -> CMD_BREAK_RETURN")
+	{
+		REQUIRE(parse("break return", &cmd));
+		CHECK(cmd.tag == CMD_BREAK_RETURN);
+	}
+	SECTION("br r -> CMD_BREAK_RETURN")
+	{
+		REQUIRE(parse("br r", &cmd));
+		CHECK(cmd.tag == CMD_BREAK_RETURN);
+	}
+	SECTION("br return -> CMD_BREAK_RETURN")
+	{
+		REQUIRE(parse("br return", &cmd));
+		CHECK(cmd.tag == CMD_BREAK_RETURN);
 	}
 }
 

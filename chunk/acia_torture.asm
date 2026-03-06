@@ -49,7 +49,7 @@ PASS_COUNT	EQU	SHARED+6	; 1 byte
 FAIL_COUNT	EQU	SHARED+7	; 1 byte
 IRQ_NOSIRQ	EQU	SHARED+8	; 2 bytes - handler calls where S_IRQ was not set
 
-NTESTS		EQU	8
+NTESTS		EQU	9
 
 ; ===============================================================
 ; Entry point
@@ -532,6 +532,83 @@ T8Dump	LDA	,X+
 T8Done
 
 ; ---------------------------------------------------------------
+; Test 9: Host RX IRQ - character from terminal (no loopback)
+;
+; This tests the real NitrOS-9 scenario: a character arrives
+; from the host via USB serial, and the ACIA must assert IRQ.
+; Prompts the user to press a key, waits with a timeout.
+; ---------------------------------------------------------------
+	LDA	#9
+	STA	TEST_NUM
+	LDX	#T9Msg
+	LBSR	PPuts
+
+	LBSR	ClrIRQ
+	; reset, then normal mode with RX IRQ enabled
+	LDA	#C_RESET
+	STA	UARTC
+	LDA	#C_RX_IRQ	; normal mode (no loopback), RX IRQ on
+	STA	UARTC
+	; drain any stale data
+T9Drain	LDA	UARTS
+	BITA	#S_RDRF
+	BEQ	T9Go
+	LDA	UARTRX		; discard
+	BRA	T9Drain
+T9Go	LBSR	ClrIRQ
+	; unmask CPU IRQ and wait for host keypress
+	ANDCC	#$EF
+	; timeout loop: ~2.4 seconds at 1MHz
+	; inner: LDY #0 → 65536 iterations (wraps from 0 to $FFFF)
+	; outer: LDX #2  → 2 passes = 131072 inner iterations
+	; ~18 cycles/iteration → ~2.36M cycles ≈ 2.4s at 1MHz
+	LDX	#2		; outer counter
+	LDY	#0		; inner counter (65536 iterations per outer)
+T9Wait	LDA	IRQ_FLAGS
+	BITA	#1
+	BNE	T9Got		; IRQ handler fired
+	LEAY	-1,Y
+	BNE	T9Wait
+	LEAX	-1,X
+	BNE	T9Wait
+	; timeout
+	ORCC	#$50
+	LDA	#C_RESET
+	STA	UARTC
+	LBSR	PFail
+	LDX	#FailTimeout
+	LBSR	PPuts
+	BRA	T9Done
+T9Got	ORCC	#$50
+	LDA	#C_RESET
+	STA	UARTC
+	; verify S_IRQ was set in handler
+	LDA	IRQ_STATUS
+	BITA	#S_IRQ
+	BNE	T9A
+	LBSR	PFail
+	LDX	#FailNoSIRQ
+	LBSR	PPuts
+	BRA	T9Done
+T9A	; verify S_RDRF was set
+	LDA	IRQ_STATUS
+	BITA	#S_RDRF
+	BNE	T9B
+	LBSR	PFail
+	LDX	#FailNoRDRF
+	LBSR	PPuts
+	BRA	T9Done
+T9B	; echo the received character
+	LDA	#C_NONE
+	STA	UARTC
+	LDA	IRQ_DATA
+	LBSR	POutch
+	LDA	#' '
+	LBSR	POutch
+	LBSR	PPass
+T9Done
+
+; ---------------------------------------------------------------
 ; Summary
 ; ---------------------------------------------------------------
 	; switch back to normal mode for final output
@@ -730,6 +807,10 @@ T7Msg	FCC	"Test 7: Overrun (close loopback) ..... "
 T7Note	FCC	"(got 1st byte) "
 	FCB	0
 T8Msg	FCC	"Test 8: Bulk 256-byte throughput ...... "
+	FCB	0
+T9Msg	FCC	"Test 9: Host RX IRQ (press a key) .... "
+	FCB	0
+FailTimeout	FCC	"timeout - no IRQ from host char\n"
 	FCB	0
 
 PassMsg	FCC	"PASS\n"

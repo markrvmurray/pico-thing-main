@@ -26,6 +26,7 @@ typedef enum cmd_tag {
 	CMD_EXAMINE,
 
 	CMD_MODIFY,
+	CMD_MODIFY_READ,
 	CMD_SNIPPET,
 
 	CMD_LOOP,
@@ -63,6 +64,10 @@ typedef enum cmd_tag {
 	CMD_FREQ,
 
 	CMD_USB,
+
+	CMD_BREAK,
+	CMD_BREAK_ADDR,
+	CMD_BREAK_RETURN,
 
 	CMD_SRECORD,
 } cmd_tag_t;
@@ -152,6 +157,11 @@ typedef struct parsed_cmd {
 		struct {
 			char args[128]; /* space-separated remainder of line */
 		} usb;
+
+		/* CMD_BREAK_ADDR */
+		struct {
+			uint16_t address;
+		} brk;
 
 		/* CMD_SRECORD */
 		struct {

@@ -83,6 +83,7 @@ class mc6850 {
 	bool loopback_close = false;	// tx_irq==0b11 (BREAK): TX→RX register directly
 	bool loopback_queue = false;	// divide_select==0b10 (÷64): TX→RX queue
 	volatile bool tx_write_pending = false;	// set by write ISR, cleared by guest_transmit()
+	void sync_status();
 	void sync_transmit();
 public:
 	mc6850();
@@ -108,8 +109,9 @@ public:
 			(assert_receive_irq ? 0b01000000 : 0b00000000);
 	}
 	void guest_receive();
-	void guest_transmit();
+	void guest_transmit(uint8_t data);
 	void guest_control();
+	void rx_read_fast_path();	// called from read ISR: clears RDRF immediately
 	[[nodiscard]] interrupt has_interrupt();
 };
 

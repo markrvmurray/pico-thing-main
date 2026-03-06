@@ -31,7 +31,7 @@ S@0	LDX	#SHORT
 	LBSR	PUTS
 	LBSR	PUTCRLF
 	LBSR	PUTCRLF
-S@1	BRA	S@1		Loop instead of syncing to allow interrupts to clear buffer
+S@1	BRA	S@0		Loop instead of syncing to allow interrupts to clear buffer
 
 	ENDSECTION
 

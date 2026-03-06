@@ -217,6 +217,10 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// ISR fired before Core 1 drained it, causing guest_receive() to be
 			// skipped and RDRF to stay set with a stale byte.
 			rx_read_count++;
+			// Fast-path: clear RDRF/IRQ immediately so the next 6809 status
+			// read sees the change.  guest_receive() will stage the next byte
+			// (if any) and re-set RDRF on the next for(;;) iteration.
+			fast_serial.rx_read_fast_path();
 		} else {
 			read_location = loc;
 			read_irq_received = true;
@@ -243,8 +247,23 @@ __time_critical_func(dma_bus_read_irq_handler())
 //   1) accept write_registers + A5-0
 //   2) accept the byte to be written to that address
 
-static volatile bool write_irq_received = false;
-static volatile uint8_t write_location;
+// Ring buffer for DMA write events.  The ISR pushes {location, value}
+// entries; the Core 1 for(;;) loop drains them.  This replaces the old
+// single-slot write_location / write_irq_received pair, which silently
+// dropped writes when back-to-back 6809 writes arrived faster than the
+// for(;;) loop could process them.
+struct write_entry {
+	uint8_t location;
+	uint8_t value;
+};
+static constexpr uint8_t WRITE_RING_SIZE = 16u;  // must be power of 2
+static constexpr uint8_t WRITE_RING_MASK = WRITE_RING_SIZE - 1u;
+static volatile write_entry write_ring[WRITE_RING_SIZE];
+static volatile uint8_t write_ring_head = 0u;    // written by ISR
+static volatile uint8_t write_ring_tail = 0u;    // read by for(;;) loop
+#ifdef DEBUG
+static uint32_t write_ring_overflow = 0u;
+#endif
 
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
@@ -256,23 +275,38 @@ __time_critical_func(dma_bus_write_irq_handler())
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
 	if (!MC6809.bus_state.bit.RESET) {
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
-		write_location = written_addr & registers::register_mask;
+		const uint8_t wloc = written_addr & registers::register_mask;
+		const uint8_t wval = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
 		// Special-case any writes that need to be handled before the next guest
 		// instruction picks up an incorrect read. I.e., these need to be _fast_.
-		if (write_location == SYSTEM_TASK) {
-			const uint8_t new_task = MC6809.task_change(*reinterpret_cast<volatile std::uint8_t *>(written_addr));
+		if (wloc == SYSTEM_TASK) {
+			const uint8_t new_task = MC6809.task_change(wval);
 			reg[SYSTEM_TASK] = new_task;
 			task_pins_update(new_task);
 		}
-		else if (write_location == CONSOLE_TX_DATA)
+		else if (wloc == CONSOLE_CONTROL)
+			fast_serial.guest_control();	// apply immediately so guest_transmit() sees updated state
+		else if (wloc == CONSOLE_TX_DATA)
 			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
-		else if (write_location >= REGISTER_BUFFER_OFFSET && write_location < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
-			reg[write_location] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
-		write_irq_received = true;
+		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
+			reg[wloc] = wval;
+		// Queue for the for(;;) loop to do full dispatch.
+		const uint8_t h = write_ring_head;
+		const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
+		if (next_h == write_ring_tail) {
+			// Ring full — drop oldest entry so the newest is never lost.
+			write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
+#ifdef DEBUG
+			write_ring_overflow++;
+#endif
+		}
+		write_ring[h].location = wloc;
+		write_ring[h].value = wval;
+		write_ring_head = next_h;
 #ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
-			trace[trace_pos][0] = write_location;
-			trace[trace_pos][1] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
+			trace[trace_pos][0] = wloc;
+			trace[trace_pos][1] = wval;
 			trace[trace_pos][2] = TRACE_WRITE | (MC6809.busy_lic_avma.byte << 8) | (MC6809.bus_state.byte << 4) | MC6809.run_state;
 			trace[trace_pos][3] = 0u;
 			trace_pos++;
@@ -505,6 +539,9 @@ cmd_parse(char *input, parsed_cmd_t *out)
 }
 
 static volatile interrupt console_interrupt = INTERRUPT_NONE;
+// Tracks which interrupt caused the current break (INTERRUPT_NONE = no active break).
+// Set by CMD_BREAK on success; cleared by CMD_BREAK_RETURN.
+static interrupt break_active = INTERRUPT_NONE;
 
 static void
 console_set_interrupt(interrupt eirq)
@@ -693,14 +730,38 @@ process_command(char *buf)
 		} else {
 			printf("Modifying system registers, so provoking callbacks\n");
 			for (uint16_t i = 0u; i < count; i++) {
-				registers::write(start + i) = buffer[i];
-				write_location    = (start + i) & registers::register_mask;
-				write_irq_received = true;
-				printf("%04X: %02X %02X %u\n",
-				       ADDRESS(start + i),
-				       static_cast<uint8_t>(registers::write(start + i)),
-				       static_cast<uint8_t>(reg[start + i]),
-				       write_irq_received);
+				const uint8_t loc = (start + i) & registers::register_mask;
+				registers::write(loc) = buffer[i];
+				// Inject into the write ring so the for(;;) loop dispatches callbacks.
+				const uint8_t h = write_ring_head;
+				const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
+				if (next_h == write_ring_tail)
+					write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
+				write_ring[h].location = loc;
+				write_ring[h].value = buffer[i];
+				write_ring_head = next_h;
+				printf("%04X: %02X %02X\n",
+				       static_cast<uint16_t>(start + i),
+				       static_cast<uint8_t>(registers::write(loc)),
+				       static_cast<uint8_t>(reg[start + i]));
+			}
+		}
+		break;
+	}
+
+	case CMD_MODIFY_READ: {
+		const uint16_t start = cmd.modify.start;
+		const uint8_t  count = cmd.modify.count;
+		memcpy(buffer, cmd.modify.data, count);
+		if (start < REGISTER_BASE) {
+			printf("mo! only applies to system registers ($%04X+)\n", REGISTER_BASE);
+		} else {
+			printf("Modifying read registers directly (no callbacks)\n");
+			for (uint16_t i = 0u; i < count; i++) {
+				reg[start + i] = buffer[i];
+				printf("%04X: %02X\n",
+				       static_cast<uint16_t>(start + i),
+				       static_cast<uint8_t>(reg[start + i]));
 			}
 		}
 		break;
@@ -1012,6 +1073,70 @@ process_command(char *buf)
 		MC6809.stop();
 		break;
 
+	case CMD_BREAK: {
+		if (break_active != INTERRUPT_NONE) {
+			printf("Break already active (use 'break return' first)\n");
+			break;
+		}
+		// NMI break: load the BREAK snippet into the snippet block,
+		// point the NMI vector there, and trigger NMI.  The 6809 pushes its
+		// full register set onto the stack and the snippet catches the 6809.
+		uint32_t timeout = 0u;
+		snippet_copy(BREAK);
+		for (uint i = 0; i < 16; i++) {
+			reg[REGISTER_BUFFER_OFFSET + i] = static_cast<uint8_t>(0x00);
+			registers::write(REGISTER_BUFFER_OFFSET + i) = static_cast<uint8_t>(0x00);
+		}
+		reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET);
+		printf("NMI break -> %04X\n", REGISTER_SNIPPET);
+		console_set_interrupt(INTERRUPT_NMI);
+		// Wait for the full 6809 register set to be stacked.
+		// TODO: MarkM: this is exactly what I wanted BS_IRQ to help with.
+		while ((reg[REGISTER_BUFFER + 10] | reg[REGISTER_BUFFER + 11]) == static_cast<uint8_t>(0x00)) { sleep_us(1); if (++timeout > 1000000u) break; }
+		console_set_interrupt(INTERRUPT_NONE);
+		if (timeout > 1000000u)
+			printf("Timeout. No NMI?\n");
+		else {
+			break_active = INTERRUPT_NMI;
+			uint8_t cc = reg[REGISTER_BUFFER];
+			printf("CC: ");
+			for (uint i = 0; i < 8; i++) {
+				printf("%c", cc & 0x80 ? "EFHINZVC"[i] : '-');
+				cc <<= 1;
+			}
+			printf(" A: %02X B: %02X DP: %02X X: %02X%02X Y: %02X%02X U: %02X%02X PC: %02X%02X\n",
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 1]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 2]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 3]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 4]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 5]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 6]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 7]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 8]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 9]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 10]),
+				static_cast<uint8_t>(reg[REGISTER_BUFFER + 11]));
+		}
+		break;
+	}
+
+	case CMD_BREAK_ADDR:
+		// TODO: address-based breakpoint at $%04X
+		printf("Address breakpoint at $%04X (not yet implemented)\n", cmd.brk.address);
+		break;
+
+	case CMD_BREAK_RETURN:
+		if (break_active == INTERRUPT_NONE) {
+			printf("No active break to return from\n");
+			break;
+		}
+		printf("Returning from %s break\n",
+			break_active == INTERRUPT_NMI ? "NMI" :
+			break_active == INTERRUPT_SWI ? "SWI" : "???");
+		reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
+		break_active = INTERRUPT_NONE;
+		break;
+
 	case CMD_FREQ:
 		MC6809.set_e_frequency(cmd.freq.mhz, pio_clock);
 		printf("Set E to %.1f MHz\n", MC6809.get_e_frequency());
@@ -1220,11 +1345,12 @@ __no_inline_not_in_flash_func(main_core1)()
 		// timer.tick(1u) is now called from the Q-falling ISR (see
 		// gpio_clock_eq_irq_handler) to guarantee 1:1 edge→tick rate.
 
-		if (write_irq_received) {
+		while (write_ring_tail != write_ring_head) {
 			//gpio_put(GPIO_TRACE_CORE1, true);
-			write_irq_received = false;
-			const uint8_t written_location = write_location;
-			const uint8_t written_byte = registers::write(written_location);
+			const uint8_t t = write_ring_tail;
+			const uint8_t written_location = write_ring[t].location;
+			const uint8_t written_byte = write_ring[t].value;
+			write_ring_tail = (t + 1u) & WRITE_RING_MASK;
 			switch (written_location) {
 			default:
 				break;
@@ -1321,7 +1447,7 @@ __no_inline_not_in_flash_func(main_core1)()
 #ifdef DEBUG
 				UART_TX_DATA_COUNT++;
 #endif
-				fast_serial.guest_transmit();
+				fast_serial.guest_transmit(written_byte);
 				break;
 
 			case SYSTEM_TIMER_CONTROL_13:
@@ -1395,7 +1521,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				break;
 			}
 			//gpio_put(GPIO_TRACE_CORE1, false);
-		} // if (write_irq_received)
+		} // while (write_ring not empty)
 
 		// Drain the CONSOLE_RX_DATA counter before checking the shared slot.
 		// Each ISR-detected RX data read must call guest_receive() exactly once.

@@ -101,6 +101,7 @@ match_command_keyword(const char *text)
 		{ "stop",    "sp", TOK_STOP    },
 		{ "freq",    "fq", TOK_FREQ    },
 		{ "reset",   "rs", TOK_RESET   },
+		{ "break",   "br", TOK_BREAK   },
 		{ "usb",     "ub", TOK_USB     },
 		{ NULL, NULL, 0 }
 	};
@@ -132,6 +133,7 @@ match_command_keyword(const char *text)
 [Aa][Ll][Ll]                        { return TOK_ALL; }
 [Hh][Aa][Ll][Tt]                    { return TOK_HALT; }
 [Rr][Ee][Ss][Tt][Aa][Rr][Tt]        { return TOK_RESTART; }
+[Rr][Ee][Tt][Uu][Rr][Nn]            { return TOK_RETURN; }
 
 	/* ---- Loop types (exact, CASE-SENSITIVE per original behaviour) ---- */
 "rw"|"RW"                           { return TOK_RW; }

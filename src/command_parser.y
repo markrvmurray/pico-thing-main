@@ -124,6 +124,7 @@ static int _t_count;
 %token TOK_STOP
 %token TOK_FREQ
 %token TOK_RESET
+%token TOK_BREAK
 %token TOK_USB
 
 /* Subcommand keywords */
@@ -131,6 +132,7 @@ static int _t_count;
 %token TOK_ALL
 %token TOK_HALT
 %token TOK_RESTART
+%token TOK_RETURN
 
 /* Loop access types */
 %token TOK_r
@@ -177,6 +179,7 @@ command:
 	| run_cmd
 	| stop_cmd
 	| freq_cmd
+	| break_cmd
 	| usb_cmd
 	| srecord_cmd
 	| TOK_WORD        { printf("Unknown command \"%s\"\n", $1); YYERROR; }
@@ -240,6 +243,21 @@ modify_cmd:
 			YYERROR;
 		}
 		result->tag          = CMD_MODIFY;
+		result->modify.start = (uint16_t)s;
+		result->modify.count = (uint8_t)_byte_count;
+		memcpy(result->modify.data, _bytes, (size_t)_byte_count);
+	}
+	| TOK_MODIFY TOK_BANG TOK_NUMBER { _byte_count = 0; } byte_list_ne {
+		uint32_t s = parse_hex($3);
+		if (s == UINT32_MAX || s > 0xFFFEu) {
+			printf("Invalid hex start address '%s'\n", $3);
+			YYERROR;
+		}
+		if (_byte_count > 64) {
+			printf("Too many bytes (maximum 64)\n");
+			YYERROR;
+		}
+		result->tag          = CMD_MODIFY_READ;
 		result->modify.start = (uint16_t)s;
 		result->modify.count = (uint8_t)_byte_count;
 		memcpy(result->modify.data, _bytes, (size_t)_byte_count);
@@ -627,6 +645,30 @@ freq_cmd:
 		}
 		result->tag      = CMD_FREQ;
 		result->freq.mhz = f;
+	}
+	;
+
+/* -----------------------------------------------------------------------
+ * break [ <address> ]
+ * ----------------------------------------------------------------------- */
+break_cmd:
+	  TOK_BREAK {
+		result->tag = CMD_BREAK;
+	}
+	| TOK_BREAK TOK_NUMBER {
+		uint32_t v = parse_hex($2);
+		if (v == UINT32_MAX || v > 0xFFFFu) {
+			printf("Invalid hex address '%s'\n", $2);
+			YYERROR;
+		}
+		result->tag         = CMD_BREAK_ADDR;
+		result->brk.address = (uint16_t)v;
+	}
+	| TOK_BREAK TOK_RETURN {
+		result->tag = CMD_BREAK_RETURN;
+	}
+	| TOK_BREAK TOK_r {
+		result->tag = CMD_BREAK_RETURN;
 	}
 	;
 

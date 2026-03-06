@@ -1063,3 +1063,72 @@ TEST_CASE("write() irq_en=1 immediately asserts IRQ when flag already set", "[mc
 	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
 	REQUIRE((registers::peek(SYSTEM_TIMER_STATUS) & 0x80u) != 0);
 }
+
+// ============================================================
+//  Power-on / hard-reset state (NitrOS-9 bring-up bug)
+//
+//  The Pico's peripheral_clear() fills the DEVICES block ($FFC0-$FFCF)
+//  with $FF before the mc6840 constructor runs.  The constructor must
+//  push its clean status ($00) into the register array so the 6809
+//  does not see a bogus $FF in PTMSTA at power-on.
+// ============================================================
+
+// Helper: simulate the Pico's peripheral_clear() by filling the DEVICES
+// block with $FF, then construct an mc6840 on top.
+static mc6840 make_timer_after_peripheral_clear()
+{
+	registers::clear();
+	// Reproduce what peripheral_clear() does: fill DEVICES offsets 0-15 with $FF.
+	for (uint16_t i = 0; i < 16; i++)
+		registers::poke(i, 0xFFu);
+	return mc6840(registers::getInstance(), 1u);
+}
+
+TEST_CASE("Power-on: PTMSTA reads $00 with no configuration", "[mc6840][poweron]")
+{
+	auto t = make_timer_after_peripheral_clear();
+	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x00u);
+}
+
+TEST_CASE("Power-on: IRQ not asserted before any configuration", "[mc6840][poweron]")
+{
+	auto t = make_timer_after_peripheral_clear();
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+}
+
+TEST_CASE("Power-on: master reset (CR2=$01) also yields clean status", "[mc6840][poweron]")
+{
+	auto t = make_timer_after_peripheral_clear();
+	// Write CR2.bit0=0 (default), then CR3.bit0=1 = master reset.
+	tw(t, SYSTEM_TIMER_CONTROL_13, 0x01u);  // CR3.bit0=1 → TR
+	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x00u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+}
+
+TEST_CASE("Power-on: IRQ only fires after explicit timer configuration", "[mc6840][poweron]")
+{
+	auto t = make_timer_after_peripheral_clear();
+
+	// No configuration yet — must be clean.
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	// Tick many times — must not fire anything.
+	for (int i = 0; i < 100; i++)
+		t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+	REQUIRE(registers::peek(SYSTEM_TIMER_STATUS) == 0x00u);
+
+	// Now configure and start Timer 2 in CONT_0 with IRQ.
+	tw(t, SYSTEM_TIMER_CONTROL_2, CR2_CONT0_IRQ);
+	tw(t, SYSTEM_TIMER_2_MSB, 0x00u);
+	tw(t, SYSTEM_TIMER_2_LSB, 5u);  // latch=5, fires at tick 6 (N+1)
+
+	// Still clean before the timer fires.
+	for (int i = 0; i < 5; i++)
+		t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_NONE);
+
+	// Tick 6 — IRQ fires.
+	t.tick(1u);
+	REQUIRE(t.has_interrupt() == INTERRUPT_IRQ);
+}

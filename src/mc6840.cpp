@@ -39,6 +39,9 @@ mc6840::hard_reset()
 	// I'm simulating the output of the first timer being
 	// wired to !NMI through an inverter.
 	nmi_pending = false;
+	// Sync the cleared status to the register array so the 6809 reads $00.
+	// Without this, peripheral_clear()'s $FF fill persists in read_registers.
+	sync_status();
 }
 
 void

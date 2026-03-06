@@ -69,6 +69,7 @@ public:
 		memset(write_registers, 0, sizeof(write_registers));
 	}
 	static uint8_t peek(uint16_t i) { return read_registers[i & register_mask]; }
+	static void poke(uint16_t i, uint8_t v) { read_registers[i & register_mask] = v; }
 
 	// Stubs for methods referenced elsewhere in the real firmware
 	static void copy_in(uint16_t, const uint8_t*, uint16_t) {}
