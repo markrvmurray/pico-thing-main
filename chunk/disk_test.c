@@ -79,6 +79,7 @@ main(void)
 	print[40] = '\0';
 	printf("Model number: '%s'\n", print);
 	// ==========================================================================}
+#if 0
 	//memset(buffer, 0xFF, BLOCK_WORD_COUNT*2);
 	for (i = 0; i < BLOCK_WORD_COUNT; i++)
 		buffer[i] = (uint16_t)i + (uint16_t)129;
@@ -91,6 +92,7 @@ main(void)
 	if (ide == 0)
 		printf("Yay again!!\n");
 	dump_buffer(buffer);
+#endif
 	memset(buffer, 0, BLOCK_WORD_COUNT*2);
 	ide = ide_read_sector(0, buffer);
 	if (ide == 0)

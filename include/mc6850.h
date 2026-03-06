@@ -80,6 +80,8 @@ class mc6850 {
 	bool assert_receive_irq = false;
 	bool cts_deasserted = false;
 	bool rts_deasserted = false;
+	bool loopback_close = false;	// tx_irq==0b11 (BREAK): TX→RX register directly
+	bool loopback_queue = false;	// divide_select==0b10 (÷64): TX→RX queue
 	volatile bool tx_write_pending = false;	// set by write ISR, cleared by guest_transmit()
 	void sync_transmit();
 public:

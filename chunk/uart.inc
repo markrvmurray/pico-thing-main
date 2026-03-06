@@ -10,6 +10,8 @@ C_RESET		EQU	%00000011
 C_TX_IRQ	EQU	%00100000
 C_RX_IRQ	EQU	%10000000
 C_RTS_OFF	EQU	%01000000	; tx_irq=0b10: RTS deasserted, no TX irq
+C_LOOPCLOSE	EQU	%01100000	; tx_irq=0b11: close loopback (TX->RX direct)
+C_LOOPQUEUE	EQU	%00000010	; divide_select=0b10: queue loopback (TX->RX queue)
 
 
 * Status (read)

@@ -4,9 +4,9 @@ CMOC_LIBDIR := $(patsubst %/bin/cmoc,%/share/cmoc/lib,$(shell which cmoc))
 CMOC_LIBS   := -lcmoc-crt-void -lcmoc-std-void \
                $(CMOC_LIBDIR)/float-ctor.mc6839_o -lcmoc-float-mc6839
 # Object files added to every C program link for interrupt-driven I/O.
-C_IO_OBJS   := io.obj syslib.obj cstart.obj
+C_IO_OBJS   := io_noirq.obj syslib.obj cstart.obj
 
-all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw diskload.srec diskload.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin test_timer.s19 test_timer.bin
+all: assist09.s19 assist09.bin syslib.s19 syslib.bin get.s19 get.bin put.s19 put.bin loop.s19 loop.bin hello.srec hello.raw disk_test.srec disk_test.raw diskload.srec diskload.raw test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin test_send.s19 test_send.bin test_timer.s19 test_timer.bin dat_torture.srec dat_torture.raw acia_torture.s19 acia_torture.bin
 
 assist09.s19: assist09.asm
 	lwasm --list=assist09.lst --map=assist09.map --format=srec --output=$@ $^
@@ -142,6 +142,26 @@ ide.o: ide.c ide.h pico.h
 
 ide_lib.o: ide_lib.c ide_lib.h pico.h
 	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<
+
+dat_torture.srec: dat_torture.o pico.o ide_lib.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=dat_torture.map --format=srec \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
+
+dat_torture.raw: dat_torture.o pico.o ide_lib.o $(C_IO_OBJS)
+	lwlink --script=cchunk.ld --map=dat_torture.map --format=raw \
+		-L$(CMOC_LIBDIR) $(CMOC_LIBS) --output=$@ $^
+
+dat_torture.o: dat_torture.c pico.h ide_lib.h
+	cmoc --void-target --org=0x0130 --initial-s=0xf000 --mc6839 -c $<
+
+acia_torture.s19: acia_torture.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=acia_torture.map --format=srec --output=$@ $^
+
+acia_torture.bin: acia_torture.obj bss.obj syslib.obj
+	lwlink --script=chunk.ld --map=acia_torture.map --format=decb --output=$@ $^
+
+acia_torture.obj: acia_torture.asm ascii.inc uart.inc syslib.inc
+	lwasm --format=obj --list=acia_torture.lst --output=$@ $<
 
 clean:
 	rm -f *.bin *.obj *.o *.lst *.map *.link *.s19 *.srec *.raw

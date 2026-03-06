@@ -32,11 +32,11 @@ INIT	BSR	URESET		reset the uart
 INIT	PSHS	CC,A,X
 	BSR	URESET		reset the uart
 	LDX	#IRQ_ISR
-	LBSR	INITFIRQ	install the interrrupt service routine
+	LBSR	INITIRQ		install the interrrupt service routine
 	LDA	IQ_RX		select receive interrupts, transmit interrupts are enabled when needed
 	STA	UARTC
 	PULS	CC
-	ANDCC	F		enable FIRQ in cpu (clear F bit)
+	ANDCC	I		enable IRQ in cpu (clear I bit)
 	PULS	A,X,PC
 
 	ENDC
@@ -221,15 +221,13 @@ I@3	PULS	CC
 
 	ELSE
 
-IRQ_ISR	PSHS	B,X
-	LDA	UARTS		this doesn't clear the interrupt
+IRQ_ISR	LDA	UARTS		this doesn't clear the interrupt
 	BITA	#S_RDRF		receiver interrupt (checked first so RX has priority over TX)
 	BNE	RXIRQ
 	BITA	#S_TDRE		transmitter interrupt
 	BNE	TXIRQ
 * FALLTHROUGH
-IRQ_RET	PULS	B,X
-	RTS
+IRQ_RET	RTS
 
 TXIRQ	LDB	TX_P_OU
 	CMPB	TX_P_IN

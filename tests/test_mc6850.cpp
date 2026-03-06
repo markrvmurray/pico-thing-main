@@ -286,3 +286,225 @@ TEST_CASE("TDRE recovers after draining below CTS threshold") {
 	CHECK(status().tdre == 1);
 	CHECK(status().cts  == 0);
 }
+
+// -----------------------------------------------------------------------
+// Close loopback (tx_irq=0b11, BREAK mode repurposed)
+// -----------------------------------------------------------------------
+
+TEST_CASE("close loopback: TX byte appears in RX register immediately") {
+	registers::clear();
+	mc6850 uart;
+
+	// tx_irq=0b11 (bits 5-6) = close loopback
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+
+	uart_write(uart, 'L');
+
+	CHECK(status().rdrf == 1);
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'L');
+	// Byte should NOT appear in host TX queue
+	CHECK_FALSE(uart.host_receive_avail());
+}
+
+TEST_CASE("close loopback: TDRE restored after write") {
+	registers::clear();
+	mc6850 uart;
+
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+
+	uart_write(uart, 'M');
+
+	CHECK(status().tdre == 1);
+}
+
+TEST_CASE("close loopback: second TX overwrites RX if not read") {
+	registers::clear();
+	mc6850 uart;
+
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+
+	uart_write(uart, 'A');
+	uart_write(uart, 'B');
+
+	// Second byte overwrites the first
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'B');
+	CHECK(status().rdrf == 1);
+}
+
+TEST_CASE("close loopback: RX IRQ fires on looped byte") {
+	registers::clear();
+	mc6850 uart;
+
+	// tx_irq=0b11 (close loopback) + rx_irq=1 (bit 7)
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b11100000);
+	uart.guest_control();
+
+	uart_write(uart, 'I');
+
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
+	CHECK(status().irq  == 1);
+	CHECK(status().rdrf == 1);
+}
+
+TEST_CASE("close loopback: host TX queue is not affected") {
+	registers::clear();
+	mc6850 uart;
+
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+
+	for (int i = 0; i < 10; i++)
+		uart_write(uart, static_cast<uint8_t>('0' + i));
+
+	// Nothing in the host TX queue
+	CHECK(uart.receive_level() == 0);
+}
+
+// -----------------------------------------------------------------------
+// Queue loopback (divide_select=0b10, div64 mode repurposed)
+// -----------------------------------------------------------------------
+
+TEST_CASE("queue loopback: TX byte arrives via RX queue") {
+	registers::clear();
+	mc6850 uart;
+
+	// divide_select=0b10 (bits 0-1) = queue loopback
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
+	uart.guest_control();
+
+	uart_write(uart, 'Q');
+
+	// Byte is in the RX queue, not yet staged (needs guest_receive or has_interrupt)
+	CHECK(status().rdrf == 0);
+	CHECK_FALSE(uart.host_receive_avail());  // not in host TX queue
+
+	// Stage it via guest_receive
+	uart.guest_receive();
+	CHECK(status().rdrf == 1);
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Q');
+}
+
+TEST_CASE("queue loopback: multiple bytes queue up") {
+	registers::clear();
+	mc6850 uart;
+
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
+	uart.guest_control();
+
+	uart_write(uart, 'X');
+	uart_write(uart, 'Y');
+	uart_write(uart, 'Z');
+
+	// Stage and check each byte in order
+	uart.guest_receive();
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'X');
+
+	uart.guest_receive();
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Y');
+
+	uart.guest_receive();
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Z');
+}
+
+TEST_CASE("queue loopback: has_interrupt stages byte with rx_irq") {
+	registers::clear();
+	mc6850 uart;
+
+	// divide_select=0b10 (queue loopback) + rx_irq=1 (bit 7)
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b10000010);
+	uart.guest_control();
+
+	uart_write(uart, 'R');
+
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
+	CHECK(status().rdrf == 1);
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'R');
+}
+
+TEST_CASE("queue loopback: host TX queue is not affected") {
+	registers::clear();
+	mc6850 uart;
+
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
+	uart.guest_control();
+
+	for (int i = 0; i < 10; i++)
+		uart_write(uart, static_cast<uint8_t>('a' + i));
+
+	CHECK(uart.receive_level() == 0);  // host TX queue empty
+}
+
+TEST_CASE("queue loopback: TDRE stays 1 (bytes go to RX queue, not TX)") {
+	registers::clear();
+	mc6850 uart;
+
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
+	uart.guest_control();
+
+	uart_write(uart, 'T');
+	CHECK(status().tdre == 1);
+	CHECK(status().cts  == 0);
+}
+
+// -----------------------------------------------------------------------
+// Loopback mode transitions
+// -----------------------------------------------------------------------
+
+TEST_CASE("master reset clears loopback state") {
+	registers::clear();
+	mc6850 uart;
+
+	// Enable close loopback
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+	uart_write(uart, 'L');
+	REQUIRE(registers::peek(CONSOLE_RX_DATA) == 'L');
+
+	// Master reset
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0x03);
+	uart.guest_control();
+
+	// Normal mode: TX should go to host queue
+	uart_write(uart, 'N');
+	CHECK(uart.host_receive_avail());
+	CHECK(uart.host_receive() == 'N');
+}
+
+TEST_CASE("switching from close to queue loopback") {
+	registers::clear();
+	mc6850 uart;
+
+	// Close loopback
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
+	uart.guest_control();
+	uart_write(uart, 'C');
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'C');
+
+	// Switch to queue loopback
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
+	uart.guest_control();
+	uart_write(uart, 'Q');
+
+	// Byte now in RX queue, needs staging
+	uart.guest_receive();
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Q');
+}
+
+TEST_CASE("close loopback takes priority over queue loopback") {
+	registers::clear();
+	mc6850 uart;
+
+	// Both bits set: tx_irq=0b11 + divide_select=0b10
+	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100010);
+	uart.guest_control();
+
+	uart_write(uart, 'P');
+
+	// Close loopback wins: byte in RX register immediately
+	CHECK(status().rdrf == 1);
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 'P');
+	CHECK_FALSE(uart.host_receive_avail());
+}

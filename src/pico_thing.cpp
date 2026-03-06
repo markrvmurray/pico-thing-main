@@ -91,6 +91,17 @@ static pio_dma piodma_write = {
 	DMA_IRQ_1
 };
 
+// PIO-driven task pins (pio2, GPIO base 16, pins 40-45)
+static PIO task_pio;
+static uint task_pio_sm;
+
+static inline void
+task_pins_update(uint8_t task)
+{
+	uint32_t pio_word = task | ((task == 0u) ? (1u << NUM_TASK_PINS) : 0u);
+	pio_sm_put(task_pio, task_pio_sm, pio_word);
+}
+
 // Keep track of which task was interrupted
 #define MAX_INT_NEST_DEPTH 16u
 static volatile uint8_t task_stack[MAX_INT_NEST_DEPTH];
@@ -246,10 +257,17 @@ __time_critical_func(dma_bus_write_irq_handler())
 	if (!MC6809.bus_state.bit.RESET) {
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
 		write_location = written_addr & registers::register_mask;
-		if (write_location >= REGISTER_BUFFER_OFFSET && write_location < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
-			reg[write_location] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
-		if (write_location == CONSOLE_TX_DATA)
+		// Special-case any writes that need to be handled before the next guest
+		// instruction picks up an incorrect read. I.e., these need to be _fast_.
+		if (write_location == SYSTEM_TASK) {
+			const uint8_t new_task = MC6809.task_change(*reinterpret_cast<volatile std::uint8_t *>(written_addr));
+			reg[SYSTEM_TASK] = new_task;
+			task_pins_update(new_task);
+		}
+		else if (write_location == CONSOLE_TX_DATA)
 			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
+		else if (write_location >= REGISTER_BUFFER_OFFSET && write_location < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
+			reg[write_location] = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
 		write_irq_received = true;
 #ifdef DEBUG_NOT_NOW
 		if (trace_pos < trace_size - 1) {
@@ -770,6 +788,7 @@ process_command(char *buf)
 
 	case CMD_TASK_SET: {
 		uint8_t task = MC6809.task_change(cmd.task.tasknum);
+		task_pins_update(task);
 		printf("Task = %u\n", task);
 		break;
 	}
@@ -1169,6 +1188,9 @@ __no_inline_not_in_flash_func(main_core1)()
 	       PIO_NUM(piodma_write.pio),
 	       piodma_write.sm);
 
+	pio_sm_set_enabled(task_pio, task_pio_sm, true);
+	printf("Pico2 MC6809E task pio%d/sm%d started\n", PIO_NUM(task_pio), task_pio_sm);
+
 	sysreq_initialise();
 	mc6840 timer(reg, 1);
 	timer_isr_ptr = &timer;	// expose to GPIO ISR before the loop starts
@@ -1209,7 +1231,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 			case SYSTEM_TASK: // Task reg for DAT/MMU
 				// TODO: MarkM - Don't allow tasks other than zero to do this!
-				reg[SYSTEM_TASK] = MC6809.task_change(written_byte);
+				// Handled in DMA write ISR via PIO task_output
 				break;
 
 			case SYSTEM_REQUEST:
@@ -1591,6 +1613,18 @@ bus_pio_dma_init()
 		dma_encode_transfer_count(1),
 		false);
 	printf("Pico2 MC6809E DMA write_address channel configured\n");
+
+	// SM: Task pin output driver (pio2 with GPIO base 16 for access to GPIO 40-45)
+	task_pio = pio2;
+	pio_set_gpio_base(task_pio, 16);
+	const int ofs_task = pio_add_program(task_pio, &task_output_program);
+	if (ofs_task < 0) {
+		printf("Pico2 MC6809E insufficient space for task_output program\n");
+		panic("Unable to proceed");
+	}
+	task_pio_sm = pio_claim_unused_sm(task_pio, true);
+	task_output_program_init(task_pio, task_pio_sm, ofs_task);
+	printf("Pico2 MC6809E task output pio%u sm%u configured\n", PIO_NUM(task_pio), task_pio_sm);
 }
 
 #define MEASURE_FREQS
@@ -1621,6 +1655,54 @@ measure_freqs()
 // Can't measure clk_ref/xosc as it is the ref
 }
 #endif
+
+// Stub: disable PIO state machines for power-down
+static void
+pio_shutdown()
+{
+	// TODO: disable and unclaim PIO state machines, DMA channels, IRQs
+}
+
+static void
+set_power()
+{
+	// NOTE: Start of power-up process
+	POWER_ASSERT;
+
+	// Setup !Reset, !Halt, and the interrupt pins.
+	MC6809.init();
+	printf("Pico2 MC6809E guest state initialised\n");
+
+	sleep_ms(10);
+	printf("Pico2 MC6809E external power on.\n");
+
+	usb_init();
+	printf("Pico2 MC6809E initialised USB\n");
+
+	clock_pio_init();
+	bus_pio_dma_init();
+	peripheral_clear(true);
+	printf("Pico2 MC6809E emulated RAM and devices initialised\n");
+
+	multicore_launch_core1(main_core1);
+	// NOTE: End of power-up process
+}
+
+static void
+reset_power()
+{
+	MC6809.stop();
+	printf("Pico2 MC6809E guest stopped\n");
+
+	multicore_reset_core1();
+	printf("Pico2 MC6809E core1 stopped\n");
+
+	pio_shutdown();
+	printf("Pico2 MC6809E emulated RAM and devices disabled\n");
+
+	POWER_DEASSERT;
+	printf("Pico2 MC6809E external power off\n");
+}
 
 int
 main()
@@ -1660,26 +1742,7 @@ main()
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
-	// NOTE: Start of power-up process
-	POWER_ASSERT;
-
-	// Setup !Reset, !Halt, and the interrupt pins.
-	MC6809.init();
-	printf("Pico2 MC6809E guest state initialised\n");
-
-	sleep_ms(10);
-	printf("Pico2 MC6809E external power on.\n");
-
-	usb_init();
-	printf("Pico2 MC6809E initialised USB\n");
-
-	clock_pio_init();
-	bus_pio_dma_init();
-	peripheral_clear(true);
-	printf("Pico2 MC6809E emulated RAM and reg initialised\n");
-
-	multicore_launch_core1(main_core1);
-	// NOTE: End of power-up process
+	set_power();
 
 	tm tm = build_time_tm();
 	aon_timer_stop();

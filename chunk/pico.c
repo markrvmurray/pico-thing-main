@@ -10,7 +10,7 @@ initialiseFastSerial(void)
 {
 	asm {
 		EXTERN	INIT
-		lbsr	INIT		; UART reset + install FIRQ ISR + enable FIRQ
+		lbsr	INIT		; UART reset + install IRQ ISR + enable IRQ
 	}
 }
 

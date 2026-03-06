@@ -43,6 +43,8 @@ mc6850::reset()
 	assert_receive_irq = false;
 	cts_deasserted = false;
 	rts_deasserted = false;
+	loopback_close = false;
+	loopback_queue = false;
 	tx_write_pending = false;
 	//tx.reset();
 	//rx.reset();
@@ -91,9 +93,13 @@ mc6850::guest_control()
 	if (cr.divide_select == 0b11u) {
 		reset();
 	} else {
+		// tx_irq==0b11 (BREAK): close loopback (TX→RX register, no queues)
+		// divide_select==0b10 (÷64): queue loopback (TX→RX queue)
+		loopback_close = (cr.tx_irq == 0b11u);
+		loopback_queue = !loopback_close && (cr.divide_select == 0b10u);
 		transmit_irq = cr.tx_irq == 0b01u;
 		receive_irq = cr.rx_irq;
-		rts_deasserted = (cr.tx_irq == 0b10u || cr.tx_irq == 0b11u);
+		rts_deasserted = (cr.tx_irq == 0b10u);	// 0b11 is now close loopback, not RTS
 		sync_transmit();
 	}
 }
@@ -102,8 +108,25 @@ void
 mc6850::guest_transmit()
 {
 	tx_write_pending = false;		// acknowledge: for(;;) loop has taken ownership
-	if (tx.has_space())
-		tx.put(registers::write(CONSOLE_TX_DATA));
+	uint8_t data = registers::write(CONSOLE_TX_DATA);
+	if (loopback_close) {
+		// Close loopback: TX byte goes directly into the RX register,
+		// bypassing both queues.  RDRF is set immediately.
+		reg[CONSOLE_RX_DATA] = data;
+		receive_buffer_full = true;
+		mc6850_status sr = {reg[CONSOLE_STATUS]};
+		sr.rdrf = 1;
+		reg[CONSOLE_STATUS] = sr.byte;
+	} else if (loopback_queue) {
+		// Queue loopback: TX byte enters the RX queue, delivered via
+		// the normal guest_receive()/has_interrupt() staging path.
+		if (rx.has_space())
+			rx.put(data);
+	} else {
+		// Normal: byte enters the TX queue for host consumption.
+		if (tx.has_space())
+			tx.put(data);
+	}
 	sync_transmit();			// restores TDRE=1 (tx_write_pending is now false)
 }
 
@@ -148,6 +171,6 @@ mc6850::has_interrupt()
 	sr.irq = assert_receive_irq || assert_transmit_irq;
 	reg[CONSOLE_STATUS] = sr.byte;
 	if (assert_transmit_irq || assert_receive_irq)
-		return INTERRUPT_FIRQ;
+		return INTERRUPT_IRQ;
 	return INTERRUPT_NONE;
 }

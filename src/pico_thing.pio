@@ -23,6 +23,7 @@
 .define	public	GPIO_TRACE_WR	28	; Debugging
 
 .define public	GPIO_PIX_BASE	32	; Communication with the second Pico
+.define public	GPIO_TASK_BASE	40	; TASK[4:0] + TASK0
 
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.
@@ -162,6 +163,36 @@ mc6809_bus_write_program_init(PIO pio, uint sm, uint offset)
 	sm_config_set_sideset_pins(&c, GPIO_TRACE_WR);
 	pio_sm_init(pio, sm, offset, &c);
 	// pio_sm_set_enabled(pio, sm, false); // We'll start this when DMA, the IRQ's and the second core get going.
+}
+
+%}
+
+; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and
+; outputs it to GPIO 40-45 (TASK[4:0] + TASK0).
+; Runs at full system clock (320 MHz, no divider).
+; Bit layout: [5]=TASK0 (active-high when task==0), [4:0]=task number.
+.program	task_output
+
+.wrap_target
+	pull	block		; Stall until new task value arrives
+	out	pins 6		; Output bits[5:0] to GPIO 40-45
+.wrap
+
+% c-sdk {
+
+static inline void
+task_output_program_init(PIO pio, uint sm, uint offset)
+{
+	for (uint i = 0; i < 6; i++)
+		pio_gpio_init(pio, GPIO_TASK_BASE + i);
+	pio_sm_set_consecutive_pindirs(pio, sm, GPIO_TASK_BASE, 6, true);
+	pio_sm_config c = task_output_program_get_default_config(offset);
+	sm_config_set_out_pins(&c, GPIO_TASK_BASE, 6);
+	sm_config_set_out_shift(&c, true, false, 32);	// Right shift, no autopull
+	pio_sm_init(pio, sm, offset, &c);
+	// Pre-load task 0: TASK0=1, TASK[4:0]=0 → bit pattern 0b100000
+	pio_sm_put(pio, sm, (1u << 5));
+	// pio_sm_set_enabled(pio, sm, false);  // We'll start this when DMA, the IRQ's and the second core get going.
 }
 
 %}

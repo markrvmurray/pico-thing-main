@@ -50,23 +50,15 @@ mc6809::task_initialise()
 	reg[SYSTEM_TASK] = static_cast<uint8_t>(0u);
 	task_stack_ptr = 0x00u;
 	task = 0u;
-	init_pins_range(GPIO_TASK_BASE, NUM_TASK_PINS);
-	gpio_set_dir_out_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE);
-	gpio_init(GPIO_TASK_0);
-	gpio_set_dir(GPIO_TASK_0, GPIO_OUT);
-	gpio_put_masked64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE, 0LLu);
-	gpio_put(GPIO_TASK_0, true);
 }
 
-// Done when the guest changes the task register
+// Done when the guest changes the task register; task pins are
+// driven by the PIO task_output program in pico_thing.cpp.
 uint8_t
 mc6809::task_change(uint8_t new_task)
 {
 	new_task &= TASK_PINS_MASK;
 	task = new_task;
-	gpio_clr_mask64(static_cast<uint64_t>(TASK_PINS_MASK) << GPIO_TASK_BASE);
-	gpio_set_mask64(static_cast<uint64_t>(new_task) << GPIO_TASK_BASE);
-	gpio_put(GPIO_TASK_0, new_task == 0u);
 	return new_task;
 }
 
