@@ -347,7 +347,7 @@ enum copy_type {
 	INWARDS
 };
 
-static void
+static bool
 copy(const copy_type direction, const uint16_t count, const uint16_t address, uint8_t *data)
 {
 	uint16_t start = address;
@@ -370,14 +370,21 @@ copy(const copy_type direction, const uint16_t count, const uint16_t address, ui
 		reg[REGISTER_SNIPPET_OFFSET + 7u] = len;
 		if (direction == OUTWARDS) {
 			registers::copy_in(REGISTER_BUFFER_OFFSET, data + pos, len);
-			MC6809.start_with_timeout(4u);
+			if (!MC6809.start_with_timeout(4u)) {
+				printf("Snippet execution failed — CPU did not respond\n");
+				return false;
+			}
 		} else {
-			MC6809.start_with_timeout(4u);
+			if (!MC6809.start_with_timeout(4u)) {
+				printf("Snippet execution failed — CPU did not respond\n");
+				return false;
+			}
 			registers::copy_out(data + pos, REGISTER_BUFFER_OFFSET, len);
 		}
 		start += len;
 		pos += len;
 	}
+	return true;
 }
 
 #define CHUNK_NAMES_INC 1
@@ -645,7 +652,8 @@ process_command(char *buf)
 		const uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
 		absolute_time_t next_usb = get_absolute_time();
 		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
-			copy(INWARDS, 16u, loc, buffer);
+			if (!copy(INWARDS, 16u, loc, buffer))
+				break;
 			printf("%04X:", loc);
 			for (uint16_t i = 0; i < 16u; i++) {
 				if (loc + i >= start && loc + i < end)
@@ -685,7 +693,8 @@ process_command(char *buf)
 		const uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
 		absolute_time_t next_usb = get_absolute_time();
 		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
-			copy(INWARDS, 16u, loc, buffer);
+			if (!copy(INWARDS, 16u, loc, buffer))
+				break;
 			printf("%04X:", loc);
 			for (uint16_t i = 0; i < 16u; i++) {
 				if (loc + i >= start && loc + i < end)
@@ -720,12 +729,14 @@ process_command(char *buf)
 		const uint8_t  count = cmd.modify.count;
 		memcpy(buffer, cmd.modify.data, count);
 		if (start < REGISTER_BASE) {
+			if (!MC6809.assert_stopped())
+				break;
 			if (static_cast<uint32_t>(start) + count > REGISTER_BASE) {
 				printf("Overflow into reg region by %u bytes - truncating overflow\n",
 				       start + count - REGISTER_BASE);
-				copy(OUTWARDS, REGISTER_BASE - start, start, buffer);
+				(void)copy(OUTWARDS, REGISTER_BASE - start, start, buffer);
 			} else
-				copy(OUTWARDS, count, start, buffer);
+				(void)copy(OUTWARDS, count, start, buffer);
 		} else {
 			printf("Modifying system registers, so provoking callbacks\n");
 			for (uint16_t i = 0u; i < count; i++) {
@@ -805,7 +816,8 @@ process_command(char *buf)
 		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.fill.value;
 		reg[REGISTER_SNIPPET_OFFSET + 3u] = cmd.fill.start;
 		reg[REGISTER_SNIPPET_OFFSET + 8u] = cmd.fill.end;
-		MC6809.start_with_timeout(10000u, true);
+		if (!MC6809.start_with_timeout(10000u, true))
+			printf("Fill failed — CPU did not respond\n");
 		break;
 
 	case CMD_TIME_QUERY:
@@ -869,7 +881,10 @@ process_command(char *buf)
 		for (int i = 0; i < 16; i += 2)
 			reg[REGISTER_VECTORS_OFFSET + i] = static_cast<uint16_t>(0x0000);
 		snippet_copy(ZERO);
-		MC6809.start_with_timeout(10000u, true);
+		if (!MC6809.start_with_timeout(10000u, true)) {
+			printf("Zero failed — CPU did not respond\n");
+			break;
+		}
 
 		if (hexnum == 0) {
 			printf("Interrupt strobe test. Hit any key to continue.\n");
@@ -1046,12 +1061,14 @@ process_command(char *buf)
 			snippet_copy(snippet_num);
 		} else {
 			printf("Running chunk %u = %s\n", chunk_num, chunk_string[chunk_num]);
-			copy(OUTWARDS, chunk_len[chunk_num], 0x0130u, chunk_code[chunk_num]);
+			if (!copy(OUTWARDS, chunk_len[chunk_num], 0x0130u, chunk_code[chunk_num]))
+				break;
 			reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
 		}
-		if (stop)
-			MC6809.start_with_timeout(1000u);
-		else
+		if (stop) {
+			if (!MC6809.start_with_timeout(1000u))
+				printf("Run failed — CPU did not respond\n");
+		} else
 			MC6809.start();
 		break;
 	}
@@ -1157,41 +1174,57 @@ process_command(char *buf)
 	}
 
 	case CMD_SRECORD: {
+		static bool srecord_ignore = false;
 		uint8_t count;
 		uint16_t address;
 		uint8_t checksum;
 		const char *line = cmd.srecord.line;
-		if (process_srecord(line, &count, &address, buffer, &checksum)) {
-			if (line[1] == '0') {
-				printf("S0 data = \"");
-				for (uint16_t i = 0; i < count - 3u; i++) {
-					const uint8_t c = buffer[i];
-					printf("%c", isprint(c) ? c : ' ');
-				}
-				printf("\"\n");
-			} else if (line[1] == '1') {
-				if (verbose) {
-					printf("S1 address = %04X, length = %u\n", address, count);
-					printf("%04X:", address);
-					for (uint16_t i = 0; i < count - 3u; i++)
-						printf(" %02X", buffer[i]);
-					printf("\n");
-				}
-				if (address + count < 0xFE00u)
-					copy(OUTWARDS, count - 3u, address, buffer);
-				else if (address >= 0xFFF0u)
-					for (uint16_t i = 0; i < count - 3u; i++)
-						reg[address + i] = buffer[i];
-			} else if (line[1] == '5') {
-				if (verbose)
-					printf("S5 record count = %u\n", address);
-			} else if (line[1] == '9') {
-				if (verbose)
-					printf("S9 start = %04X\n", address);
-				reg[REGISTER_VECTOR_RESET_OFFSET] = address;
-			}
-		} else
+		if (!process_srecord(line, &count, &address, buffer, &checksum)) {
 			printf("Invalid S record\n");
+			break;
+		}
+		// S0 resets the ignore flag (start of a new S-record stream)
+		if (line[1] == '0')
+			srecord_ignore = false;
+		if (srecord_ignore) {
+			printf("%s IGNORED\n", line);
+			break;
+		}
+		if (line[1] == '0') {
+			printf("S0 data = \"");
+			for (uint16_t i = 0; i < count - 3u; i++) {
+				const uint8_t c = buffer[i];
+				printf("%c", isprint(c) ? c : ' ');
+			}
+			printf("\"\n");
+		} else if (line[1] == '1') {
+			if (verbose) {
+				printf("S1 address = %04X, length = %u\n", address, count);
+				printf("%04X:", address);
+				for (uint16_t i = 0; i < count - 3u; i++)
+					printf(" %02X", buffer[i]);
+				printf("\n");
+			}
+			if (address + count < 0xFE00u) {
+				if (!MC6809.is_stopped()) {
+					printf("%s IGNORED (CPU not stopped)\n", line);
+					srecord_ignore = true;
+				} else if (!copy(OUTWARDS, count - 3u, address, buffer)) {
+					printf("%s IGNORED (copy failed)\n", line);
+					srecord_ignore = true;
+				}
+			} else if (address >= 0xFFF0u)
+				for (uint16_t i = 0; i < count - 3u; i++)
+					reg[address + i] = buffer[i];
+		} else if (line[1] == '5') {
+			if (verbose)
+				printf("S5 record count = %u\n", address);
+		} else if (line[1] == '9') {
+			if (verbose)
+				printf("S9 start = %04X\n", address);
+			if (!srecord_ignore)
+				reg[REGISTER_VECTOR_RESET_OFFSET] = address;
+		}
 		break;
 	}
 

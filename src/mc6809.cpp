@@ -144,7 +144,7 @@ mc6809::start()
 	}
 }
 
-void
+bool
 mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 {
 	uint32_t i;
@@ -153,7 +153,7 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 	timeout_us = MAX(1000u, timeout_us);
 	timeout_us = MIN(1000000u, timeout_us);
 	if (!assert_stopped())
-		return;
+		return false;
 	if (verbose)
 		printf("Starting MC6809 from %04X at E = %.1f MHz and timeout = %u us\n\n", static_cast<uint16_t>(reg[REGISTER_VECTOR_RESET_OFFSET]), e_freq, timeout_us);
 	setup(RS_STOPPED);
@@ -170,7 +170,10 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 			break;
 		}
 	}
-	if (sync_means_stop && run_state == RS_SYNCED)
+	bool ok = (run_state == RS_SYNCED);
+	if (sync_means_stop && ok)
+		RESET_ASSERT;
+	if (!ok)
 		RESET_ASSERT;
 	if (verbose) {
 		printf("MC6809 run took %u iterations\n", i);
@@ -181,6 +184,7 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 		if (i == 1000u*timeout_ms)
 			printf("Timeout was reached\n");
 	}
+	return ok;
 }
 
 void

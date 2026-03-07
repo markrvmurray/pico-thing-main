@@ -169,7 +169,7 @@ public:
 	[[nodiscard]] bool assert_stopped() const;
 	[[nodiscard]] uint8_t task_get() const;
 	void start();
-	void start_with_timeout(uint32_t timeout_ms, bool sync_means_stop = true);
+	[[nodiscard]] bool start_with_timeout(uint32_t timeout_ms, bool sync_means_stop = true);
 	static void stop();
 	static void halt();
 	static void release();
