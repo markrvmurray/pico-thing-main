@@ -18,12 +18,15 @@
  *   make diskload.srec   (or diskload.raw)
  */
 
+#define USE_PACKBITS
+
 #define SOH  ((uint8_t)0x01)
 #define EOT  ((uint8_t)0x04)
 #define ACK  ((uint8_t)0x06)
 #define NAK  ((uint8_t)0x15)
 
 #define BLOCK_WORD_COUNT  256u    /* 256 16-bit words = 512 bytes per ATA sector */
+#define SECTOR_SIZE       512u
 
 /* Blocking receive: spins on INCH until a byte arrives. */
 static uint8_t
@@ -50,6 +53,41 @@ tx_byte(uint8_t c)
         lbsr  OUTCH
     }
 }
+
+#ifdef USE_PACKBITS
+/*
+ * PackBits RLE decoder.  Control byte semantics:
+ *   0..127   -> copy next (n+1) literal bytes   (1-128)
+ *   129..255 -> repeat next byte (257-n) times  (2-128)
+ *   128      -> no-op / end marker
+ *
+ * Returns number of bytes written to dst.
+ */
+static uint16_t
+packbits_decode(uint8_t *dst, uint16_t dst_cap)
+{
+    uint8_t *out = dst;
+    uint8_t *end = dst + dst_cap;
+    uint8_t n, count, val;
+
+    for (;;) {
+        n = rx_byte();
+        if (n == 128u)
+            break;                    /* end-of-block marker */
+        if (n < 128u) {               /* literal run: n+1 bytes */
+            count = n + 1u;
+            while (count-- && out < end)
+                *out++ = rx_byte();
+        } else {                      /* repeat run: 257-n copies */
+            count = 257u - n;
+            val = rx_byte();
+            while (count-- && out < end)
+                *out++ = val;
+        }
+    }
+    return (uint16_t)(out - dst);
+}
+#endif /* USE_PACKBITS */
 
 int
 main(void)
@@ -83,14 +121,26 @@ main(void)
         lba |= (uint32_t)rx_byte() << 8;
         lba |= (uint32_t)rx_byte();
 
-        /* Receive 512 bytes and accumulate XOR checksum */
+        /* Receive 512-byte sector payload */
         p   = (uint8_t *)buf;
         chk = 0;
-        for (i = 0; i < 512u; i++) {
+#ifdef USE_PACKBITS
+        {
+            uint16_t decoded = packbits_decode(p, SECTOR_SIZE);
+            if (decoded != SECTOR_SIZE) {
+                tx_byte(NAK);
+                continue;
+            }
+            for (i = 0; i < SECTOR_SIZE; i++)
+                chk ^= p[i];
+        }
+#else
+        for (i = 0; i < SECTOR_SIZE; i++) {
             b    = rx_byte();
             *p++ = b;
             chk ^= b;
         }
+#endif
 
         /* Verify checksum */
         got = rx_byte();
