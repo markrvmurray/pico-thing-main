@@ -118,10 +118,9 @@ static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
 
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
-// ISR-accessible pointer to the mc6840 timer.  Set by core1_task() before
-// the for(;;) loop starts.  The Q-falling ISR calls tick() directly so
-// that every Q-falling edge is counted regardless of for(;;) loop latency.
-static mc6840 *timer_isr_ptr = nullptr;
+
+mc6850 fast_serial;
+mc6840 system_timer(1);
 
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
@@ -162,8 +161,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// The for(;;) loop is too slow to call tick() reliably at 1 MHz
 		// due to GPIO ISR overhead (~68% of Core 1 time), causing ~3×
 		// under-counting.  Running tick() here guarantees 1:1 rate.
-		if (timer_isr_ptr)
-			timer_isr_ptr->tick(1u);
+		system_timer.tick(1u);
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
 		// Grab the current 8 D pins if this is a read cycle, and the LIC timing lets us
@@ -421,6 +419,9 @@ peripheral_clear(const bool sysvectors)
 	UART_RX_DATA_COUNT = 0u;
 #endif
 
+	// Reset emulated peripherals (as a real !RESET would)
+	fast_serial.reset();
+	system_timer.reset();
 }
 
 void
@@ -503,8 +504,6 @@ sysreq_process()
 		}
 	}
 }
-
-mc6850 fast_serial;
 
 static void
 print_time()
@@ -608,10 +607,10 @@ process_command(char *buf)
 		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "high" : "LOW");
 		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "high" : "LOW");
 #ifdef DEBUG
-		static uint16_t last_LIC = 0u;
+		static uint32_t last_LIC = 0u;
 		printf("LIC count: %lu\n", MC6809.get_lic_count());
 		if (MC6809.is_started()) {
-			uint8_t LIC = MC6809.get_lic_count();
+			uint32_t LIC = MC6809.get_lic_count();
 			if (last_LIC != LIC)
 				last_LIC = LIC;
 			else
@@ -1104,7 +1103,7 @@ process_command(char *buf)
 				printf("%c", cc & 0x80 ? "EFHINZVC"[i] : '-');
 				cc <<= 1;
 			}
-			printf(" A: %02X B: %02X DP: %02X X: %02X%02X Y: %02X%02X U: %02X%02X PC: %02X%02X\n",
+			printf("\nA: %02X  B: %02X  DP: %02X\nX: %02X%02X  Y: %02X%02X\nU: %02X%02X  PC: %02X%02X\n",
 				static_cast<uint8_t>(reg[REGISTER_BUFFER + 1]),
 				static_cast<uint8_t>(reg[REGISTER_BUFFER + 2]),
 				static_cast<uint8_t>(reg[REGISTER_BUFFER + 3]),
@@ -1317,8 +1316,6 @@ __no_inline_not_in_flash_func(main_core1)()
 	printf("Pico2 MC6809E task pio%d/sm%d started\n", PIO_NUM(task_pio), task_pio_sm);
 
 	sysreq_initialise();
-	mc6840 timer(reg, 1);
-	timer_isr_ptr = &timer;	// expose to GPIO ISR before the loop starts
 
 	printf("Pico2 MC6809E core1 process started\n");
 
@@ -1333,7 +1330,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			// FOR_EACH interrupt_source:
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
-			eirq = timer.has_interrupt();
+			eirq = system_timer.has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
@@ -1342,7 +1339,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
 
-		// timer.tick(1u) is now called from the Q-falling ISR (see
+		// system_timer.tick(1u) is now called from the Q-falling ISR (see
 		// gpio_clock_eq_irq_handler) to guarantee 1:1 edge→tick rate.
 
 		while (write_ring_tail != write_ring_head) {
@@ -1458,7 +1455,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			case SYSTEM_TIMER_2_LSB:
 			case SYSTEM_TIMER_3_MSB:
 			case SYSTEM_TIMER_3_LSB:
-				timer.write(written_location - SYSTEM_TIMER_BASE, written_byte);
+				system_timer.write(written_location - SYSTEM_TIMER_BASE, written_byte);
 				break;
 
 			case REGISTER_BUFFER_OFFSET + 0x00:
@@ -1574,7 +1571,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			case SYSTEM_TIMER_2_LSB:
 			case SYSTEM_TIMER_3_MSB:
 			case SYSTEM_TIMER_3_LSB:
-				timer.read(read_location - SYSTEM_TIMER_BASE);
+				system_timer.read(read_location - SYSTEM_TIMER_BASE);
 				break;
 
 			}

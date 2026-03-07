@@ -63,7 +63,7 @@ static constexpr uint8_t CR2_CONT0_NOIRQ  = 0x02u;
 static mc6840 make_timer()
 {
 	registers::clear();
-	return mc6840(registers::getInstance(), 1u);
+	return mc6840(1u);
 }
 
 // ============================================================
@@ -348,7 +348,7 @@ TEST_CASE("MC6840 status register irq bits", "[mc6840][status]")
 static mc6840 make_nmi_timer()
 {
 	registers::clear();
-	mc6840 t(registers::getInstance(), 1u);
+	mc6840 t(1u);
 	tw(t, SYSTEM_TIMER_CONTROL_2, 0x01u);   // CR2.bit0=1 → route CONTROL_13 to CR1
 	tw(t, SYSTEM_TIMER_CONTROL_13, 0xA6u);  // CR1: SINGLE_0, bits_8, clk_sel, out_en
 	tw(t, SYSTEM_TIMER_CONTROL_2, 0x00u);   // clear CR2
@@ -1081,7 +1081,7 @@ static mc6840 make_timer_after_peripheral_clear()
 	// Reproduce what peripheral_clear() does: fill DEVICES offsets 0-15 with $FF.
 	for (uint16_t i = 0; i < 16; i++)
 		registers::poke(i, 0xFFu);
-	return mc6840(registers::getInstance(), 1u);
+	return mc6840(1u);
 }
 
 TEST_CASE("Power-on: PTMSTA reads $00 with no configuration", "[mc6840][poweron]")

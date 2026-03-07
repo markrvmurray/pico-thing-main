@@ -65,14 +65,14 @@ class mc6840 {
 
 	bool nmi_pending = false;
 
-	void hard_reset();
 	void initialise(uint ctr);
 	void sync_status();
 
 public:
-	mc6840(registers &reg, uint16_t interval);
+	mc6840(uint16_t interval);
 	~mc6840() = default;
 
+	void reset();
 	void read(uint16_t offset);
 	void write(uint16_t offset, uint8_t val);
 	[[nodiscard]] interrupt has_interrupt();

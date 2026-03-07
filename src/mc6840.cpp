@@ -17,14 +17,14 @@
 #include "mc6809.h"
 #include "mc6840.h"
 
-mc6840::mc6840(registers &reg, uint16_t interval)
-	: reg(reg), interval(interval)
+mc6840::mc6840(uint16_t interval)
+	: reg(registers::getInstance()), interval(interval)
 {
-	hard_reset();
+	reset();
 }
 
 void
-mc6840::hard_reset()
+mc6840::reset()
 {
 	for (uint i = CTR1; i <= CTR3; i++) {
 		control[i].byte = 0x00;
