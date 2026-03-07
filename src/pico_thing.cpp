@@ -122,6 +122,12 @@ static volatile bool q_falling_edge = false;
 mc6850 fast_serial;
 mc6840 system_timer(1);
 
+static volatile uint32_t _debug_qrise_count = 0u;
+static volatile uint32_t _debug_irq_assert_count = 0u;
+static volatile uint32_t _debug_loop_count = 0u;
+static volatile uint32_t _debug_write_ring_count = 0u;
+static volatile uint32_t _debug_read_irq_count = 0u;
+
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
 {
@@ -613,6 +619,9 @@ process_command(char *buf)
 		printf("POWER pin: %s\n", POWER_IS_ASSERTED ? "HIGH" : "low");
 		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "high" : "LOW");
 		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "high" : "LOW");
+		printf("  NMI pin: %s\n", NMI_IS_ASSERTED ? "OUTPUT LOW" : "hi-z");
+		printf(" FIRQ pin: %s\n", FIRQ_IS_ASSERTED ? "OUTPUT LOW" : "hi-z");
+		printf("  IRQ pin: %s\n", IRQ_IS_ASSERTED ? "OUTPUT LOW" : "hi-z");
 #ifdef DEBUG
 		static uint32_t last_LIC = 0u;
 		printf("LIC count: %lu\n", MC6809.get_lic_count());
@@ -627,6 +636,21 @@ process_command(char *buf)
 #endif
 		printf("Register and emulated RAM block:\n");
 		registers::dump();
+		printf("Timer:\n");
+		printf("Timer status: %02X  nmi_pending: %d  running: %d %d %d\n",
+		       system_timer.debug_status(),
+		       system_timer.debug_nmi_pending(),
+		       system_timer.debug_running(CTR1),
+		       system_timer.debug_running(CTR2),
+		       system_timer.debug_running(CTR3));
+		printf("Timer CR1: %02X  CR2: %02X  CR3: %02X\n",
+		       system_timer.debug_control(CTR1),
+		       system_timer.debug_control(CTR2),
+		       system_timer.debug_control(CTR3));
+		printf("Core1 loop: %lu  q_rise: %lu  irq_assert: %lu\n",
+		       _debug_loop_count, _debug_qrise_count, _debug_irq_assert_count);
+		printf("Core1 write_ring: %lu  read_irq: %lu\n",
+		       _debug_write_ring_count, _debug_read_irq_count);
 		printf("Console:\n");
 		printf("Interrupt status: %02X\n", fast_serial.interrupt_status());
 		printf("UART: TxQueue: %u\n", fast_serial.receive_level());
@@ -1355,10 +1379,12 @@ __no_inline_not_in_flash_func(main_core1)()
 	core1_initialised = true;
 
 	for (;;) {
+		_debug_loop_count++;
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {
 			q_rising_edge = false;
-			static uint32_t interrupt_refcount[NUM_INTERRUPTS];
+			_debug_qrise_count++;
+			uint32_t interrupt_refcount[NUM_INTERRUPTS] = {};
 			interrupt eirq;
 			// FOR_EACH interrupt_source:
 			eirq = console_has_interrupt();
@@ -1367,6 +1393,8 @@ __no_inline_not_in_flash_func(main_core1)()
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
+			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
+				_debug_irq_assert_count++;
 			mc6809::apply_interrupts(interrupt_refcount);
 			// END FOR_EACH
 			//gpio_put(GPIO_TRACE_CORE1, false);
@@ -1376,6 +1404,7 @@ __no_inline_not_in_flash_func(main_core1)()
 		// gpio_clock_eq_irq_handler) to guarantee 1:1 edge→tick rate.
 
 		while (write_ring_tail != write_ring_head) {
+			_debug_write_ring_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			const uint8_t t = write_ring_tail;
 			const uint8_t written_location = write_ring[t].location;
@@ -1564,6 +1593,7 @@ __no_inline_not_in_flash_func(main_core1)()
 		}
 
 		if (read_irq_received) {
+			_debug_read_irq_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
 			switch (read_location) {

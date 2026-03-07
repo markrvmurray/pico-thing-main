@@ -33,10 +33,13 @@
 // a drive-low, becoming an input sets high impedance.
 #define ASSERT_NMI gpio_set_dir(GPIO_NMI, GPIO_OUT)
 #define DEASSERT_NMI gpio_set_dir(GPIO_NMI, GPIO_IN)
+#define NMI_IS_ASSERTED ((gpio_get_dir(GPIO_NMI) == GPIO_OUT) && !gpio_get(GPIO_NMI))
 #define ASSERT_FIRQ gpio_set_dir(GPIO_FIRQ, GPIO_OUT)
 #define DEASSERT_FIRQ gpio_set_dir(GPIO_FIRQ, GPIO_IN)
+#define FIRQ_IS_ASSERTED ((gpio_get_dir(GPIO_FIRQ) == GPIO_OUT) && !gpio_get(GPIO_FIRQ))
 #define ASSERT_IRQ gpio_set_dir(GPIO_IRQ, GPIO_OUT)
 #define DEASSERT_IRQ gpio_set_dir(GPIO_IRQ, GPIO_IN)
+#define IRQ_IS_ASSERTED ((gpio_get_dir(GPIO_IRQ) == GPIO_OUT) && !gpio_get(GPIO_IRQ))
 
 enum interrupt {
 	INTERRUPT_ILLEGAL,

@@ -33,18 +33,18 @@ union mc6840_control {
 union mc6840_status {
 	uint8_t byte;
 	struct {
-		union {
-			struct {
-				uint8_t irq1 : 1;
-				uint8_t irq2 : 1;
-				uint8_t irq3 : 1;
-			};
-			uint8_t irqs : 3;
-		};
+		uint8_t irq1 : 1;
+		uint8_t irq2 : 1;
+		uint8_t irq3 : 1;
 		uint8_t : 4;
 		uint8_t irq : 1;
 	};
+	struct {
+		uint8_t irqs : 3;
+		uint8_t : 5;
+	};
 };
+static_assert(sizeof(mc6840_status) == 1, "mc6840_status must be 1 byte");
 
 enum {CTR1, CTR2, CTR3};
 enum {CONT_0, FREQ_COMP_0, CONT_1, PW_COMP_0, SINGLE_0, FREQ_COMP_1, SINGLE_1, PW_COMP_1};
@@ -76,5 +76,9 @@ public:
 	void read(uint16_t offset);
 	void write(uint16_t offset, uint8_t val);
 	[[nodiscard]] interrupt has_interrupt();
+	[[nodiscard]] uint8_t debug_status() const { return status.byte; }
+	[[nodiscard]] bool debug_nmi_pending() const { return nmi_pending; }
+	[[nodiscard]] bool debug_running(uint i) const { return running[i]; }
+	[[nodiscard]] uint8_t debug_control(uint i) const { return control[i].byte; }
 	void tick(uint8_t);
 };

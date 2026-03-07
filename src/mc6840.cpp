@@ -11,6 +11,7 @@
 #include "pico/multicore.h"
 
 #include "hardware/pio.h"
+#include "hardware/sync.h"
 
 #include "registers.h"
 #include "pico_thing.h"
@@ -236,31 +237,44 @@ mc6840::read(uint16_t offset)
 		latch_active[CTR1] = true;
 		reg[SYSTEM_TIMER_1_LSB] = read_latch[CTR1].byte[LOWER];
 		break;
-	case SYSTEM_TIMER_1_LSB - SYSTEM_TIMER_BASE:	// 3: clear timer 1 IRQ
+	case SYSTEM_TIMER_1_LSB - SYSTEM_TIMER_BASE: {	// 3: clear timer 1 IRQ
 		latch_active[CTR1] = false;
+		// Disable interrupts so tick()'s ISR cannot preempt between
+		// clearing the per-timer flag and sync_status() recomputing
+		// the composite irq bit.  Without this, tick() can set a new
+		// irqs flag mid-sync, and our stale status.irq=false clobbers it.
+		uint32_t saved = save_and_disable_interrupts();
 		status.irq1 = 0;
 		sync_status();
+		restore_interrupts(saved);
 		break;
+	}
 	case SYSTEM_TIMER_2_MSB - SYSTEM_TIMER_BASE:	// 4: latch counter 2 MSB
 		read_latch[CTR2].word = counter[CTR2].word;
 		latch_active[CTR2] = true;
 		reg[SYSTEM_TIMER_2_LSB] = read_latch[CTR2].byte[LOWER];
 		break;
-	case SYSTEM_TIMER_2_LSB - SYSTEM_TIMER_BASE:	// 5: clear timer 2 IRQ
+	case SYSTEM_TIMER_2_LSB - SYSTEM_TIMER_BASE: {	// 5: clear timer 2 IRQ
 		latch_active[CTR2] = false;
+		uint32_t saved = save_and_disable_interrupts();
 		status.irq2 = 0;
 		sync_status();
+		restore_interrupts(saved);
 		break;
+	}
 	case SYSTEM_TIMER_3_MSB - SYSTEM_TIMER_BASE:	// 6: latch counter 3 MSB
 		read_latch[CTR3].word = counter[CTR3].word;
 		latch_active[CTR3] = true;
 		reg[SYSTEM_TIMER_3_LSB] = read_latch[CTR3].byte[LOWER];
 		break;
-	case SYSTEM_TIMER_3_LSB - SYSTEM_TIMER_BASE:	// 7: clear timer 3 IRQ
+	case SYSTEM_TIMER_3_LSB - SYSTEM_TIMER_BASE: {	// 7: clear timer 3 IRQ
 		latch_active[CTR3] = false;
+		uint32_t saved = save_and_disable_interrupts();
 		status.irq3 = 0;
 		sync_status();
+		restore_interrupts(saved);
 		break;
+	}
 	}
 }
 
