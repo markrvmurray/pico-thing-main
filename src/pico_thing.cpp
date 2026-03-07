@@ -127,6 +127,16 @@ static volatile uint32_t _debug_irq_assert_count = 0u;
 static volatile uint32_t _debug_loop_count = 0u;
 static volatile uint32_t _debug_write_ring_count = 0u;
 static volatile uint32_t _debug_read_irq_count = 0u;
+static volatile uint8_t _debug_loop_phase = 0u;
+static volatile uint8_t _debug_last_write_loc = 0u;
+static volatile uint8_t _debug_last_read_loc = 0u;
+static volatile uint32_t _debug_isr_count = 0u;	// incremented in GPIO ISR
+
+// Stack watermark for Core 1 — paint stack with 0xDEADBEEF, then scan
+// from the bottom to find the high-water mark.
+extern "C" uint32_t __StackOneBottom;	// linker symbol
+extern "C" uint32_t __StackOneTop;	// linker symbol
+static volatile uint32_t _debug_core1_stack_free = 0u;
 
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
@@ -134,6 +144,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, true); // scope timing
 #endif
+	_debug_isr_count++;
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
 		q_rising_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
@@ -651,6 +662,21 @@ process_command(char *buf)
 		       _debug_loop_count, _debug_qrise_count, _debug_irq_assert_count);
 		printf("Core1 write_ring: %lu  read_irq: %lu\n",
 		       _debug_write_ring_count, _debug_read_irq_count);
+		printf("Core1 phase: %u  last_write: %02X  last_read: %02X  isr: %lu\n",
+		       _debug_loop_phase, _debug_last_write_loc, _debug_last_read_loc,
+		       _debug_isr_count);
+		{
+			// Scan stack watermark from bottom to find high-water mark
+			volatile uint32_t *bottom = &__StackOneBottom;
+			volatile uint32_t *top = &__StackOneTop;
+			volatile uint32_t *p = bottom;
+			while (p < top && *p == 0xDEADBEEFu)
+				p++;
+			uint32_t stack_total = (top - bottom) * sizeof(uint32_t);
+			uint32_t stack_free = (p - bottom) * sizeof(uint32_t);
+			printf("Core1 stack: %lu total, %lu free (min), %lu used (max)\n",
+			       stack_total, stack_free, stack_total - stack_free);
+		}
 		printf("Console:\n");
 		printf("Interrupt status: %02X\n", fast_serial.interrupt_status());
 		printf("UART: TxQueue: %u\n", fast_serial.receive_level());
@@ -1376,26 +1402,50 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	printf("Pico2 MC6809E core1 process started\n");
 
+	// Paint the unused portion of Core 1's stack with a canary pattern.
+	// SP points to the current top; everything between StackOneBottom and
+	// the current SP is unused and can be painted safely.
+	{
+		volatile uint32_t *bottom = &__StackOneBottom;
+		volatile uint32_t *sp;
+		__asm volatile ("mov %0, sp" : "=r" (sp));
+		// Leave 64 bytes headroom below current SP
+		for (volatile uint32_t *p = bottom; p < sp - 16; p++)
+			*p = 0xDEADBEEFu;
+		_debug_core1_stack_free = (sp - bottom) * sizeof(uint32_t);
+		printf("Pico2 MC6809E core1 stack: %lu bytes total, %lu bytes free at start\n",
+		       (&__StackOneTop - &__StackOneBottom) * sizeof(uint32_t),
+		       _debug_core1_stack_free);
+	}
+
 	core1_initialised = true;
 
 	for (;;) {
+		_debug_loop_phase = 1;
 		_debug_loop_count++;
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {
 			q_rising_edge = false;
 			_debug_qrise_count++;
+			_debug_loop_phase = 2;
 			uint32_t interrupt_refcount[NUM_INTERRUPTS] = {};
 			interrupt eirq;
 			// FOR_EACH interrupt_source:
+			_debug_loop_phase = 20;
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
+			_debug_loop_phase = 21;
 			eirq = system_timer.has_interrupt();
 			interrupt_refcount[eirq]++;
+			_debug_loop_phase = 22;
 			eirq = fast_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
+			_debug_loop_phase = 3;
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
 				_debug_irq_assert_count++;
+			_debug_loop_phase = 30;
 			mc6809::apply_interrupts(interrupt_refcount);
+			_debug_loop_phase = 31;
 			// END FOR_EACH
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
@@ -1403,12 +1453,15 @@ __no_inline_not_in_flash_func(main_core1)()
 		// system_timer.tick(1u) is now called from the Q-falling ISR (see
 		// gpio_clock_eq_irq_handler) to guarantee 1:1 edge→tick rate.
 
+		_debug_loop_phase = 4;
 		while (write_ring_tail != write_ring_head) {
 			_debug_write_ring_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			const uint8_t t = write_ring_tail;
 			const uint8_t written_location = write_ring[t].location;
 			const uint8_t written_byte = write_ring[t].value;
+			_debug_last_write_loc = written_location;
+			_debug_loop_phase = 5;
 			write_ring_tail = (t + 1u) & WRITE_RING_MASK;
 			switch (written_location) {
 			default:
@@ -1584,6 +1637,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 		// Drain the CONSOLE_RX_DATA counter before checking the shared slot.
 		// Each ISR-detected RX data read must call guest_receive() exactly once.
+		_debug_loop_phase = 6;
 		while (rx_processed_count != rx_read_count) {
 #ifdef DEBUG
 			UART_RX_DATA_COUNT++;
@@ -1592,10 +1646,13 @@ __no_inline_not_in_flash_func(main_core1)()
 			rx_processed_count++;
 		}
 
+		_debug_loop_phase = 7;
 		if (read_irq_received) {
 			_debug_read_irq_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
+			_debug_last_read_loc = read_location;
+			_debug_loop_phase = 8;
 			switch (read_location) {
 			default:
 				// The MC6809 got whatever byte was here. By default, do nothing else.

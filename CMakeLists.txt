@@ -97,6 +97,12 @@ target_sources(pico-thing
 		${BISON_CmdParser_OUTPUTS}
 )
 
+# Core 1 stack is 0x800 (2 KiB) by default — too small for three nested
+# ISR levels (DMA prio-0 → GPIO prio-1 → thread) with FPU lazy stacking.
+target_compile_definitions(pico-thing PRIVATE
+	PICO_CORE1_STACK_SIZE=0x1000
+)
+
 target_link_libraries(pico-thing
 	pico_stdlib
 	pico_multicore
