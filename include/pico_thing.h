@@ -171,18 +171,11 @@ union high_bus_pins {
 #define CONSOLE_TX_DATA		uint16_t(0x04u)
 #define CONSOLE_RX_DATA		uint16_t(0x04u)
 
-// Try to emulate an MC6840 PTM, within reason. The output of
-// Timer 1 is connected to NMI.
-#define SYSTEM_TIMER_BASE	uint16_t(0x08u)
-#define SYSTEM_TIMER_CONTROL_13	uint16_t(0x08u) // Write-only
-#define SYSTEM_TIMER_CONTROL_2	uint16_t(0x09u) // Write-only
-#define SYSTEM_TIMER_STATUS	uint16_t(0x09u) // Reade-only
-#define SYSTEM_TIMER_1_MSB	uint16_t(0x0Au) // Read/Write
-#define SYSTEM_TIMER_1_LSB	uint16_t(0x0Bu) // Read/Write
-#define SYSTEM_TIMER_2_MSB	uint16_t(0x0Cu) // Read/Write
-#define SYSTEM_TIMER_2_LSB	uint16_t(0x0Du) // Read/Write
-#define SYSTEM_TIMER_3_MSB	uint16_t(0x0Eu) // Read/Write
-#define SYSTEM_TIMER_3_LSB	uint16_t(0x0Fu) // Read/Write
+// Simple 50 Hz tick timer.
+// $FFC8 write: bit 0 = enable/disable.
+// $FFC9 read:  bit 7 = IRQ pending; reading clears it.
+#define SYSTEM_TIMER_CONTROL_13	uint16_t(0x08u) // Write-only (enable/disable)
+#define SYSTEM_TIMER_STATUS	uint16_t(0x09u) // Read-only (IRQ flag, cleared on read)
 
 // System request opcodes
 #define	REQUEST_NULL		uint8_t(0x00u)

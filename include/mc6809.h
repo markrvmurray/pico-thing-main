@@ -41,18 +41,7 @@
 #define DEASSERT_IRQ gpio_set_dir(GPIO_IRQ, GPIO_IN)
 #define IRQ_IS_ASSERTED ((gpio_get_dir(GPIO_IRQ) == GPIO_OUT) && !gpio_get(GPIO_IRQ))
 
-enum interrupt {
-	INTERRUPT_ILLEGAL,
-	INTERRUPT_SWI3,
-	INTERRUPT_SWI2,
-	INTERRUPT_FIRQ,
-	INTERRUPT_IRQ,
-	INTERRUPT_SWI,
-	INTERRUPT_NMI,
-	INTERRUPT_RESET,
-	INTERRUPT_NONE,
-	NUM_INTERRUPTS
-};
+#include "interrupt.h"
 
 #define stringify(a) x_stringify(a)
 #define x_stringify(a) #a

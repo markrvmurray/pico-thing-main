@@ -62,6 +62,13 @@ static void uart_write(mc6850 &uart, uint8_t byte)
 	uart.guest_transmit(byte);    // for(;;) step: queues byte, restores TDRE
 }
 
+// Simulate a 6809 write to UARTC (control register).
+static void uart_control(mc6850 &uart, uint8_t val)
+{
+	registers::write(CONSOLE_CONTROL) = val;
+	uart.guest_control(val);
+}
+
 // -----------------------------------------------------------------------
 // Construction
 // -----------------------------------------------------------------------
@@ -89,8 +96,7 @@ TEST_CASE("mc6850 master reset restores TDRE=1") {
 	REQUIRE(status().tdre == 0);
 
 	// divide_select=0b11 triggers reset()
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0x03u);
-	uart.guest_control();
+	uart_control(uart, 0x03u);
 
 	CHECK(status().tdre == 1);
 	CHECK(status().rdrf == 0);
@@ -202,8 +208,7 @@ TEST_CASE("guest_receive with rts_deasserted skips staging") {
 	mc6850 uart;
 
 	// tx_irq=0b10 (bits 5-6) → rts_deasserted=true
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01000000);
-	uart.guest_control();
+	uart_control(uart, 0b01000000);
 
 	uart.host_transmit('Q');
 	uart.guest_receive();
@@ -216,8 +221,7 @@ TEST_CASE("has_interrupt: stages byte and returns IRQ when rx_irq enabled") {
 	mc6850 uart;
 
 	// rx_irq = bit 7
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b10000000);
-	uart.guest_control();
+	uart_control(uart, 0b10000000);
 
 	uart.host_transmit('A');
 	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
@@ -237,8 +241,7 @@ TEST_CASE("has_interrupt: tx irq fires when tx_irq enabled and buffer empty") {
 	mc6850 uart;
 
 	// tx_irq=0b01 (bits 5-6)
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00100000);
-	uart.guest_control();
+	uart_control(uart, 0b00100000);
 
 	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
 }
@@ -296,8 +299,7 @@ TEST_CASE("close loopback: TX byte appears in RX register immediately") {
 	mc6850 uart;
 
 	// tx_irq=0b11 (bits 5-6) = close loopback
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 
 	uart_write(uart, 'L');
 
@@ -311,8 +313,7 @@ TEST_CASE("close loopback: TDRE restored after write") {
 	registers::clear();
 	mc6850 uart;
 
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 
 	uart_write(uart, 'M');
 
@@ -323,8 +324,7 @@ TEST_CASE("close loopback: second TX overwrites RX if not read") {
 	registers::clear();
 	mc6850 uart;
 
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 
 	uart_write(uart, 'A');
 	uart_write(uart, 'B');
@@ -339,8 +339,7 @@ TEST_CASE("close loopback: RX IRQ fires on looped byte") {
 	mc6850 uart;
 
 	// tx_irq=0b11 (close loopback) + rx_irq=1 (bit 7)
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b11100000);
-	uart.guest_control();
+	uart_control(uart, 0b11100000);
 
 	uart_write(uart, 'I');
 
@@ -354,8 +353,7 @@ TEST_CASE("close loopback: S_IRQ set immediately by guest_transmit (no has_inter
 	mc6850 uart;
 
 	// tx_irq=0b11 (close loopback) + rx_irq=1 (bit 7)
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b11100000);
-	uart.guest_control();
+	uart_control(uart, 0b11100000);
 
 	// Write a byte — guest_transmit must set both RDRF and S_IRQ
 	// WITHOUT requiring has_interrupt() to run first.
@@ -371,8 +369,7 @@ TEST_CASE("close loopback: S_IRQ not set when rx_irq disabled") {
 	mc6850 uart;
 
 	// tx_irq=0b11 (close loopback) but rx_irq=0 (bit 7 clear)
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 
 	uart_write(uart, 'R');
 
@@ -385,8 +382,7 @@ TEST_CASE("close loopback: rx_read_fast_path clears RDRF immediately") {
 	mc6850 uart;
 
 	// tx_irq=0b11 (close loopback) + rx_irq=1
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b11100000);
-	uart.guest_control();
+	uart_control(uart, 0b11100000);
 
 	uart_write(uart, 'S');
 	CHECK(status().rdrf == 1);
@@ -403,8 +399,7 @@ TEST_CASE("close loopback: host TX queue is not affected") {
 	registers::clear();
 	mc6850 uart;
 
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 
 	for (int i = 0; i < 10; i++)
 		uart_write(uart, static_cast<uint8_t>('0' + i));
@@ -422,8 +417,7 @@ TEST_CASE("queue loopback: TX byte arrives via RX queue") {
 	mc6850 uart;
 
 	// divide_select=0b10 (bits 0-1) = queue loopback
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
-	uart.guest_control();
+	uart_control(uart, 0b00000010);
 
 	uart_write(uart, 'Q');
 
@@ -441,8 +435,7 @@ TEST_CASE("queue loopback: multiple bytes queue up") {
 	registers::clear();
 	mc6850 uart;
 
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
-	uart.guest_control();
+	uart_control(uart, 0b00000010);
 
 	uart_write(uart, 'X');
 	uart_write(uart, 'Y');
@@ -466,8 +459,7 @@ TEST_CASE("queue loopback: has_interrupt stages byte with rx_irq") {
 	mc6850 uart;
 
 	// divide_select=0b10 (queue loopback) + rx_irq=1 (bit 7)
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b10000010);
-	uart.guest_control();
+	uart_control(uart, 0b10000010);
 
 	uart_write(uart, 'R');
 
@@ -480,8 +472,7 @@ TEST_CASE("queue loopback: host TX queue is not affected") {
 	registers::clear();
 	mc6850 uart;
 
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
-	uart.guest_control();
+	uart_control(uart, 0b00000010);
 
 	for (int i = 0; i < 10; i++)
 		uart_write(uart, static_cast<uint8_t>('a' + i));
@@ -493,8 +484,7 @@ TEST_CASE("queue loopback: TDRE stays 1 (bytes go to RX queue, not TX)") {
 	registers::clear();
 	mc6850 uart;
 
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
-	uart.guest_control();
+	uart_control(uart, 0b00000010);
 
 	uart_write(uart, 'T');
 	CHECK(status().tdre == 1);
@@ -510,14 +500,12 @@ TEST_CASE("master reset clears loopback state") {
 	mc6850 uart;
 
 	// Enable close loopback
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 	uart_write(uart, 'L');
 	REQUIRE(registers::peek(CONSOLE_RX_DATA) == 'L');
 
 	// Master reset
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0x03);
-	uart.guest_control();
+	uart_control(uart, 0x03);
 
 	// Normal mode: TX should go to host queue
 	uart_write(uart, 'N');
@@ -530,14 +518,12 @@ TEST_CASE("switching from close to queue loopback") {
 	mc6850 uart;
 
 	// Close loopback
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100000);
-	uart.guest_control();
+	uart_control(uart, 0b01100000);
 	uart_write(uart, 'C');
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'C');
 
 	// Switch to queue loopback
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b00000010);
-	uart.guest_control();
+	uart_control(uart, 0b00000010);
 	uart_write(uart, 'Q');
 
 	// Byte now in RX queue, needs staging; clear old close-loopback byte first
@@ -551,8 +537,7 @@ TEST_CASE("close loopback takes priority over queue loopback") {
 	mc6850 uart;
 
 	// Both bits set: tx_irq=0b11 + divide_select=0b10
-	registers::write(CONSOLE_CONTROL) = static_cast<uint8_t>(0b01100010);
-	uart.guest_control();
+	uart_control(uart, 0b01100010);
 
 	uart_write(uart, 'P');
 

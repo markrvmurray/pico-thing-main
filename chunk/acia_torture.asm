@@ -18,6 +18,11 @@
 ;   5  IRQ latches while CPU I-bit masked, fires on unmask
 ;   6  Back-to-back receive under IRQ (16 chars via queue loopback)
 ;   7  Overrun: second write before first read (close loopback)
+;   8  Bulk 256-byte throughput via queue loopback
+;   9  Host RX IRQ (character from terminal, no loopback)
+;  10  Mode switch after output (write_ring ordering)
+;  11  Tight IRQ deassert (PEND_IRQ clearing in DMA read ISR)
+;  12  Output-then-burst (write ring stress, 24-byte blast)
 ;
 ; SHARED block layout (visible via Pico 'st' command):
 ;   +0  IRQ_COUNT  (2)  handler invocations
@@ -49,7 +54,7 @@ PASS_COUNT	EQU	SHARED+6	; 1 byte
 FAIL_COUNT	EQU	SHARED+7	; 1 byte
 IRQ_NOSIRQ	EQU	SHARED+8	; 2 bytes - handler calls where S_IRQ was not set
 
-NTESTS		EQU	9
+NTESTS		EQU	12
 
 ; ===============================================================
 ; Entry point
@@ -323,21 +328,24 @@ T4Done
 	LBSR	PPuts
 	ORCC	#$50
 	BRA	T5Done
-T5A	; unmask - IRQ should fire immediately
+T5A	; unmask - IRQ should fire once the for(;;) loop sets PEND_IRQ
+	; and the Q-rising ISR asserts /IRQ. Use a timeout loop rather
+	; than fixed NOPs, since the for(;;) loop latency is variable.
 	ANDCC	#$EF
-	NOP
-	NOP
-	NOP
-	ORCC	#$50
-	; handler should have fired
-	LDA	IRQ_FLAGS
+	LDX	#$2000		; timeout (~65k cycles)
+T5W	LDA	IRQ_FLAGS
 	BITA	#1
-	BNE	T5B
+	BNE	T5Got
+	LEAX	-1,X
+	BNE	T5W
+	; timeout — IRQ never fired
+	ORCC	#$50
 	LBSR	PFail
 	LDX	#FailNoIRQ
 	LBSR	PPuts
 	BRA	T5Done
-T5B	; verify correct byte
+T5Got	ORCC	#$50
+	; verify correct byte
 	LDA	IRQ_DATA
 	CMPA	#'E'
 	BEQ	T5Pass
@@ -561,8 +569,8 @@ T9Go	LBSR	ClrIRQ
 	; timeout loop: ~2.4 seconds at 1MHz
 	; inner: LDY #0 → 65536 iterations (wraps from 0 to $FFFF)
 	; outer: LDX #2  → 2 passes = 131072 inner iterations
-	; ~18 cycles/iteration → ~2.36M cycles ≈ 2.4s at 1MHz
-	LDX	#2		; outer counter
+	; ~18 cycles/iteration → ~23.6M cycles ≈ 24s at 1MHz
+	LDX	#4		; outer counter
 	LDY	#0		; inner counter (65536 iterations per outer)
 T9Wait	LDA	IRQ_FLAGS
 	BITA	#1
@@ -607,6 +615,170 @@ T9B	; echo the received character
 	LBSR	POutch
 	LBSR	PPass
 T9Done
+
+; ---------------------------------------------------------------
+; Test 10: Mode switch after output (ordering)
+;          Print a char in normal mode, immediately switch to
+;          close loopback, send+receive a byte.  Exercises the
+;          write_ring ordering fix: guest_control() must not
+;          take effect before pending TX_DATA entries.
+; ---------------------------------------------------------------
+	LDA	#10
+	STA	TEST_NUM
+	LDX	#T10Msg
+	LBSR	PPuts
+
+	; normal mode - send a visible char (should appear on console)
+	LDA	#C_NONE
+	STA	UARTC
+	LDA	#'*'
+	STA	UARTTX
+T10W1	LDB	UARTS
+	BITB	#S_TDRE
+	BEQ	T10W1
+	; immediately switch to close loopback
+	ORCC	#$50
+	LDA	#C_LOOPCLOSE
+	STA	UARTC
+	; send a byte in loopback - should arrive in RX register
+	LDA	#'!'
+	STA	UARTTX
+	LBSR	PWaitRx
+	; read it back
+	LDA	UARTRX
+	CMPA	#'!'
+	BEQ	T10Pass
+	LBSR	PFail
+	LDX	#FailData
+	LBSR	PPuts
+	BRA	T10Done
+T10Pass	LBSR	PPass
+T10Done	LDA	#C_RESET
+	STA	UARTC
+
+; ---------------------------------------------------------------
+; Test 11: Tight IRQ deassert (PEND_IRQ clearing)
+;          Send a byte via queue loopback with RX IRQ, wait for
+;          exactly 1 IRQ, then burn minimal cycles and verify no
+;          spurious re-fire.  Exercises the DMA read ISR clearing
+;          PEND_IRQ after rx_read_fast_path().
+; ---------------------------------------------------------------
+	LDA	#11
+	STA	TEST_NUM
+	LDX	#T11Msg
+	LBSR	PPuts
+
+	LBSR	ClrIRQ
+	; enable queue loopback with RX IRQ
+	LDA	#C_LOOPQUEUE|C_RX_IRQ
+	STA	UARTC
+	ANDCC	#$EF
+	; send one byte
+	LDA	#'K'
+	STA	UARTTX
+	; wait for handler
+	LBSR	PWaitIRQ
+	; very short delay - just a few NOPs
+	NOP
+	NOP
+	NOP
+	NOP
+	; mask and reset
+	ORCC	#$50
+	LDA	#C_RESET
+	STA	UARTC
+	; should have exactly 1 IRQ - no spurious re-fire from stale PEND_IRQ
+	LDD	IRQ_COUNT
+	CMPD	#1
+	BEQ	T11A
+	LBSR	PFail
+	LDX	#FailExtra
+	LBSR	PPuts
+	LDD	IRQ_COUNT
+	LBSR	PPrintD
+	LBSR	PCrlf
+	BRA	T11Done
+T11A	; verify correct data
+	LDA	IRQ_DATA
+	CMPA	#'K'
+	BEQ	T11Pass
+	LBSR	PFail
+	LDX	#FailData
+	LBSR	PPuts
+	BRA	T11Done
+T11Pass	LBSR	PPass
+T11Done
+
+; ---------------------------------------------------------------
+; Test 12: Output-then-burst (write ring stress)
+;          Print a string in normal mode, switch to queue loopback,
+;          blast 24 bytes.  Exercises the 32-entry write ring: the
+;          CONTROL entry must not be dropped by overflow.
+; ---------------------------------------------------------------
+	LDA	#12
+	STA	TEST_NUM
+	LDX	#T12Msg
+	LBSR	PPuts
+
+	LBSR	ClrIRQ
+	; point handler at receive buffer
+	LDX	#RxBuf
+	STX	RxBufPtr
+	; normal mode - print a short string to fill the write ring
+	LDA	#C_NONE
+	STA	UARTC
+	LDX	#T12Pre
+	LBSR	PPuts
+	; immediately switch to queue loopback with RX IRQ
+	LDA	#C_LOOPQUEUE|C_RX_IRQ
+	STA	UARTC
+	ANDCC	#$EF
+	; blast 24 bytes ($40-$57) - stresses write ring with CONTROL + 24 data
+	LDB	#24
+	LDA	#$40
+T12Send	STA	UARTTX
+	INCA
+	DECB
+	BNE	T12Send
+	; wait for all 24 to arrive
+T12Wait	LDD	IRQ_COUNT
+	CMPD	#24
+	BLO	T12Wait
+	; mask and reset
+	ORCC	#$50
+	LDA	#C_RESET
+	STA	UARTC
+	; clear buffer pointer
+	LDD	#0
+	STD	RxBufPtr
+	; verify count
+	LDD	IRQ_COUNT
+	CMPD	#24
+	BEQ	T12Chk
+	LBSR	PFail
+	LDX	#FailCount
+	LBSR	PPuts
+	LDD	IRQ_COUNT
+	LBSR	PPrintD
+	LBSR	PCrlf
+	BRA	T12Done
+T12Chk	; verify sequence $40..$57
+	LDX	#RxBuf
+	LDA	#$40
+T12Ck1	CMPA	,X+
+	BNE	T12Bad
+	INCA
+	CMPA	#$58		; $40+24
+	BNE	T12Ck1
+	LBSR	PPass
+	BRA	T12Done
+T12Bad	LBSR	PFail
+	LDX	#FailSeq
+	LBSR	PPuts
+	LDB	-1,X		; actual
+	LBSR	PPrintH
+	LBSR	PCrlf
+T12Done
 
 ; ---------------------------------------------------------------
 ; Summary
@@ -742,10 +914,20 @@ PFail	PSHS	A,X
 	INC	FAIL_COUNT
 	PULS	A,X,PC
 
-; Print A as single decimal digit (0-9)
-PPrintA	ADDA	#'0'
-	LBSR	POutch
-	RTS
+; Print A as decimal 0-99 (two digits with leading digit suppressed)
+PPrintA	PSHS	B
+	LDB	#'0'-1		; tens digit
+PP@T	INCB
+	SUBA	#10
+	BCC	PP@T
+	ADDA	#10+'0'		; remainder + '0' = units digit
+	CMPB	#'0'
+	BEQ	PP@U		; suppress leading zero
+	EXG	A,B
+	LBSR	POutch		; print tens
+	EXG	A,B
+PP@U	LBSR	POutch		; print units
+	PULS	B,PC
 
 ; Print D as 4 hex digits
 PPrintD	PSHS	D
@@ -790,25 +972,33 @@ Banner	FCC	"\nACIA Torture Test (loopback)\n"
 	FCC	"============================\n\n"
 	FCB	0
 
-T1Msg	FCC	"Test 1: Polled RX (RDRF set/clear) ... "
+T1Msg	FCC	"Test  1: Polled RX (RDRF set/clear) .. "
 	FCB	0
-T2Msg	FCC	"Test 2: Status read preserves data ... "
+T2Msg	FCC	"Test  2: Status read preserves data .. "
 	FCB	0
-T3Msg	FCC	"Test 3: IRQ fires on RX .............. "
+T3Msg	FCC	"Test  3: IRQ fires on RX ............. "
 	FCB	0
-T4Msg	FCC	"Test 4: No spurious re-fire .......... "
+T4Msg	FCC	"Test  4: No spurious re-fire ......... "
 	FCB	0
-T5Msg	FCC	"Test 5: IRQ latches while CPU masked . "
+T5Msg	FCC	"Test  5: IRQ latches while CPU masked  "
 	FCB	0
-T6Msg	FCC	"Test 6: Back-to-back RX (16 chars) ... "
+T6Msg	FCC	"Test  6: Back-to-back RX (16 chars) .. "
 	FCB	0
-T7Msg	FCC	"Test 7: Overrun (close loopback) ..... "
+T7Msg	FCC	"Test  7: Overrun (close loopback) .... "
 	FCB	0
 T7Note	FCC	"(got 1st byte) "
 	FCB	0
-T8Msg	FCC	"Test 8: Bulk 256-byte throughput ...... "
+T8Msg	FCC	"Test  8: Bulk 256-byte throughput ..... "
 	FCB	0
-T9Msg	FCC	"Test 9: Host RX IRQ (press a key) .... "
+T9Msg	FCC	"Test  9: Host RX IRQ (press a key) ... "
+	FCB	0
+T10Msg	FCC	"Test 10: Mode switch after output ..... "
+	FCB	0
+T11Msg	FCC	"Test 11: Tight IRQ deassert ........... "
+	FCB	0
+T12Msg	FCC	"Test 12: Write ring stress (24 burst) . "
+	FCB	0
+T12Pre	FCC	"."
 	FCB	0
 FailTimeout	FCC	"timeout - no IRQ from host char\n"
 	FCB	0

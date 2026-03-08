@@ -97,9 +97,9 @@ mc6850::update_task()
 }
 
 void
-mc6850::guest_control()
+mc6850::guest_control(uint8_t val)
 {
-	mc6850_control cr = {registers::write(CONSOLE_CONTROL)};
+	mc6850_control cr = {val};
 	if (cr.divide_select == 0b11u) {
 		reset();
 	} else {

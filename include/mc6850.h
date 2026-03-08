@@ -110,7 +110,7 @@ public:
 	}
 	void guest_receive();
 	void guest_transmit(uint8_t data);
-	void guest_control();
+	void guest_control(uint8_t val);
 	void rx_read_fast_path();	// called from read ISR: clears RDRF immediately
 	[[nodiscard]] interrupt has_interrupt();
 };

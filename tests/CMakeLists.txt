@@ -76,26 +76,6 @@ target_link_libraries(test_command_parser PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_command_parser)
 
 # ---------------------------------------------------------------------------
-# test_mc6840: host-native build using fake/ stub headers.
-#
-# fake/ is placed first in the include path so that mc6840.cpp gets stub
-# versions of pico/*, hardware/pio.h, registers.h, pico_thing.h, and
-# mc6809.h in place of the real Pico-SDK-dependent headers.
-# mc6840.h itself has no Pico includes and is taken from ../include.
-# ---------------------------------------------------------------------------
-add_executable(test_mc6840
-    test_mc6840.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mc6840.cpp
-)
-target_include_directories(test_mc6840 PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/fake   # fake Pico/registers stubs (first!)
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-)
-target_compile_features(test_mc6840 PRIVATE cxx_std_17)
-target_link_libraries(test_mc6840 PRIVATE Catch2::Catch2WithMain)
-catch_discover_tests(test_mc6840)
-
-# ---------------------------------------------------------------------------
 # test_mc6850: host-native build using fake/ stub headers.
 #
 # fake/pico/util/queue.h provides a simple ring-buffer queue_t in place of
@@ -112,3 +92,21 @@ target_include_directories(test_mc6850 PRIVATE
 target_compile_features(test_mc6850 PRIVATE cxx_std_17)
 target_link_libraries(test_mc6850 PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_mc6850)
+
+# ---------------------------------------------------------------------------
+# test_tick_timer: host-native build using fake/ stub headers.
+#
+# fake/pico/time.h stubs out repeating_timer and add_repeating_timer_us().
+# simulate_tick() calls the callback directly for deterministic testing.
+# ---------------------------------------------------------------------------
+add_executable(test_tick_timer
+    test_tick_timer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tick_timer.cpp
+)
+target_include_directories(test_tick_timer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake   # fake Pico/registers stubs (first!)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_features(test_tick_timer PRIVATE cxx_std_17)
+target_link_libraries(test_tick_timer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_tick_timer)

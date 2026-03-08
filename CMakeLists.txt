@@ -58,9 +58,9 @@ add_executable(pico-thing
 		src/mc6809.cpp
 		src/srec.cpp
 		src/mc6850.cpp
+		src/tick_timer.cpp
 		src/usb_descriptors.c
 		src/usb.c
-		src/mc6840.cpp
 )
 
 # Include both the project headers and generated ones

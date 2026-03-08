@@ -1,14 +1,4 @@
 #pragma once
-// Minimal stub providing only what mc6840.cpp needs.
+// Minimal stub providing only what test code needs from mc6809.h.
 
-enum interrupt {
-	INTERRUPT_ILLEGAL,
-	INTERRUPT_SWI3,
-	INTERRUPT_SWI2,
-	INTERRUPT_FIRQ,
-	INTERRUPT_IRQ,
-	INTERRUPT_SWI,
-	INTERRUPT_NMI,
-	INTERRUPT_RESET,
-	INTERRUPT_NONE,
-};
+#include "interrupt.h"

@@ -1,0 +1,20 @@
+/**
+ * Copyright (c) 2025-2026 Mark R V Murray.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+enum interrupt {
+	INTERRUPT_ILLEGAL,
+	INTERRUPT_SWI3,
+	INTERRUPT_SWI2,
+	INTERRUPT_FIRQ,
+	INTERRUPT_IRQ,
+	INTERRUPT_SWI,
+	INTERRUPT_NMI,
+	INTERRUPT_RESET,
+	INTERRUPT_NONE,
+	NUM_INTERRUPTS
+};

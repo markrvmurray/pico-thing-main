@@ -33,8 +33,8 @@
 #include "mc6809.h"
 #include "srec.h"
 #include "mc6850.h"
+#include "tick_timer.h"
 #include "build_time.h"
-#include "mc6840.h"
 #include "command_parser.h"
 
 /* Flex/bison generated scanner API (yy_buffer_state is flex's internal type) */
@@ -118,9 +118,22 @@ static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
 
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
+static volatile bool core1_initialised = false;
 
 mc6850 fast_serial;
-mc6840 system_timer(1);
+
+// Cached interrupt state — updated by for(;;) loop's has_interrupt() calls,
+// applied to GPIO pins by the Q-rising ISR.  Decouples IRQ delivery from
+// for(;;) loop throughput.  Packed into a single byte so the ISR does one
+// volatile read (not three) — the init ISR budget is extremely tight.
+static volatile uint8_t pending_interrupts = 0u;
+static constexpr uint8_t PEND_NMI  = 1u << 0;
+static constexpr uint8_t PEND_FIRQ = 1u << 1;
+static constexpr uint8_t PEND_IRQ  = 1u << 2;
+
+// Simple 50 Hz IRQ clock — replaces MC6840.
+static tick_timer system_tick(reg, pending_interrupts, PEND_IRQ,
+                              SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
 static volatile uint32_t _debug_qrise_count = 0u;
 static volatile uint32_t _debug_irq_assert_count = 0u;
@@ -170,15 +183,25 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 			}
 		}
+		// Assert/deassert all interrupt pins from cached pending state.
+		// NMI is edge-triggered (one-shot): assert once and clear flag.
+		// IRQ/FIRQ are level-triggered: assert when pending, deassert
+		// when not.  The DMA read ISR clears PEND_IRQ after
+		// rx_read_fast_path() and timer reads, keeping stale assertion
+		// windows short.
+		{
+			const uint8_t pend = pending_interrupts;
+			if (pend & PEND_NMI) {
+				ASSERT_NMI;
+				pending_interrupts = pend & ~PEND_NMI;
+			}
+			if (pend & PEND_FIRQ) ASSERT_FIRQ; else DEASSERT_FIRQ;
+			if (pend & PEND_IRQ)  ASSERT_IRQ;  else DEASSERT_IRQ;
+		}
 //	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 	} else {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
-		// Tick the timer on every Q-falling edge directly from the ISR.
-		// The for(;;) loop is too slow to call tick() reliably at 1 MHz
-		// due to GPIO ISR overhead (~68% of Core 1 time), causing ~3×
-		// under-counting.  Running tick() here guarantees 1:1 rate.
-		system_timer.tick(1u);
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
 		// Grab the current 8 D pins if this is a read cycle, and the LIC timing lets us
@@ -236,6 +259,12 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// read sees the change.  guest_receive() will stage the next byte
 			// (if any) and re-set RDRF on the next for(;;) iteration.
 			fast_serial.rx_read_fast_path();
+			// Clear PEND_IRQ so the Q-rising ISR doesn't re-assert /IRQ
+			// from stale state after the 6809 has acknowledged the interrupt.
+			pending_interrupts &= ~PEND_IRQ;
+		} else if (loc == SYSTEM_TIMER_STATUS) {
+			// Reading the timer status register acknowledges the IRQ.
+			system_tick.acknowledge();
 		} else {
 			read_location = loc;
 			read_irq_received = true;
@@ -271,7 +300,7 @@ struct write_entry {
 	uint8_t location;
 	uint8_t value;
 };
-static constexpr uint8_t WRITE_RING_SIZE = 16u;  // must be power of 2
+static constexpr uint8_t WRITE_RING_SIZE = 32u;  // must be power of 2
 static constexpr uint8_t WRITE_RING_MASK = WRITE_RING_SIZE - 1u;
 static volatile write_entry write_ring[WRITE_RING_SIZE];
 static volatile uint8_t write_ring_head = 0u;    // written by ISR
@@ -299,10 +328,16 @@ __time_critical_func(dma_bus_write_irq_handler())
 			reg[SYSTEM_TASK] = new_task;
 			task_pins_update(new_task);
 		}
-		else if (wloc == CONSOLE_CONTROL)
-			fast_serial.guest_control();	// apply immediately so guest_transmit() sees updated state
+		// CONSOLE_CONTROL is NOT handled here — guest_control() must run
+		// from the for(;;) loop's write_ring processing so it is sequenced
+		// AFTER any pending CONSOLE_TX_DATA entries.  If we call it here,
+		// a mode change (e.g. loopback enable) takes effect before the
+		// for(;;) loop processes the last TX byte from the previous mode,
+		// routing it through the wrong path (loopback vs normal TX queue).
 		else if (wloc == CONSOLE_TX_DATA)
 			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
+		else if (wloc == SYSTEM_TIMER_CONTROL_13)
+			system_tick.control(wval);
 		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
 			reg[wloc] = wval;
 		// Queue for the for(;;) loop to do full dispatch.
@@ -445,7 +480,7 @@ peripheral_clear(const bool sysvectors)
 
 	// Reset emulated peripherals (as a real !RESET would)
 	fast_serial.reset();
-	system_timer.reset();
+	system_tick.reset();
 }
 
 void
@@ -647,17 +682,8 @@ process_command(char *buf)
 #endif
 		printf("Register and emulated RAM block:\n");
 		registers::dump();
-		printf("Timer:\n");
-		printf("Timer status: %02X  nmi_pending: %d  running: %d %d %d\n",
-		       system_timer.debug_status(),
-		       system_timer.debug_nmi_pending(),
-		       system_timer.debug_running(CTR1),
-		       system_timer.debug_running(CTR2),
-		       system_timer.debug_running(CTR3));
-		printf("Timer CR1: %02X  CR2: %02X  CR3: %02X\n",
-		       system_timer.debug_control(CTR1),
-		       system_timer.debug_control(CTR2),
-		       system_timer.debug_control(CTR3));
+		printf("Tick timer: enabled=%d  irq_pending=%d\n",
+		       (int)system_tick.is_enabled(), (int)system_tick.is_irq_pending());
 		printf("Core1 loop: %lu  q_rise: %lu  irq_assert: %lu\n",
 		       _debug_loop_count, _debug_qrise_count, _debug_irq_assert_count);
 		printf("Core1 write_ring: %lu  read_irq: %lu\n",
@@ -1274,6 +1300,7 @@ process_command(char *buf)
 				printf("S9 start = %04X\n", address);
 			if (!srecord_ignore)
 				reg[REGISTER_VECTOR_RESET_OFFSET] = address;
+			srecord_ignore = false;	// end of stream — reset for next load
 		}
 		break;
 	}
@@ -1282,8 +1309,6 @@ process_command(char *buf)
 		break;
 	}
 }
-
-static volatile bool core1_initialised = false;
 
 #define COMMAND_BUFFER_LEN 256u
 
@@ -1303,7 +1328,73 @@ poll_console()
 
 	print_time();
 
+	// Software watchdog: detect Core 1 for(;;) loop stalls.
+	// Sampled every WATCHDOG_INTERVAL_MS from Core 0.  Requires
+	// WATCHDOG_THRESHOLD consecutive misses before alerting, so transient
+	// ISR starvation during heavy bus activity (e.g. NitrOS9 boot) doesn't
+	// trigger false alarms.
+	uint32_t watchdog_last_loop_count = _debug_loop_count;
+	uint32_t watchdog_last_isr_count = _debug_isr_count;
+	static constexpr uint32_t WATCHDOG_INTERVAL_MS = 10u;
+	static constexpr uint32_t WATCHDOG_THRESHOLD = 10u;	// 10 × 10ms = 100ms
+	uint32_t watchdog_miss_count = 0u;
+	absolute_time_t watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
+	bool watchdog_stalled = false;
+
 	for (;;) {
+		if (absolute_time_diff_us(get_absolute_time(), watchdog_next) <= 0) {
+			const uint32_t cur_loop = _debug_loop_count;
+			const uint32_t cur_isr = _debug_isr_count;
+			if (cur_loop == watchdog_last_loop_count && core1_initialised) {
+				watchdog_miss_count++;
+				if (!watchdog_stalled && watchdog_miss_count >= WATCHDOG_THRESHOLD) {
+					const bool isr_alive = (cur_isr != watchdog_last_isr_count);
+					printf("\n*** Core 1 for(;;) loop stalled (%lums)!\n",
+					       watchdog_miss_count * WATCHDOG_INTERVAL_MS);
+					if (!isr_alive)
+						printf("*** ISRs also stopped — probable hard fault or deadlock\n");
+					else
+						printf("*** ISRs still running — thread mode starved or hung\n");
+					printf("  phase=%u  loop=%lu  isr=%lu\n",
+					       _debug_loop_phase, cur_loop, cur_isr);
+					printf("  last_write=%02X  last_read=%02X\n",
+					       _debug_last_write_loc, _debug_last_read_loc);
+					printf("  pending_interrupts=%02X  write_ring: head=%u tail=%u\n",
+					       pending_interrupts, write_ring_head, write_ring_tail);
+					printf("  ACIA: int_status=%02X\n",
+					       fast_serial.interrupt_status());
+					printf("  Tick: enabled=%d  irq_pending=%d\n",
+					       (int)system_tick.is_enabled(), (int)system_tick.is_irq_pending());
+					// Stack watermark check
+					{
+						volatile uint32_t *bottom = &__StackOneBottom;
+						volatile uint32_t *top = &__StackOneTop;
+						volatile uint32_t *p = bottom;
+						while (p < top && *p == 0xDEADBEEFu)
+							p++;
+						uint32_t used = (top - p) * sizeof(uint32_t);
+						uint32_t total = (top - bottom) * sizeof(uint32_t);
+						printf("  stack: %lu/%lu bytes used", used, total);
+						if (p == bottom)
+							printf(" *** STACK OVERFLOW ***");
+						printf("\n");
+					}
+					watchdog_stalled = true;
+				}
+			} else {
+				if (watchdog_stalled) {
+					printf("*** Core 1 for(;;) loop resumed after %lums (loop=%lu)\n",
+					       watchdog_miss_count * WATCHDOG_INTERVAL_MS,
+					       cur_loop);
+				}
+				watchdog_stalled = false;
+				watchdog_miss_count = 0u;
+			}
+			watchdog_last_loop_count = cur_loop;
+			watchdog_last_isr_count = cur_isr;
+			watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
+		}
+
 		if (!prompted) {
 			printf(prompt);
 			prompted = true;
@@ -1322,6 +1413,12 @@ poll_console()
 				putchar('\n');
 				buf[idx] = '\0';
 				process_command(buf);
+				// Resample watchdog baseline — process_command() may have
+				// run a snippet/chunk that legitimately starved the for(;;)
+				// loop for its duration.
+				watchdog_last_loop_count = _debug_loop_count;
+				watchdog_last_isr_count = _debug_isr_count;
+				watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
 				idx = 0;
 				prompted = false;
 			} else if (ch == '\b') {
@@ -1400,6 +1497,10 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	sysreq_initialise();
 
+	// Start the 50 Hz tick timer (hardware alarm, runs independently of E clock).
+	system_tick.start();
+	printf("Pico2 MC6809E 50 Hz tick timer started\n");
+
 	printf("Pico2 MC6809E core1 process started\n");
 
 	// Paint the unused portion of Core 1's stack with a canary pattern.
@@ -1435,7 +1536,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
 			_debug_loop_phase = 21;
-			eirq = system_timer.has_interrupt();
+			eirq = system_tick.has_interrupt();
 			interrupt_refcount[eirq]++;
 			_debug_loop_phase = 22;
 			eirq = fast_serial.has_interrupt();
@@ -1444,14 +1545,17 @@ __no_inline_not_in_flash_func(main_core1)()
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
 				_debug_irq_assert_count++;
 			_debug_loop_phase = 30;
-			mc6809::apply_interrupts(interrupt_refcount);
+			// Update cached state so the Q-rising ISR can assert/deassert
+			// interrupt pins.  Single volatile write; the ISR handles all
+			// GPIO assertion and deassertion — no apply_interrupts() here.
+			pending_interrupts =
+				(interrupt_refcount[INTERRUPT_NMI]  > 0u ? PEND_NMI  : 0u) |
+				(interrupt_refcount[INTERRUPT_FIRQ] > 0u ? PEND_FIRQ : 0u) |
+				(interrupt_refcount[INTERRUPT_IRQ]  > 0u ? PEND_IRQ  : 0u);
 			_debug_loop_phase = 31;
 			// END FOR_EACH
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
-
-		// system_timer.tick(1u) is now called from the Q-falling ISR (see
-		// gpio_clock_eq_irq_handler) to guarantee 1:1 edge→tick rate.
 
 		_debug_loop_phase = 4;
 		while (write_ring_tail != write_ring_head) {
@@ -1552,7 +1656,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				}
 				UART_CONTROL_COUNT++;
 #endif
-				fast_serial.guest_control();
+				fast_serial.guest_control(written_byte);
 				break;
 			}
 			case CONSOLE_TX_DATA: // UART tx data
@@ -1562,16 +1666,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				fast_serial.guest_transmit(written_byte);
 				break;
 
-			case SYSTEM_TIMER_CONTROL_13:
-			case SYSTEM_TIMER_CONTROL_2:
-			case SYSTEM_TIMER_1_MSB:
-			case SYSTEM_TIMER_1_LSB:
-			case SYSTEM_TIMER_2_MSB:
-			case SYSTEM_TIMER_2_LSB:
-			case SYSTEM_TIMER_3_MSB:
-			case SYSTEM_TIMER_3_LSB:
-				system_timer.write(written_location - SYSTEM_TIMER_BASE, written_byte);
-				break;
+			// Tick timer writes are handled directly in the DMA write ISR.
 
 			case REGISTER_BUFFER_OFFSET + 0x00:
 			case REGISTER_BUFFER_OFFSET + 0x01:
@@ -1683,16 +1778,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 			// CONSOLE_RX_DATA is handled via rx_read_count above.
 
-			case SYSTEM_TIMER_CONTROL_13:
-			case SYSTEM_TIMER_STATUS:
-			case SYSTEM_TIMER_1_MSB:
-			case SYSTEM_TIMER_1_LSB:
-			case SYSTEM_TIMER_2_MSB:
-			case SYSTEM_TIMER_2_LSB:
-			case SYSTEM_TIMER_3_MSB:
-			case SYSTEM_TIMER_3_LSB:
-				system_timer.read(read_location - SYSTEM_TIMER_BASE);
-				break;
+			// Tick timer status read is handled directly in the DMA read ISR.
 
 			}
 			//gpio_put(GPIO_TRACE_CORE1, false);
