@@ -9,6 +9,8 @@
 enum {
 	ITF_NUM_CDC_0 = 0,
 	ITF_NUM_CDC_0_DATA,
+	ITF_NUM_CDC_1,
+	ITF_NUM_CDC_1_DATA,
 	ITF_NUM_VENDOR,
 	ITF_NUM_TOTAL
 };
@@ -17,8 +19,12 @@ enum {
 #define EPNUM_CDC_0_OUT		0x02	/* EP2 OUT (bulk)      */
 #define EPNUM_CDC_0_IN		0x82	/* EP2 IN  (bulk)      */
 
-#define EPNUM_VENDOR_OUT	0x03	/* EP3 OUT */
-#define EPNUM_VENDOR_IN		0x83	/* EP3 IN  */
+#define EPNUM_CDC_1_NOTIF	0x83	/* EP3 IN  (interrupt) */
+#define EPNUM_CDC_1_OUT		0x04	/* EP4 OUT (bulk)      */
+#define EPNUM_CDC_1_IN		0x84	/* EP4 IN  (bulk)      */
+
+#define EPNUM_VENDOR_OUT	0x05	/* EP5 OUT */
+#define EPNUM_VENDOR_IN		0x85	/* EP5 IN  */
 
 tusb_desc_device_t const desc_device = {
 	.bLength = sizeof(tusb_desc_device_t),
@@ -45,13 +51,13 @@ tud_descriptor_device_cb(void)
 	return (uint8_t const *) &desc_device;
 }
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + 2 * TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
 	/* Configuration descriptor */
 	TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
-	/* CDC ACM interface (control + data) */
+	/* CDC 0 — console UART */
 	TUD_CDC_DESCRIPTOR(
 		ITF_NUM_CDC_0,		/* interface number */
 		4,			/* string index     */
@@ -59,6 +65,17 @@ uint8_t const desc_configuration[] = {
 		8,
 		EPNUM_CDC_0_OUT,	/* OUT EP   */
 		EPNUM_CDC_0_IN,		/* IN EP    */
+		64
+	),
+
+	/* CDC 1 — auxiliary UART */
+	TUD_CDC_DESCRIPTOR(
+		ITF_NUM_CDC_1,		/* interface number */
+		6,			/* string index     */
+		EPNUM_CDC_1_NOTIF,	/* notification ep  */
+		8,
+		EPNUM_CDC_1_OUT,	/* OUT EP   */
+		EPNUM_CDC_1_IN,		/* IN EP    */
 		64
 	),
 
@@ -85,10 +102,11 @@ static uint16_t desc_str[DESC_STR_MAXLEN];
 char const *string_desc_arr[] = {
 	(const char[]){0x09, 0x04}, /* supported language: English */
 	"MarkM",                    /* 1: Manufacturer */
-	"8-bit Overlord",           /* 2: Product */
+	"Pico-Thing",               /* 2: Product */
 	"6809",                     /* 3: Serial number */
 	"MC6809 Serial",            /* 4 */
-	"MC6809 Bulk"               /* 5 */
+	"MC6809 Aux Serial",        /* 6 */
+	"MC6809 Bulk",              /* 5 */
 };
 
 uint16_t const *

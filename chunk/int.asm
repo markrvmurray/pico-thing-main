@@ -19,18 +19,23 @@ VECTORS	EQU	$FFF0	CPU reset and interrupt vectors
 
 CHUNK	EQU	$0130
 
-UARTC	equ	$FFC3
-UARTS	equ	$FFC3
-UARTTX	equ	$FFC4
-UARTRX	equ	$FFC4
+ACIAC	equ	$FFC3
+ACIAS	equ	$FFC3
+ACIATX	equ	$FFC4
+ACIARX	equ	$FFC4
+
+AUXAC	equ	$FFC5
+AUXAS	equ	$FFC5
+AUXATX	equ	$FFC6
+AUXARX	equ	$FFC6
 
 	ORG	CHUNK
 	FDB	EUrtIRQ-CHUNK
 UartIRQ	LDS	#$8000
 	CLR	ERRNO
-	CLR	UART
+	CLR	ACIA
 	LDA	#$22
-	STA	UARTC
+	STA	ACIAC
 	LDX	#LONG
 	BSR	PUTS
 	LDA	#$88
@@ -95,7 +100,7 @@ O@0	CMPB	TX_P_OU
 	PULS	B
 	STB	TX_P_IN
 	LDA	#%10000000
-	STA	UARTC
+	STA	ACIAC
 	PULS	CC
 	ANDCC	#%11101111
 	PULS	A,B,U,PC
@@ -141,19 +146,19 @@ RX_BUF	ZMB	16
 	FILL	$FF,$0240-*
 
 * =====================================================================
-* ISR For UART charater input/output
+* ISR For ACIA charater input/output
 *
 * [*] TX_P_IN == TX_P_OU => ISR: buffer empty, so come back later
 * [*] TX_P_IN != TX_P_OU => ISR: next byte to transfer is at TX_P_OU, then TX_P_OU+
 * [ ] TX_P_IN+ == TX_P_OU => OUTCH: buffer full, so spinwait
 * [ ] TX_P_IN+ != TX_P_OU => OUTCH: Store byte in TX_P_IN, then TX_P_IN+
 *
-* [*] RX_P_IN+ == RX_P_OU => ISR: buffer full, so disable interrupts and do not read UARTRX register
+* [*] RX_P_IN+ == RX_P_OU => ISR: buffer full, so disable interrupts and do not read ACIARX register
 * [*] RX_P_IN+ != RX_P_OU => ISR: Store byte in RX_P_IN, then RX_P_IN+
 * [ ] RX_P_IN == RX_P_OU => INCH: buffer empty, so return "not available" status
 * [ ] RX_P_IN != RX_P_OU => INCH: next byte to return is at RX_P_OU, then RX_P_OU+
 
-ISR	LDA	UARTS
+ISR	LDA	ACIAS
 	BITA	#%00000010
 	BNE	TXIRQ		Tx Interrupt
 	BITA	#%00000001
@@ -165,15 +170,15 @@ TXIRQ	LDU	#TX_BUF
 	CMPB	TX_P_IN
 	BEQ	TXEMPTY
 	LDA	B,U
-	STA	UARTTX
+	STA	ACIATX
 	INCB
 	ANDB	#%00001111
 	STB	TX_P_OU
 	BRA	ISR
 
-TXEMPTY	LDA	UARTS
+TXEMPTY	LDA	ACIAS
 	ANDA	#%01111111
-	STA	UARTC
+	STA	ACIAC
 	LDA	#$27
 	STA	ERRNO
 	RTI
@@ -186,18 +191,18 @@ RXIRQ	LDU	#RX_BUF
 	BEQ	RXFULL
 	PSHS	B
 	LDB	RX_P_IN
-	LDA	UARTRX
+	LDA	ACIARX
 	STA	B,U
 	PULS	B
 	STB	RX_P_IN
 	BRA	ISR
 
-RXFULL	LDA	UARTS
+RXFULL	LDA	ACIAS
 	ANDA	#%11110111
-	STA	UARTC
+	STA	ACIAC
 	RTI
 
-NOT_ME	STA	UART
+NOT_ME	STA	ACIA
 	LDA	#$76
 	STA	ERRNO
 	RTI
@@ -213,7 +218,7 @@ LONG	FCC	"Hello, World! 1\r\n"
 	FILL 	$FF,$0330-*
 
 ERRNO	FCB	0
-UART	FCB	0
+ACIA	FCB	0
 
 	FILL 	$FF,$03A0-*
 

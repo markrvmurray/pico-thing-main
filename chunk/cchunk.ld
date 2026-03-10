@@ -1,5 +1,5 @@
 ; Linker script for C programs (compiled with cmoc) that use the io.asm
-; interrupt-driven UART library.
+; interrupt-driven ACIA library.
 ;
 ; Section ordering:
 ;   start      load 0130  - cmoc startup (sets stack, calls INILIB then main)
@@ -17,7 +17,7 @@
 ;   SYSVECTORS load FD00  - ISR dispatch code + handler tables
 ;   DAT_RAM    load FE00  - DAT RAM
 ;   IO_DEVICES load FF00  - IDE and other I/O devices
-;   PICO2      load FFC0  - UART / timer register addresses
+;   PICO2      load FFC0  - ACIA / timer register addresses
 ;   VECTORS    load FFF0  - CPU interrupt / reset vectors
 
 ; Use the patterns that cmoc's INILIB expects for BSS start/length.

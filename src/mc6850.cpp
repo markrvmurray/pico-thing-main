@@ -17,24 +17,25 @@
 #include "mc6809.h"
 #include "mc6850.h"
 
-mc6850::mc6850() :
-	tx(sizeof(uint8_t), CONSOLE_QUEUE_LEN),
-	rx(sizeof(uint8_t), CONSOLE_QUEUE_LEN),
+mc6850::mc6850(uint16_t ctl_off, uint16_t data_off) :
+	ctl_offset(ctl_off),
+	data_offset(data_off),
 	reg(registers::getInstance())
 {
-	registers::write(CONSOLE_CONTROL) = CONSOLE_NONE;
-	reg[CONSOLE_STATUS] = reset_status.byte;
-	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>(0x00);
-	reg[CONSOLE_RX_DATA] = static_cast<uint8_t>(0x00);
+	registers::write(ctl_offset) = CONSOLE_NONE;
+	reg[ctl_offset] = reset_status.byte;
+	cached_status_byte = reset_status.byte;
+	registers::write(data_offset) = static_cast<uint8_t>(0x00);
+	reg[data_offset] = static_cast<uint8_t>(0x00);
 }
 
 void
 mc6850::reset()
 {
-	registers::write(CONSOLE_CONTROL) = CONSOLE_NONE;
-	reg[CONSOLE_STATUS] = CONSOLE_NONE;
-	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>(0x00);
-	reg[CONSOLE_RX_DATA] = static_cast<uint8_t>(0x00);
+	registers::write(ctl_offset) = CONSOLE_NONE;
+	reg[ctl_offset] = CONSOLE_NONE;
+	registers::write(data_offset) = static_cast<uint8_t>(0x00);
+	reg[data_offset] = static_cast<uint8_t>(0x00);
 	transmit_buffer_empty = true;
 	receive_buffer_full = false;
 	transmit_irq = false;
@@ -46,15 +47,18 @@ mc6850::reset()
 	loopback_close = false;
 	loopback_queue = false;
 	tx_write_pending = false;
+	irq_dirty = true;
 	//tx.reset();
 	//rx.reset();
-	reg[CONSOLE_STATUS] = reset_status.byte;
+	reg[ctl_offset] = reset_status.byte;
+	cached_status_byte = reset_status.byte;
 }
 
 // Derive the full status register from internal state variables.
-// Must NOT read-modify-write reg[CONSOLE_STATUS] — the read ISR
+// Must NOT read-modify-write reg[ctl_offset] — the read ISR
 // (rx_read_fast_path) can preempt and clear RDRF between our read
 // and write, causing us to clobber the ISR's update.
+// Skips the register write if the byte hasn't changed.
 inline void
 mc6850::sync_status()
 {
@@ -63,7 +67,10 @@ mc6850::sync_status()
 	sr.tdre = (transmit_buffer_empty && !cts_deasserted && !tx_write_pending) ? 1u : 0u;
 	sr.cts  = cts_deasserted ? 1u : 0u;
 	sr.irq  = (assert_receive_irq || assert_transmit_irq) ? 1u : 0u;
-	reg[CONSOLE_STATUS] = sr.byte;
+	if (sr.byte != cached_status_byte) {
+		cached_status_byte = sr.byte;
+		reg[ctl_offset] = sr.byte;
+	}
 }
 
 // Sync TDRE/CTS status bits from current TX queue state.
@@ -84,16 +91,8 @@ void
 mc6850::write_received()
 {
 	tx_write_pending = true;
+	irq_dirty = true;
 	sync_status();
-}
-
-// Called periodically from the Core 1 timer. Keeps TDRE/CTS current for
-// the 6809's TX path. Receive loading and interrupt state are handled by
-// has_interrupt() on every Q-rising edge.
-void
-mc6850::update_task()
-{
-	sync_transmit();
 }
 
 void
@@ -110,6 +109,7 @@ mc6850::guest_control(uint8_t val)
 		transmit_irq = cr.tx_irq == 0b01u;
 		receive_irq = cr.rx_irq;
 		rts_deasserted = (cr.tx_irq == 0b10u);	// 0b11 is now close loopback, not RTS
+		irq_dirty = true;
 		sync_transmit();
 	}
 }
@@ -122,7 +122,7 @@ mc6850::guest_transmit(uint8_t data)
 		// Close loopback: TX byte goes directly into the RX register,
 		// bypassing both queues.  RDRF and S_IRQ are set immediately
 		// so the 6809 sees correct status without waiting for has_interrupt().
-		reg[CONSOLE_RX_DATA] = data;
+		reg[data_offset] = data;
 		receive_buffer_full = true;
 		assert_receive_irq = receive_irq;
 	} else if (loopback_queue) {
@@ -135,6 +135,7 @@ mc6850::guest_transmit(uint8_t data)
 		if (tx.has_space())
 			tx.put(data);
 	}
+	irq_dirty = true;
 	sync_transmit();			// restores TDRE=1 (tx_write_pending is now false)
 }
 
@@ -147,6 +148,7 @@ mc6850::rx_read_fast_path()
 {
 	receive_buffer_full = false;
 	assert_receive_irq = false;
+	irq_dirty = true;
 	sync_status();
 }
 
@@ -157,6 +159,7 @@ mc6850::guest_receive()
 	// leave it in the rx queue so it is delivered once RTS is re-asserted.
 	if (rts_deasserted) {
 		receive_buffer_full = false;
+		irq_dirty = true;
 		sync_status();
 		return;
 	}
@@ -166,14 +169,25 @@ mc6850::guest_receive()
 	if (!receive_buffer_full) {
 		receive_buffer_full = rx.has_bytes();
 		if (receive_buffer_full)
-			reg[CONSOLE_RX_DATA] = rx.get();
+			reg[data_offset] = rx.get();
 	}
+	irq_dirty = true;
 	sync_status();
 }
 
 interrupt
 mc6850::has_interrupt()
 {
+	// Fast path: if no state has changed since the last call, return
+	// the cached result without recomputing anything.
+	if (!irq_dirty)
+		return cached_irq_result;
+	irq_dirty = false;
+
+	// Absorb TX queue state refresh (formerly update_task/sync_transmit).
+	transmit_buffer_empty = tx.has_space();
+	cts_deasserted = tx.get_level() > CTS_THRESHOLD;
+
 	// Stage the next byte if the slot is empty. Called every Q-rising edge,
 	// so RDRF is current before apply_interrupts() drives /IRQ. There is an
 	// inherent one-cycle lag (the DMA already served the previous value for
@@ -181,12 +195,12 @@ mc6850::has_interrupt()
 	// the very next UARTS read.
 	if (!receive_buffer_full && rx.has_bytes() && !rts_deasserted) {
 		receive_buffer_full = true;
-		reg[CONSOLE_RX_DATA] = rx.get();
+		reg[data_offset] = rx.get();
 	}
 	assert_receive_irq = receive_irq && receive_buffer_full;
 	assert_transmit_irq = transmit_irq && transmit_buffer_empty && !tx_write_pending;
 	sync_status();
-	if (assert_transmit_irq || assert_receive_irq)
-		return INTERRUPT_IRQ;
-	return INTERRUPT_NONE;
+	cached_irq_result = (assert_transmit_irq || assert_receive_irq)
+		? INTERRUPT_IRQ : INTERRUPT_NONE;
+	return cached_irq_result;
 }

@@ -242,45 +242,56 @@ mc6809::apply_rti()
 
 #define USB_BUFFER_SIZE 64
 
+struct uart_port_state {
+	uint8_t rx_buf[USB_BUFFER_SIZE];
+	uint8_t tx_buf[USB_BUFFER_SIZE];
+	uint16_t rx_count = 0, rx_index = 0;
+	uint16_t tx_count = 0, tx_index = 0;
+};
+
+static uart_port_state port_state[2];
+
+static void
+uart_port_pump(mc6850 &serial, uint8_t cdc_port, uart_port_state &st, bool suppress_read)
+{
+	// READ USB -> Guest (only if 6809 has asserted RTS)
+	{
+		mc6850_control cr = {registers::write(serial.get_ctl_offset())};
+		bool rts_deasserted = (cr.tx_irq == 0b10u || cr.tx_irq == 0b11u);
+		if (!rts_deasserted && !suppress_read) {
+			if (st.rx_count == 0u) {
+				st.rx_count = usb_cdc_read_n(cdc_port, st.rx_buf, USB_BUFFER_SIZE);
+				st.rx_index = 0u;
+			}
+			uint uart_level_avail = serial.host_transmit_level_avail();
+			uint transmit_amount = MIN(uart_level_avail, st.rx_count - st.rx_index);
+			for (uint i = 0u; i < transmit_amount; i++)
+				serial.host_transmit(st.rx_buf[st.rx_index + i]);
+			st.rx_index += transmit_amount;
+			if (st.rx_index >= st.rx_count)
+				st.rx_count = 0u;
+		}
+	}
+	// WRITE Guest -> USB
+	if (st.tx_count == 0u) {
+		while (serial.host_receive_avail() && st.tx_count < USB_BUFFER_SIZE)
+			st.tx_buf[st.tx_count++] = serial.host_receive();
+		st.tx_index = 0u;
+	}
+	st.tx_index += usb_cdc_write_n(cdc_port, st.tx_buf + st.tx_index, st.tx_count - st.tx_index);
+	if (st.tx_index >= st.tx_count)
+		st.tx_count = 0u;
+}
+
 void
 mc6809::uart_task(bool suppress_cdc_read)
 {
-	static uint8_t receive_buffer[USB_BUFFER_SIZE], transmit_buffer[USB_BUFFER_SIZE];
-	static uint16_t bytes_read = 0u, bytes_read_index = 0u, bytes_write = 0u, bytes_write_index = 0u;
-
 	if (MC6809.run_state == RS_STARTED || MC6809.run_state == RS_SYNCED) {
-		// READ USB -> Guest (only if 6809 has asserted RTS)
-		{
-			mc6850_control cr = {registers::write(CONSOLE_CONTROL)};
-			bool rts_deasserted = (cr.tx_irq == 0b10u || cr.tx_irq == 0b11u);
-			if (!rts_deasserted && !suppress_cdc_read) {
-				if (bytes_read == 0u) {
-					bytes_read = usb_cdc_read(receive_buffer, USB_BUFFER_SIZE);
-					bytes_read_index = 0u;
-				}
-				uint uart_level_avail = fast_serial.host_transmit_level_avail();
-				uint transmit_amount = MIN(uart_level_avail, bytes_read - bytes_read_index);
-				for (uint i = 0u; i < transmit_amount; i++)
-					fast_serial.host_transmit(receive_buffer[bytes_read_index + i]);
-				bytes_read_index += transmit_amount;
-				if (bytes_read_index >= bytes_read)
-					bytes_read = 0u;
-			}
-		}
-		// WRITE Guest -> USB
-		if (bytes_write == 0u) {
-			while (fast_serial.host_receive_avail() && bytes_write < USB_BUFFER_SIZE)
-				transmit_buffer[bytes_write++] = fast_serial.host_receive();
-			bytes_write_index = 0u;
-		}
-		bytes_write_index += usb_cdc_write(transmit_buffer + bytes_write_index, bytes_write - bytes_write_index);
-		if (bytes_write_index >= bytes_write)
-			bytes_write = 0u;
+		uart_port_pump(fast_serial, 0, port_state[0], suppress_cdc_read);
+		uart_port_pump(aux_serial, 1, port_state[1], false);
 	} else if (MC6809.run_state == RS_STOPPED) {
-		bytes_read = 0u;
-		bytes_read_index = 0u;
-		bytes_write = 0u;
-		bytes_write_index = 0u;
+		port_state[0] = {};
+		port_state[1] = {};
 	}
 }
 

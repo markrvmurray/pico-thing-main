@@ -9,11 +9,8 @@
 #include "registers.h"
 #include "tick_timer.h"
 
-tick_timer::tick_timer(registers &r, volatile uint8_t &pending, uint8_t pend_bit,
-                       uint16_t ctrl_off, uint16_t stat_off)
+tick_timer::tick_timer(registers &r, uint16_t ctrl_off, uint16_t stat_off)
 	: reg(r)
-	, pending_irq_flags(pending)
-	, pend_irq_bit(pend_bit)
 	, control_offset(ctrl_off)
 	, status_offset(stat_off)
 {
@@ -51,7 +48,8 @@ tick_timer::acknowledge()
 {
 	irq_pending = false;
 	reg[status_offset] = static_cast<uint8_t>(0x00u);
-	pending_irq_flags &= ~pend_irq_bit;
+	// Do not clear pending_irq_flags here — the for(;;) loop recomputes
+	// it from all device has_interrupt() calls each Q-rising edge.
 }
 
 void

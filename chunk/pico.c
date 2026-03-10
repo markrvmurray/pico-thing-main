@@ -3,14 +3,16 @@
 
 struct sysvectors *sys_vector = (struct sysvectors *)0xFD00;
 
-extern uint8_t *UARTC;
-
 void
 initialiseFastSerial(void)
 {
 	asm {
-		EXTERN	INIT
-		lbsr	INIT		; UART reset + install IRQ ISR + enable IRQ
+		EXTERN	INIT_CON
+		EXTERN	INIT_AUX
+		pshs	u
+		lbsr	INIT_CON	; Console ACIA reset + install IRQ ISR + enable IRQ
+		lbsr	INIT_AUX	; Auxiliary ACIA reset + enable IRQ
+		puls	u
 	}
 }
 
@@ -19,7 +21,11 @@ newOutputRoutine(void)
 {
 	asm {
 		EXTERN	PUTCHAR
-		lbsr	PUTCHAR		; LF→CR+LF conversion, then interrupt-driven OUTCH
+		EXTERN	CON_PORT
+		pshs	u
+		ldu	#CON_PORT
+		lbsr	PUTCHAR		; LF->CR+LF conversion, then interrupt-driven OUTCH
+		puls	u
 	}
 }
 

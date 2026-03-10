@@ -11,9 +11,9 @@
 ;
 ; RX ISR (fires on each incoming byte):
 ;   IRQ entry   19  (stack CC,A,B,DP,X,Y,U,PC = 12 bytes + vector fetch)
-;   ORCC I 3, LDA UARTS 5, BITA #RDRF 2, BNE RXIRQ 3            = 13
+;   ORCC I 3, LDA ACIAS 5, BITA #RDRF 2, BNE RXIRQ 3            = 13
 ;   LDB RX_P_IN 5, INCB 2, ANDB 2, CMPB RX_P_OU 5, BEQ 3       = 17
-;   PSHS B 6, LDA UARTRX 5, LDB RX_P_IN 5, LDX #RX_BUF 3       = 19
+;   PSHS B 6, LDA ACIARX 5, LDB RX_P_IN 5, LDX #RX_BUF 3       = 19
 ;   STA B,X 5, PULS B 6, STB RX_P_IN 5, RTI (E=1) 15            = 31
 ;                                                         Total  = 99
 ;
@@ -31,17 +31,17 @@
 ;                              CMPB TX_P_OU 5, BEQ not-taken 3,
 ;                              PSHS B 6, LDB TX_P_IN 5, STA B,U 5,
 ;                              PULS B 6, STB TX_P_IN 5,
-;                              LDB IQ_RXTX 5, STB UARTC 5,
+;                              LDB IQ_RXTX 5, STB ACIAC 5,
 ;                              PULS CC,B,U,PC 11)                = 86
 ;   BRA Loop    3
 ;                                                       Subtotal = 169
 ;
 ; TX ISR (fires on TDRE after OUTCH enables it):
 ;   IRQ entry   19
-;   ORCC I 3, LDA UARTS 5, BITA #RDRF 2, BNE not-taken 3        = 13
+;   ORCC I 3, LDA ACIAS 5, BITA #RDRF 2, BNE not-taken 3        = 13
 ;   BITA #TDRE 2, BNE TXIRQ 3                                    =  5
 ;   LDB TX_P_OU 5, CMPB TX_P_IN 5, BEQ not-taken 3              = 13
-;   LDX #TX_BUF 3, LDA B,X 5, STA UARTTX 5                      = 13
+;   LDX #TX_BUF 3, LDA B,X 5, STA ACIATX 5                      = 13
 ;   INCB 2, ANDB 2, STB TX_P_OU 5, RTI (E=1) 15                 = 24
 ;                                                         Total  = 87
 ;
@@ -59,7 +59,7 @@ Start	EXPORT
 
 Start	LDS	#STACK
 	LBSR	BSSCLR
-	LBSR	INIT
+	LBSR	INIT_CON
 
 Loop	LBSR	INCH
 	BCC	Loop

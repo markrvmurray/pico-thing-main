@@ -15,7 +15,7 @@ extern "C" {
 #define CFG_TUD_ENDPOINT0_SIZE     64
 
 /* ------ Device Classes Enabled ------ */
-#define CFG_TUD_CDC                 1           /* one CDC interface (control + data) */
+#define CFG_TUD_CDC                 2           /* two CDC interfaces (console + aux) */
 #define CFG_TUD_VENDOR              1           /* one vendor interface               */
 
 #define CFG_TUD_MSC                 0

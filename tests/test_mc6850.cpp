@@ -5,7 +5,7 @@
  *
  * The fake/ stubs replace:
  *   pico/stdlib.h        — defines uint
- *   pico/util/queue.h    — ring-buffer queue_t (no SDK spinlocks)
+ *   (SpscQueue is now inline in mc6850.h — no pico/util/queue.h needed)
  *   hardware/pio.h       — empty stub
  *   registers.h          — simplified read/write proxy
  *   pico_thing.h         — CONSOLE_* register offsets
@@ -75,7 +75,7 @@ static void uart_control(mc6850 &uart, uint8_t val)
 
 TEST_CASE("mc6850 construction: TDRE=1, RDRF=0") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	CHECK(status().tdre == 1);
 	CHECK(status().rdrf == 0);
@@ -88,7 +88,7 @@ TEST_CASE("mc6850 construction: TDRE=1, RDRF=0") {
 
 TEST_CASE("mc6850 master reset restores TDRE=1") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// Prime some pending state
 	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('A');
@@ -101,8 +101,8 @@ TEST_CASE("mc6850 master reset restores TDRE=1") {
 	CHECK(status().tdre == 1);
 	CHECK(status().rdrf == 0);
 
-	// update_task() after reset must leave TDRE=1
-	uart.update_task();
+	// has_interrupt() after reset must leave TDRE=1
+	(void)uart.has_interrupt();
 	CHECK(status().tdre == 1);
 }
 
@@ -112,7 +112,7 @@ TEST_CASE("mc6850 master reset restores TDRE=1") {
 
 TEST_CASE("write_received clears TDRE") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('H');
 	uart.write_received();
@@ -122,7 +122,7 @@ TEST_CASE("write_received clears TDRE") {
 
 TEST_CASE("guest_transmit restores TDRE and queues byte") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('H');
 	uart.write_received();
@@ -133,15 +133,15 @@ TEST_CASE("guest_transmit restores TDRE and queues byte") {
 	CHECK(uart.host_receive() == 'H');
 }
 
-TEST_CASE("update_task while write_pending does not restore TDRE") {
+TEST_CASE("has_interrupt while write_pending does not restore TDRE") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('X');
 	uart.write_received();
 	CHECK(status().tdre == 0);
 
-	uart.update_task();   // must NOT restore TDRE while tx_write_pending
+	(void)uart.has_interrupt();   // must NOT restore TDRE while tx_write_pending
 	CHECK(status().tdre == 0);
 
 	uart.guest_transmit('X');
@@ -150,7 +150,7 @@ TEST_CASE("update_task while write_pending does not restore TDRE") {
 
 TEST_CASE("back-to-back writes: both bytes queued, neither dropped") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// PUTCHAR(LF) issues OUTCH(CR) then OUTCH(LF) — the original drop scenario
 	uart_write(uart, '\r');
@@ -163,7 +163,7 @@ TEST_CASE("back-to-back writes: both bytes queued, neither dropped") {
 
 TEST_CASE("sequential single-byte writes all arrive") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	const char msg[] = "Hello";
 	for (char c : msg) {
@@ -185,7 +185,7 @@ TEST_CASE("sequential single-byte writes all arrive") {
 
 TEST_CASE("guest_receive stages byte: RDRF=1, byte in read registers") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart.host_transmit('Z');
 	uart.guest_receive();
@@ -196,7 +196,7 @@ TEST_CASE("guest_receive stages byte: RDRF=1, byte in read registers") {
 
 TEST_CASE("guest_receive with empty queue: RDRF=0") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart.guest_receive();
 
@@ -205,7 +205,7 @@ TEST_CASE("guest_receive with empty queue: RDRF=0") {
 
 TEST_CASE("guest_receive with rts_deasserted skips staging") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b10 (bits 5-6) → rts_deasserted=true
 	uart_control(uart, 0b01000000);
@@ -218,7 +218,7 @@ TEST_CASE("guest_receive with rts_deasserted skips staging") {
 
 TEST_CASE("has_interrupt: stages byte and returns IRQ when rx_irq enabled") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// rx_irq = bit 7
 	uart_control(uart, 0b10000000);
@@ -230,7 +230,7 @@ TEST_CASE("has_interrupt: stages byte and returns IRQ when rx_irq enabled") {
 
 TEST_CASE("has_interrupt: returns NONE when no IRQs enabled") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart.host_transmit('B');
 	CHECK(uart.has_interrupt() == INTERRUPT_NONE);
@@ -238,7 +238,7 @@ TEST_CASE("has_interrupt: returns NONE when no IRQs enabled") {
 
 TEST_CASE("has_interrupt: tx irq fires when tx_irq enabled and buffer empty") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b01 (bits 5-6)
 	uart_control(uart, 0b00100000);
@@ -252,7 +252,7 @@ TEST_CASE("has_interrupt: tx irq fires when tx_irq enabled and buffer empty") {
 
 TEST_CASE("TDRE remains 1 below CTS threshold") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// Fill to exactly the threshold (200 bytes)
 	for (int i = 0; i < 200; i++)
@@ -264,7 +264,7 @@ TEST_CASE("TDRE remains 1 below CTS threshold") {
 
 TEST_CASE("CTS deasserts TDRE at threshold+1") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	for (int i = 0; i < 201; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
@@ -275,7 +275,7 @@ TEST_CASE("CTS deasserts TDRE at threshold+1") {
 
 TEST_CASE("TDRE recovers after draining below CTS threshold") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	for (int i = 0; i < 201; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
@@ -284,7 +284,7 @@ TEST_CASE("TDRE recovers after draining below CTS threshold") {
 	// Drain two bytes to bring level back to 199 (below 200)
 	uart.host_receive();
 	uart.host_receive();
-	uart.update_task();
+	(void)uart.has_interrupt();
 
 	CHECK(status().tdre == 1);
 	CHECK(status().cts  == 0);
@@ -296,7 +296,7 @@ TEST_CASE("TDRE recovers after draining below CTS threshold") {
 
 TEST_CASE("close loopback: TX byte appears in RX register immediately") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b11 (bits 5-6) = close loopback
 	uart_control(uart, 0b01100000);
@@ -311,7 +311,7 @@ TEST_CASE("close loopback: TX byte appears in RX register immediately") {
 
 TEST_CASE("close loopback: TDRE restored after write") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart_control(uart, 0b01100000);
 
@@ -322,7 +322,7 @@ TEST_CASE("close loopback: TDRE restored after write") {
 
 TEST_CASE("close loopback: second TX overwrites RX if not read") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart_control(uart, 0b01100000);
 
@@ -336,7 +336,7 @@ TEST_CASE("close loopback: second TX overwrites RX if not read") {
 
 TEST_CASE("close loopback: RX IRQ fires on looped byte") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b11 (close loopback) + rx_irq=1 (bit 7)
 	uart_control(uart, 0b11100000);
@@ -350,7 +350,7 @@ TEST_CASE("close loopback: RX IRQ fires on looped byte") {
 
 TEST_CASE("close loopback: S_IRQ set immediately by guest_transmit (no has_interrupt needed)") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b11 (close loopback) + rx_irq=1 (bit 7)
 	uart_control(uart, 0b11100000);
@@ -366,7 +366,7 @@ TEST_CASE("close loopback: S_IRQ set immediately by guest_transmit (no has_inter
 
 TEST_CASE("close loopback: S_IRQ not set when rx_irq disabled") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b11 (close loopback) but rx_irq=0 (bit 7 clear)
 	uart_control(uart, 0b01100000);
@@ -379,7 +379,7 @@ TEST_CASE("close loopback: S_IRQ not set when rx_irq disabled") {
 
 TEST_CASE("close loopback: rx_read_fast_path clears RDRF immediately") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// tx_irq=0b11 (close loopback) + rx_irq=1
 	uart_control(uart, 0b11100000);
@@ -397,7 +397,7 @@ TEST_CASE("close loopback: rx_read_fast_path clears RDRF immediately") {
 
 TEST_CASE("close loopback: host TX queue is not affected") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart_control(uart, 0b01100000);
 
@@ -414,7 +414,7 @@ TEST_CASE("close loopback: host TX queue is not affected") {
 
 TEST_CASE("queue loopback: TX byte arrives via RX queue") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// divide_select=0b10 (bits 0-1) = queue loopback
 	uart_control(uart, 0b00000010);
@@ -433,7 +433,7 @@ TEST_CASE("queue loopback: TX byte arrives via RX queue") {
 
 TEST_CASE("queue loopback: multiple bytes queue up") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart_control(uart, 0b00000010);
 
@@ -456,7 +456,7 @@ TEST_CASE("queue loopback: multiple bytes queue up") {
 
 TEST_CASE("queue loopback: has_interrupt stages byte with rx_irq") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// divide_select=0b10 (queue loopback) + rx_irq=1 (bit 7)
 	uart_control(uart, 0b10000010);
@@ -470,7 +470,7 @@ TEST_CASE("queue loopback: has_interrupt stages byte with rx_irq") {
 
 TEST_CASE("queue loopback: host TX queue is not affected") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart_control(uart, 0b00000010);
 
@@ -482,7 +482,7 @@ TEST_CASE("queue loopback: host TX queue is not affected") {
 
 TEST_CASE("queue loopback: TDRE stays 1 (bytes go to RX queue, not TX)") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	uart_control(uart, 0b00000010);
 
@@ -497,7 +497,7 @@ TEST_CASE("queue loopback: TDRE stays 1 (bytes go to RX queue, not TX)") {
 
 TEST_CASE("master reset clears loopback state") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// Enable close loopback
 	uart_control(uart, 0b01100000);
@@ -515,7 +515,7 @@ TEST_CASE("master reset clears loopback state") {
 
 TEST_CASE("switching from close to queue loopback") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// Close loopback
 	uart_control(uart, 0b01100000);
@@ -534,7 +534,7 @@ TEST_CASE("switching from close to queue loopback") {
 
 TEST_CASE("close loopback takes priority over queue loopback") {
 	registers::clear();
-	mc6850 uart;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// Both bits set: tx_irq=0b11 + divide_select=0b10
 	uart_control(uart, 0b01100010);

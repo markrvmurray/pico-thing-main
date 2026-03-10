@@ -1,8 +1,0 @@
-Start	EXPORT
-
-	SECTION	TEXT
-
-Start	SYNC
-
-	ENDSECTION
-

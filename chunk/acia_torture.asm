@@ -12,7 +12,7 @@
 ;
 ; Tests:
 ;   1  Polled RX: S_RDRF set on receive, cleared by data read
-;   2  Status read preserves data (reading UARTS doesn't consume char)
+;   2  Status read preserves data (reading ACIAS doesn't consume char)
 ;   3  IRQ fires when C_RX_IRQ enabled and char arrives
 ;   4  IRQ deasserts after data register read (no spurious re-fire)
 ;   5  IRQ latches while CPU I-bit masked, fires on unmask
@@ -26,8 +26,8 @@
 ;
 ; SHARED block layout (visible via Pico 'st' command):
 ;   +0  IRQ_COUNT  (2)  handler invocations
-;   +2  IRQ_STATUS (1)  UARTS seen by handler
-;   +3  IRQ_DATA   (1)  UARTRX read by handler
+;   +2  IRQ_STATUS (1)  ACIAS seen by handler
+;   +3  IRQ_DATA   (1)  ACIARX read by handler
 ;   +4  IRQ_FLAGS  (1)  bit 0 = handler was called
 ;   +5  TEST_NUM   (1)  current test number
 ;   +6  PASS_COUNT (1)  tests passed
@@ -70,9 +70,9 @@ ShrClr	CLR	,X+
 	DECB
 	BNE	ShrClr
 
-	; reset UART, then switch to close loopback for output
+	; reset ACIA, then switch to close loopback for output
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 
 	; install our IRQ handler into the vector chain
 	LDX	#MyIRQ
@@ -80,7 +80,7 @@ ShrClr	CLR	,X+
 
 	; switch to normal mode for banner output (no loopback)
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDX	#Banner
 	LBSR	PPuts
 
@@ -96,14 +96,14 @@ ShrClr	CLR	,X+
 	; enable close loopback with RX IRQ (CPU masked so IRQ doesn't fire)
 	ORCC	#$50
 	LDA	#C_LOOPCLOSE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	; send a byte - staged on next Q-rising edge
 	LDA	#'A'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for it to be staged
 	LBSR	PWaitRx
 	; check S_RDRF is set
-	LDA	UARTS
+	LDA	ACIAS
 	BITA	#S_RDRF
 	BNE	T1A
 	LBSR	PFail
@@ -116,17 +116,17 @@ T1A	; check S_IRQ is also set (RX IRQ enabled + RDRF = IRQ condition)
 	LBSR	PFail
 	LDX	#FailNoSIRQ
 	LBSR	PPuts
-	LDA	UARTRX		; drain
+	LDA	ACIARX		; drain
 	BRA	T1Done
 T1B	; read data register - should clear both S_RDRF and S_IRQ
-	LDA	UARTRX
+	LDA	ACIARX
 	CMPA	#'A'
 	BEQ	T1C
 	LBSR	PFail
 	LDX	#FailData
 	LBSR	PPuts
 	BRA	T1Done
-T1C	LDB	UARTS
+T1C	LDB	ACIAS
 	BITB	#S_RDRF
 	BEQ	T1D
 	LBSR	PFail
@@ -142,22 +142,22 @@ T1D	; check S_IRQ is also clear after data read
 	BRA	T1Done
 T1E	; check S_IRQ is NOT set without RX IRQ enabled
 	LDA	#C_LOOPCLOSE	; no C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	LDA	#'Z'
-	STA	UARTTX
+	STA	ACIATX
 	LBSR	PWaitRx
-	LDA	UARTS
+	LDA	ACIAS
 	BITA	#S_IRQ
 	BEQ	T1Pass
 	LBSR	PFail
 	LDX	#FailSIRQSpur
 	LBSR	PPuts
-	LDA	UARTRX		; drain
+	LDA	ACIARX		; drain
 	BRA	T1Done
-T1Pass	LDA	UARTRX		; drain
+T1Pass	LDA	ACIARX		; drain
 	LBSR	PPass
 T1Done	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 
 ; ---------------------------------------------------------------
 ; Test 2: Status read does not consume data
@@ -169,30 +169,30 @@ T1Done	LDA	#C_RESET
 	LBSR	PPuts
 
 	LDA	#C_LOOPCLOSE
-	STA	UARTC
+	STA	ACIAC
 	LDA	#'B'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for it to be staged
 	LBSR	PWaitRx
 	; read status twice - both should show S_RDRF
-	LDA	UARTS
+	LDA	ACIAS
 	BITA	#S_RDRF
 	BNE	T2A
 	LBSR	PFail
 	LDX	#FailRDRF1
 	LBSR	PPuts
-	LDA	UARTRX		; drain
+	LDA	ACIARX		; drain
 	BRA	T2Done
-T2A	LDA	UARTS		; second status read
+T2A	LDA	ACIAS		; second status read
 	BITA	#S_RDRF
 	BNE	T2B
 	LBSR	PFail
 	LDX	#FailRDRF2
 	LBSR	PPuts
-	LDA	UARTRX		; drain
+	LDA	ACIARX		; drain
 	BRA	T2Done
 T2B	; data should still be 'B'
-	LDA	UARTRX
+	LDA	ACIARX
 	CMPA	#'B'
 	BEQ	T2C
 	LBSR	PFail
@@ -200,7 +200,7 @@ T2B	; data should still be 'B'
 	LBSR	PPuts
 	BRA	T2Done
 T2C	; S_RDRF should now be clear
-	LDB	UARTS
+	LDB	ACIAS
 	BITB	#S_RDRF
 	BEQ	T2Pass
 	LBSR	PFail
@@ -209,7 +209,7 @@ T2C	; S_RDRF should now be clear
 	BRA	T2Done
 T2Pass	LBSR	PPass
 T2Done	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 
 ; ---------------------------------------------------------------
 ; Test 3: IRQ fires on receive
@@ -223,18 +223,18 @@ T2Done	LDA	#C_RESET
 	LBSR	ClrIRQ
 	; enable queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	; unmask CPU IRQ
 	ANDCC	#$EF
 	; send a byte - enters RX queue, staged on next Q edge, fires IRQ
 	LDA	#'C'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for handler to fire
 	LBSR	PWaitIRQ
 	; mask and reset
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; check handler saw S_RDRF
 	LDA	IRQ_STATUS
 	BITA	#S_RDRF
@@ -266,11 +266,11 @@ T3Done
 	LBSR	ClrIRQ
 	; enable queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	ANDCC	#$EF
 	; send one byte
 	LDA	#'D'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for handler
 	LBSR	PWaitIRQ
 	; burn cycles - any spurious re-fire would happen here
@@ -280,7 +280,7 @@ T4Dly	LEAX	-1,X
 	; mask and reset
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; should have exactly 1 IRQ
 	LDD	IRQ_COUNT
 	CMPD	#1
@@ -313,10 +313,10 @@ T4Done
 	ORCC	#$50
 	; enable queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	; send a byte while masked
 	LDA	#'E'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for byte to be staged (poll status, don't read data)
 	LBSR	PWaitRx
 	; handler must NOT have fired (CPU masked)
@@ -355,7 +355,7 @@ T5Got	ORCC	#$50
 	BRA	T5Done
 T5Pass	LBSR	PPass
 T5Done	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 
 ; ---------------------------------------------------------------
 ; Test 6: Back-to-back receive under IRQ (16 chars)
@@ -369,12 +369,12 @@ T5Done	LDA	#C_RESET
 	LBSR	ClrIRQ
 	; enable queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	ANDCC	#$EF
 	; blast 16 bytes into the queue
 	LDB	#16
 	LDA	#$30		; '0', '1', '2' ...
-T6Send	STA	UARTTX
+T6Send	STA	ACIATX
 	INCA
 	DECB
 	BNE	T6Send
@@ -385,7 +385,7 @@ T6Wait	LDD	IRQ_COUNT
 	; mask and reset
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; check count is exactly 16
 	LDD	IRQ_COUNT
 	CMPD	#16
@@ -410,17 +410,17 @@ T6Done
 	LBSR	PPuts
 
 	LDA	#C_LOOPCLOSE
-	STA	UARTC
+	STA	ACIAC
 	; write first byte, wait for it to stage
 	LDA	#'X'
-	STA	UARTTX
+	STA	ACIATX
 	LBSR	PWaitRx
 	; write second byte before reading first (overrun)
 	LDA	#'Y'
-	STA	UARTTX
+	STA	ACIATX
 	LBSR	PWaitRx
 	; read - should get 'Y' (overwritten) on a real ACIA
-	LDA	UARTRX
+	LDA	ACIARX
 	CMPA	#'Y'
 	BEQ	T7Pass
 	CMPA	#'X'
@@ -431,16 +431,16 @@ T6Done
 	BRA	T7Done
 T7First	; got first byte - not standard ACIA overrun behavior but note it
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDX	#T7Note
 	LBSR	PPuts
 	LBSR	PPass
 	BRA	T7Done
 T7Pass	LBSR	PPass
 T7Done	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 
 ; ---------------------------------------------------------------
 ; Test 8: Bulk throughput - 256 bytes through queue loopback
@@ -458,14 +458,14 @@ T7Done	LDA	#C_RESET
 	STX	RxBufPtr
 	; enable queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	ANDCC	#$EF
 	; blast 256 bytes ($00-$FF) into the queue
 	CLRA
-T8Send	LDB	UARTS
+T8Send	LDB	ACIAS
 	BITB	#S_TDRE
 	BEQ	T8Send		; wait for TDRE before each write
-	STA	UARTTX
+	STA	ACIATX
 	INCA
 	BNE	T8Send
 	; wait for all 256 to arrive
@@ -475,7 +475,7 @@ T8Wait	LDD	IRQ_COUNT
 	; mask and reset
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; clear buffer pointer (disables handler buffering)
 	LDD	#0
 	STD	RxBufPtr
@@ -554,14 +554,14 @@ T8Done
 	LBSR	ClrIRQ
 	; reset, then normal mode with RX IRQ enabled
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LDA	#C_RX_IRQ	; normal mode (no loopback), RX IRQ on
-	STA	UARTC
+	STA	ACIAC
 	; drain any stale data
-T9Drain	LDA	UARTS
+T9Drain	LDA	ACIAS
 	BITA	#S_RDRF
 	BEQ	T9Go
-	LDA	UARTRX		; discard
+	LDA	ACIARX		; discard
 	BRA	T9Drain
 T9Go	LBSR	ClrIRQ
 	; unmask CPU IRQ and wait for host keypress
@@ -582,14 +582,14 @@ T9Wait	LDA	IRQ_FLAGS
 	; timeout
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LBSR	PFail
 	LDX	#FailTimeout
 	LBSR	PPuts
 	BRA	T9Done
 T9Got	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; verify S_IRQ was set in handler
 	LDA	IRQ_STATUS
 	BITA	#S_IRQ
@@ -608,7 +608,7 @@ T9A	; verify S_RDRF was set
 	BRA	T9Done
 T9B	; echo the received character
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDA	IRQ_DATA
 	LBSR	POutch
 	LDA	#' '
@@ -630,22 +630,22 @@ T9Done
 
 	; normal mode - send a visible char (should appear on console)
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDA	#'*'
-	STA	UARTTX
-T10W1	LDB	UARTS
+	STA	ACIATX
+T10W1	LDB	ACIAS
 	BITB	#S_TDRE
 	BEQ	T10W1
 	; immediately switch to close loopback
 	ORCC	#$50
 	LDA	#C_LOOPCLOSE
-	STA	UARTC
+	STA	ACIAC
 	; send a byte in loopback - should arrive in RX register
 	LDA	#'!'
-	STA	UARTTX
+	STA	ACIATX
 	LBSR	PWaitRx
 	; read it back
-	LDA	UARTRX
+	LDA	ACIARX
 	CMPA	#'!'
 	BEQ	T10Pass
 	LBSR	PFail
@@ -654,7 +654,7 @@ T10W1	LDB	UARTS
 	BRA	T10Done
 T10Pass	LBSR	PPass
 T10Done	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 
 ; ---------------------------------------------------------------
 ; Test 11: Tight IRQ deassert (PEND_IRQ clearing)
@@ -671,11 +671,11 @@ T10Done	LDA	#C_RESET
 	LBSR	ClrIRQ
 	; enable queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	ANDCC	#$EF
 	; send one byte
 	LDA	#'K'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for handler
 	LBSR	PWaitIRQ
 	; very short delay - just a few NOPs
@@ -686,7 +686,7 @@ T10Done	LDA	#C_RESET
 	; mask and reset
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; should have exactly 1 IRQ - no spurious re-fire from stale PEND_IRQ
 	LDD	IRQ_COUNT
 	CMPD	#1
@@ -726,17 +726,17 @@ T11Done
 	STX	RxBufPtr
 	; normal mode - print a short string to fill the write ring
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDX	#T12Pre
 	LBSR	PPuts
 	; immediately switch to queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	ANDCC	#$EF
 	; blast 24 bytes ($40-$57) - stresses write ring with CONTROL + 24 data
 	LDB	#24
 	LDA	#$40
-T12Send	STA	UARTTX
+T12Send	STA	ACIATX
 	INCA
 	DECB
 	BNE	T12Send
@@ -747,7 +747,7 @@ T12Wait	LDD	IRQ_COUNT
 	; mask and reset
 	ORCC	#$50
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; clear buffer pointer
 	LDD	#0
 	STD	RxBufPtr
@@ -785,7 +785,7 @@ T12Done
 ; ---------------------------------------------------------------
 	; switch back to normal mode for final output
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 
 	LDX	#Summary
 	LBSR	PPuts
@@ -811,7 +811,7 @@ Done	BRA	Done
 ; IRQ handler - called via IRQISR chain (JSR [A,U])
 ; Reads status and data, records in SHARED block
 ; ===============================================================
-MyIRQ	LDA	UARTS
+MyIRQ	LDA	ACIAS
 	STA	IRQ_STATUS
 	BITA	#S_RDRF
 	BEQ	MyIRQX		; not our interrupt
@@ -821,7 +821,7 @@ MyIRQ	LDA	UARTS
 	LDD	IRQ_NOSIRQ	; count missing S_IRQ
 	ADDD	#1
 	STD	IRQ_NOSIRQ
-MyIRQ0	LDA	UARTRX		; read data clears IRQ
+MyIRQ0	LDA	ACIARX		; read data clears IRQ
 	STA	IRQ_DATA
 	LDA	#1
 	STA	IRQ_FLAGS
@@ -852,10 +852,10 @@ ClrIRQ	CLR	IRQ_FLAGS
 
 ; Polled output: send byte in A (works in any ACIA mode since TDRE stays set)
 POutch	PSHS	B
-P@W	LDB	UARTS
+P@W	LDB	ACIAS
 	BITB	#S_TDRE
 	BEQ	P@W
-	STA	UARTTX
+	STA	ACIATX
 	PULS	B,PC
 
 ; Polled puts: print NUL-terminated string at X, LF becomes CR+LF
@@ -880,7 +880,7 @@ PCrlf	PSHS	A
 	PULS	A,PC
 
 ; Poll for S_RDRF (does not read data register)
-PWaitRx	LDA	UARTS
+PWaitRx	LDA	ACIAS
 	BITA	#S_RDRF
 	BEQ	PWaitRx
 	RTS
@@ -895,9 +895,9 @@ PWaitIRQ
 ; Print PASS and increment counter (switches to normal mode for output)
 PPass	PSHS	A,X
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDX	#PassMsg
 	LBSR	PPuts
 	INC	PASS_COUNT
@@ -906,9 +906,9 @@ PPass	PSHS	A,X
 ; Print FAIL and increment counter (switches to normal mode for output)
 PFail	PSHS	A,X
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 	LDX	#FailMsg
 	LBSR	PPuts
 	INC	FAIL_COUNT

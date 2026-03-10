@@ -1,3 +1,4 @@
+#include <cmoc.h>
 #include "pico.h"
 #include "ide_lib.h"
 
@@ -34,10 +35,13 @@ rx_byte(void)
 {
     uint8_t c;
     asm {
-loop@:
         EXTERN INCH
-        lbsr  INCH      ; byte in A, carry set if available
+        EXTERN AUX_PORT
+        pshs  u
+        ldu   #AUX_PORT
+loop@:  lbsr  INCH      ; byte in A, carry set if available
         bcc   loop@
+        puls  u
         sta   :c
     }
     return c;
@@ -49,8 +53,12 @@ tx_byte(uint8_t c)
 {
     asm {
         EXTERN OUTCH
+        EXTERN AUX_PORT
         lda   :c
+        pshs  u
+        ldu   #AUX_PORT
         lbsr  OUTCH
+        puls  u
     }
 }
 
@@ -99,6 +107,9 @@ main(void)
     unsigned i;
 
     initialiseFastSerial();
+    setConsoleOutHook(newOutputRoutine);
+
+    printf("Disk imaging facility starting\n");
 
     /* Ready signal: send_disk.py waits for this before sending frames. */
     tx_byte('R');

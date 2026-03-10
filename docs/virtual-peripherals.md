@@ -16,9 +16,9 @@ There are three execution contexts on Core 1, listed from highest to lowest prio
 | **GPIO ISR** | 1 | E/Q clock edges | Thread mode only |
 | **Thread mode (`for(;;)` loop)** | Lowest | Runs when no ISR active | Nothing |
 
-The GPIO ISR gets ~68% of Core 1 CPU time. The `for(;;)` loop gets ~32%. DMA ISRs preempt everything.
+DMA ISRs preempt everything. The GPIO ISR takes most of Core 1 CPU time; the `for(;;)` loop runs in the remainder. The `irq_dirty` optimization (see §2) allows `has_interrupt()` to return in ~2–4 cycles when no state has changed, keeping `for(;;)` loop overhead minimal.
 
-Core 0 handles console I/O and host-side queue operations (putting bytes into the RX queue, reading bytes from the TX queue). The Pico SDK `queue_t` is thread-safe and cross-core safe.
+Core 0 handles console I/O and host-side queue operations (putting bytes into the RX queue, reading bytes from the TX queue). Queues use a lock-free `SpscQueue` (single-producer single-consumer ring buffer with `std::atomic` head/tail), safe for cross-core use without spinlocks.
 
 ### Interrupt Delivery Pipeline
 
@@ -52,10 +52,14 @@ The DMA write ISR cannot call slow methods (like `guest_control()`) directly. In
 
 ### Register Map
 
-| Offset | Guest Addr | Read | Write |
-|--------|-----------|------|-------|
-| `0x03` | `$FFC3` | Status Register | Control Register |
-| `0x04` | `$FFC4` | RX Data Register | TX Data Register |
+Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Register offsets are passed to the constructor.
+
+| Instance | Offset | Guest Addr | Read | Write |
+|----------|--------|-----------|------|-------|
+| Console  | `0x03` | `$FFC3` | Status Register | Control Register |
+| Console  | `0x04` | `$FFC4` | RX Data Register | TX Data Register |
+| Auxiliary| `0x05` | `$FFC5` | Status Register | Control Register |
+| Auxiliary| `0x06` | `$FFC6` | RX Data Register | TX Data Register |
 
 ### Data Structures
 
@@ -86,9 +90,14 @@ The DMA write ISR cannot call slow methods (like `guest_control()`) directly. In
 - `loopback_queue` — TX→RX queue (full staging pipeline)
 - `tx_write_pending` (volatile) — set by DMA write ISR, cleared by `guest_transmit()`
 
+**Caching state:**
+- `cached_status_byte` — last value written to `reg[CONSOLE_STATUS]` by `sync_status()`. When the recomputed status byte matches, the register write is skipped.
+- `cached_irq_result` — last return value of `has_interrupt()`. Returned immediately when `irq_dirty` is false.
+- `irq_dirty` (volatile) — set by any state-changing method (`write_received()`, `guest_control()`, `guest_transmit()`, `rx_read_fast_path()`, `guest_receive()`, `host_transmit()`, `reset()`). Cleared by `has_interrupt()` after recomputation. When clean, `has_interrupt()` returns `cached_irq_result` in ~2–4 cycles, avoiding ~30–50 cycles of full status recomputation.
+
 **Queues:**
-- `tx` — 256-entry `queue_t`. 6809 writes go in (via `guest_transmit()`), host reads come out (via `host_receive()`). Cross-core safe.
-- `rx` — 256-entry `queue_t`. Host writes go in (via `host_transmit()`), 6809 reads come out (via `guest_receive()`/`has_interrupt()`). Cross-core safe.
+- `tx` — 256-entry lock-free `SpscQueue`. 6809 writes go in (via `guest_transmit()`), host reads come out (via `host_receive()`). Cross-core safe.
+- `rx` — 256-entry lock-free `SpscQueue`. Host writes go in (via `host_transmit()`), 6809 reads come out (via `guest_receive()`/`has_interrupt()`). Cross-core safe.
 
 ### Method Execution Contexts
 
@@ -96,7 +105,6 @@ The DMA write ISR cannot call slow methods (like `guest_control()`) directly. In
 |--------|------------|---------|
 | `write_received()` | DMA write ISR | ISR (priority 0) |
 | `rx_read_fast_path()` | DMA read ISR | ISR (priority 0) |
-| `update_task()` | `for(;;)` loop (on CONSOLE_STATUS read) | Thread mode |
 | `has_interrupt()` | `for(;;)` loop (every Q-rising edge) | Thread mode |
 | `guest_control(val)` | `for(;;)` loop (write ring drain) | Thread mode |
 | `guest_transmit()` | `for(;;)` loop (write ring drain) | Thread mode |
@@ -114,6 +122,8 @@ RDRF = receive_buffer_full
 CTS  = cts_deasserted
 IRQ  = assert_receive_irq || assert_transmit_irq
 ```
+
+**Optimization:** The computed status byte is compared against `cached_status_byte`. If unchanged, the register write is skipped entirely. This is the common case during idle periods.
 
 ### TX Data Flow (6809 → Host)
 
@@ -149,6 +159,15 @@ rx.put(byte) ──→          if !receive_buffer_full && rx.has_bytes():      
 ```
 
 **Two staging paths:** Both `has_interrupt()` and `guest_receive()` can stage a byte from the RX queue into `reg[CONSOLE_RX_DATA]`. Both check `receive_buffer_full` first to avoid double-consuming. `has_interrupt()` runs on every Q-rising edge (proactive); `guest_receive()` runs when `rx_read_count` changes (reactive, triggered by the 6809 actually reading the data register).
+
+### `has_interrupt()` — Fast Path and Dirty Flag
+
+`has_interrupt()` is called on every Q-rising edge. To avoid ~30–50 cycles of full recomputation each time, it uses an `irq_dirty` flag:
+
+1. **Clean path** (`irq_dirty == false`): returns `cached_irq_result` immediately (~2–4 cycles).
+2. **Dirty path** (`irq_dirty == true`): refreshes TX queue state (absorbing the work previously done by the removed `update_task()` method), stages RX bytes if needed, recomputes interrupt conditions, calls `sync_status()`, caches the result, and clears `irq_dirty`.
+
+Every state-changing method sets `irq_dirty = true`. This ensures the next `has_interrupt()` call picks up the change, while all intervening calls on unchanged state return instantly.
 
 **RTS flow control:** When `rts_deasserted=true`, neither `has_interrupt()` nor `guest_receive()` will stage bytes from the RX queue. Bytes accumulate in the queue until the 6809 re-asserts RTS (writes a control register value with `tx_irq != 0b10`).
 
@@ -257,7 +276,7 @@ Called from `peripheral_clear()` during system reset. Disables the timer and cle
 
 ## 4. Interaction Between Devices
 
-Both `fast_serial.has_interrupt()` and `system_tick.has_interrupt()` are called on every Q-rising edge in the `for(;;)` loop. Their return values are OR'd into `pending_interrupts`:
+`fast_serial.has_interrupt()`, `aux_serial.has_interrupt()`, and `system_tick.has_interrupt()` are all called on every Q-rising edge in the `for(;;)` loop. Their return values are OR'd into `pending_interrupts`:
 
 ```cpp
 pending_interrupts =
@@ -266,6 +285,6 @@ pending_interrupts =
     (interrupt_refcount[INTERRUPT_IRQ]  > 0 ? PEND_IRQ  : 0);
 ```
 
-If both devices assert `INTERRUPT_IRQ` simultaneously, the 6809 sees a single `/IRQ` assertion. The ISR must read both device status registers to determine the source.
+If multiple devices assert `INTERRUPT_IRQ` simultaneously, the 6809 sees a single `/IRQ` assertion. The ISR must read each device's status register to determine the source(s).
 
-The `PEND_IRQ` clearing in the DMA read ISR is per-access, not per-device: reading either CONSOLE_RX_DATA or `$FFC9` (tick timer status) clears the shared `PEND_IRQ` flag. The next `for(;;)` loop iteration re-evaluates all devices and re-sets it if any device still has a pending IRQ. This creates a brief `/IRQ` deassert window of up to one `for(;;)` loop iteration.
+`pending_interrupts` is recomputed from scratch each Q-rising edge by calling every device's `has_interrupt()`. DMA read ISRs also clear per-device state eagerly (e.g. `rx_read_fast_path()` clears RDRF and `PEND_IRQ`, `tick_timer::acknowledge()` clears `irq_pending` and `PEND_IRQ`) so the 6809 sees `/IRQ` deassert promptly after acknowledging an interrupt. The next `for(;;)` iteration then recomputes `pending_interrupts` from all sources — if any other device still has an interrupt pending, `/IRQ` stays asserted.

@@ -55,7 +55,8 @@ $0000–$FDBF   Main RAM (1MB, paged via DAT at $FE00)
 $FE00–$FEFF   DAT RAM (256 bytes, 8kB page mapping for NitrOS9)
 $FFC0–$FFFF   Emulated peripheral registers + vectors
   $FFC3–$FFC4   MC6850 UART (CONSOLE)
-  $FFC8–$FFCF   MC6840 Timer (SYSTEM_TIMER)
+  $FFC5–$FFC6   MC6850 UART (AUXILIARY)
+  $FFC8–$FFC9   50 Hz Tick Timer
   $FFD0–$FFDF   Shared data buffer
   $FFE0–$FFEF   Snippet execution area (16-byte programs)
   $FFF0–$FFFF   CPU vectors (RESET, NMI, FIRQ, IRQ, SWI*)
@@ -67,8 +68,8 @@ $FFC0–$FFFF   Emulated peripheral registers + vectors
 |-------|------|----------------|
 | `mc6809` | `mc6809.cpp` | Processor state machine (bus state, run state, LIC counting, interrupt management) |
 | `registers` | `pico_thing.cpp` | 64-byte read/write register arrays; `ReadProxy`/`WriteProxy` handle 6809 big-endian conversion |
-| `mc6850` | `mc6850.cpp` | UART emulation with TX/RX queues; generates IRQ |
-| `mc6840` | `mc6840.cpp` | Three 16-bit timer counters; Timer 1 generates NMI |
+| `mc6850` | `mc6850.cpp` | UART emulation with TX/RX queues; generates IRQ. Two instances: `fast_serial` (console, $FFC3–$FFC4) and `aux_serial` (auxiliary, $FFC5–$FFC6) |
+| `tick_timer` | `tick_timer.cpp` | 50 Hz tick timer; generates IRQ ($FFC8–$FFC9) |
 
 ### Snippet/Chunk System
 

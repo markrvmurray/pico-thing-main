@@ -120,7 +120,8 @@ static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
 static volatile bool core1_initialised = false;
 
-mc6850 fast_serial;
+mc6850 fast_serial(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+mc6850 aux_serial(AUX_CONTROL, AUX_TX_DATA);
 
 // Cached interrupt state — updated by for(;;) loop's has_interrupt() calls,
 // applied to GPIO pins by the Q-rising ISR.  Decouples IRQ delivery from
@@ -132,8 +133,7 @@ static constexpr uint8_t PEND_FIRQ = 1u << 1;
 static constexpr uint8_t PEND_IRQ  = 1u << 2;
 
 // Simple 50 Hz IRQ clock — replaces MC6840.
-static tick_timer system_tick(reg, pending_interrupts, PEND_IRQ,
-                              SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+static tick_timer system_tick(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
 static volatile uint32_t _debug_qrise_count = 0u;
 static volatile uint32_t _debug_irq_assert_count = 0u;
@@ -236,6 +236,8 @@ static volatile uint8_t read_location;
 // A wrapping counter survives any number of overwrites of the shared slot.
 static volatile uint8_t rx_read_count = 0;
 static          uint8_t rx_processed_count = 0;
+static volatile uint8_t aux_rx_read_count = 0;
+static          uint8_t aux_rx_processed_count = 0;
 
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
@@ -259,9 +261,13 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// read sees the change.  guest_receive() will stage the next byte
 			// (if any) and re-set RDRF on the next for(;;) iteration.
 			fast_serial.rx_read_fast_path();
-			// Clear PEND_IRQ so the Q-rising ISR doesn't re-assert /IRQ
-			// from stale state after the 6809 has acknowledged the interrupt.
-			pending_interrupts &= ~PEND_IRQ;
+			// Do NOT clear PEND_IRQ here — the for(;;) loop recomputes it
+			// from all device has_interrupt() calls each Q-rising edge.
+			// Clearing here would briefly deassert /IRQ even if another
+			// device still has a pending interrupt.
+		} else if (loc == AUX_RX_DATA) {
+			aux_rx_read_count++;
+			aux_serial.rx_read_fast_path();
 		} else if (loc == SYSTEM_TIMER_STATUS) {
 			// Reading the timer status register acknowledges the IRQ.
 			system_tick.acknowledge();
@@ -336,6 +342,8 @@ __time_critical_func(dma_bus_write_irq_handler())
 		// routing it through the wrong path (loopback vs normal TX queue).
 		else if (wloc == CONSOLE_TX_DATA)
 			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
+		else if (wloc == AUX_TX_DATA)
+			aux_serial.write_received();
 		else if (wloc == SYSTEM_TIMER_CONTROL_13)
 			system_tick.control(wval);
 		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
@@ -456,8 +464,10 @@ static const char *chunk_string[] = {
 #undef  CHUNK_INITIALISERS_INC
 
 #ifdef DEBUG
-static volatile unsigned UART_CONTROL_COUNT = 0u, UART_TX_DATA_COUNT = 0u;
-static volatile unsigned UART_STATUS_COUNT = 0u, UART_RX_DATA_COUNT = 0u;
+static volatile unsigned ACIA_CONTROL_COUNT = 0u, ACIA_TX_DATA_COUNT = 0u;
+static volatile unsigned ACIA_STATUS_COUNT = 0u, ACIA_RX_DATA_COUNT = 0u;
+static volatile unsigned AUX_ACIA_CONTROL_COUNT = 0u, AUX_ACIA_TX_DATA_COUNT = 0u;
+static volatile unsigned AUX_ACIA_STATUS_COUNT = 0u, AUX_ACIA_RX_DATA_COUNT = 0u;
 #endif
 
 static void
@@ -472,14 +482,19 @@ peripheral_clear(const bool sysvectors)
 			reg[REGISTER_VECTORS_OFFSET + i] = REGISTER_SNIPPET;
 	}
 #ifdef DEBUG
-	UART_CONTROL_COUNT = 0u;
-	UART_TX_DATA_COUNT = 0u;
-	UART_STATUS_COUNT = 0u;
-	UART_RX_DATA_COUNT = 0u;
+	ACIA_CONTROL_COUNT = 0u;
+	ACIA_TX_DATA_COUNT = 0u;
+	ACIA_STATUS_COUNT = 0u;
+	ACIA_RX_DATA_COUNT = 0u;
+	AUX_ACIA_CONTROL_COUNT = 0u;
+	AUX_ACIA_TX_DATA_COUNT = 0u;
+	AUX_ACIA_STATUS_COUNT = 0u;
+	AUX_ACIA_RX_DATA_COUNT = 0u;
 #endif
 
 	// Reset emulated peripherals (as a real !RESET would)
 	fast_serial.reset();
+	aux_serial.reset();
 	system_tick.reset();
 }
 
@@ -703,13 +718,23 @@ process_command(char *buf)
 			printf("Core1 stack: %lu total, %lu free (min), %lu used (max)\n",
 			       stack_total, stack_free, stack_total - stack_free);
 		}
-		printf("Console:\n");
+		printf("Console ACIA:\n");
 		printf("Interrupt status: %02X\n", fast_serial.interrupt_status());
-		printf("UART: TxQueue: %u\n", fast_serial.receive_level());
-		printf("UART: RxQueue: %u\n", fast_serial.transmit_level());
+		printf("TxQueue: %u\n", fast_serial.receive_level());
+		printf("RxQueue: %u\n", fast_serial.transmit_level());
 #ifdef DEBUG
-		printf("UART: Control: %5u\tTx: %5u\n", UART_CONTROL_COUNT, UART_TX_DATA_COUNT);
-		printf("UART: Status:  %5u\tRx: %5u\n", UART_STATUS_COUNT, UART_RX_DATA_COUNT);
+		printf("Register access counts\n");
+		printf("Control: %5u\tTx: %5u\n", ACIA_CONTROL_COUNT, ACIA_TX_DATA_COUNT);
+		printf("Status:  %5u\tRx: %5u\n", ACIA_STATUS_COUNT, ACIA_RX_DATA_COUNT);
+#endif
+		printf("Aux ACIA:\n");
+		printf("Interrupt status: %02X\n", aux_serial.interrupt_status());
+		printf("TxQueue: %u\n", aux_serial.receive_level());
+		printf("RxQueue: %u\n", aux_serial.transmit_level());
+#ifdef DEBUG
+		printf("Register access counts\n");
+		printf("Control: %5u\tTx: %5u\n", AUX_ACIA_CONTROL_COUNT, AUX_ACIA_TX_DATA_COUNT);
+		printf("Status:  %5u\tRx: %5u\n", AUX_ACIA_STATUS_COUNT, AUX_ACIA_RX_DATA_COUNT);
 #endif
 		break;
 	}
@@ -1235,16 +1260,22 @@ process_command(char *buf)
 		break;
 
 	case CMD_USB: {
-		/* Send each space-separated word as a separate USB CDC write */
+		/* Send each space-separated word as a separate USB CDC write.
+		 * Optional port prefix: "usb 2 ..." sends to CDC interface 1. */
 		char args[sizeof(cmd.usb.args)];
 		memcpy(args, cmd.usb.args, sizeof(args));
 		char *ptr = args;
+		uint8_t itf = 0;
+		if (ptr[0] == '2' && (ptr[1] == ' ' || ptr[1] == '\t')) {
+			itf = 1;
+			ptr += 2;
+		}
 		char *word;
 		while ((word = strsep(&ptr, " \t")) != nullptr) {
 			if (*word == '\0')
 				continue;
 			snprintf(reinterpret_cast<char *>(buffer), 64u, "%s\r\n", word);
-			usb_cdc_write(buffer, strlen(reinterpret_cast<char *>(buffer)));
+			usb_cdc_write_n(itf, buffer, strlen(reinterpret_cast<char *>(buffer)));
 		}
 		break;
 	}
@@ -1361,8 +1392,8 @@ poll_console()
 					       _debug_last_write_loc, _debug_last_read_loc);
 					printf("  pending_interrupts=%02X  write_ring: head=%u tail=%u\n",
 					       pending_interrupts, write_ring_head, write_ring_tail);
-					printf("  ACIA: int_status=%02X\n",
-					       fast_serial.interrupt_status());
+					printf("  ACIA: int_status=%02X  Aux: int_status=%02X\n",
+					       fast_serial.interrupt_status(), aux_serial.interrupt_status());
 					printf("  Tick: enabled=%d  irq_pending=%d\n",
 					       (int)system_tick.is_enabled(), (int)system_tick.is_irq_pending());
 					// Stack watermark check
@@ -1455,6 +1486,7 @@ __no_inline_not_in_flash_func(main_core1)()
 	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_CORE1);
 
 	fast_serial.reset();
+	aux_serial.reset();
 	printf("Pico2 MC6809E console initialised/reset\n");
 
 	pio_sm_set_enabled(pio_clock.pio, pio_clock.sm, true);
@@ -1540,6 +1572,9 @@ __no_inline_not_in_flash_func(main_core1)()
 			interrupt_refcount[eirq]++;
 			_debug_loop_phase = 22;
 			eirq = fast_serial.has_interrupt();
+			interrupt_refcount[eirq]++;
+			_debug_loop_phase = 23;
+			eirq = aux_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
 			_debug_loop_phase = 3;
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
@@ -1644,26 +1679,46 @@ __no_inline_not_in_flash_func(main_core1)()
 				// TODO: MarkM - implement finer-grained sysreqs
 				break;
 
-			case CONSOLE_CONTROL: // UART command
+			case CONSOLE_CONTROL: { // ACIA command
 #ifdef DEBUG
-			{
 				mc6850_control cr = {written_byte};
 				if (cr.divide_select == 0b11u) {
-					UART_CONTROL_COUNT = 0u;
-					UART_TX_DATA_COUNT = 0u;
-					UART_STATUS_COUNT = 0u;
-					UART_RX_DATA_COUNT = 0u;
+					ACIA_CONTROL_COUNT = 0u;
+					ACIA_TX_DATA_COUNT = 0u;
+					ACIA_STATUS_COUNT = 0u;
+					ACIA_RX_DATA_COUNT = 0u;
 				}
-				UART_CONTROL_COUNT++;
+				ACIA_CONTROL_COUNT++;
 #endif
 				fast_serial.guest_control(written_byte);
 				break;
 			}
-			case CONSOLE_TX_DATA: // UART tx data
+			case CONSOLE_TX_DATA: // ACIA tx data
 #ifdef DEBUG
-				UART_TX_DATA_COUNT++;
+				ACIA_TX_DATA_COUNT++;
 #endif
 				fast_serial.guest_transmit(written_byte);
+				break;
+
+			case AUX_CONTROL: {
+#ifdef DEBUG
+				mc6850_control cr = {written_byte};
+				if (cr.divide_select == 0b11u) {
+					AUX_ACIA_CONTROL_COUNT = 0u;
+					AUX_ACIA_TX_DATA_COUNT = 0u;
+					AUX_ACIA_STATUS_COUNT = 0u;
+					AUX_ACIA_RX_DATA_COUNT = 0u;
+				}
+				AUX_ACIA_CONTROL_COUNT++;
+#endif
+				aux_serial.guest_control(written_byte);
+				break;
+			}
+			case AUX_TX_DATA:
+#ifdef DEBUG
+				AUX_ACIA_TX_DATA_COUNT++;
+#endif
+				aux_serial.guest_transmit(written_byte);
 				break;
 
 			// Tick timer writes are handled directly in the DMA write ISR.
@@ -1735,10 +1790,17 @@ __no_inline_not_in_flash_func(main_core1)()
 		_debug_loop_phase = 6;
 		while (rx_processed_count != rx_read_count) {
 #ifdef DEBUG
-			UART_RX_DATA_COUNT++;
+			ACIA_RX_DATA_COUNT++;
 #endif
 			fast_serial.guest_receive();
 			rx_processed_count++;
+		}
+		while (aux_rx_processed_count != aux_rx_read_count) {
+#ifdef DEBUG
+			AUX_ACIA_RX_DATA_COUNT++;
+#endif
+			aux_serial.guest_receive();
+			aux_rx_processed_count++;
 		}
 
 		_debug_loop_phase = 7;
@@ -1769,14 +1831,19 @@ __no_inline_not_in_flash_func(main_core1)()
 				// Will be set by the sysreq processor
 				break;
 
-			case CONSOLE_STATUS: // UART status
+			case CONSOLE_STATUS: // ACIA status
 #ifdef DEBUG
-				UART_STATUS_COUNT++;
+				ACIA_STATUS_COUNT++;
 #endif
-				fast_serial.update_task();
 				break;
 
-			// CONSOLE_RX_DATA is handled via rx_read_count above.
+			case AUX_STATUS:
+#ifdef DEBUG
+				AUX_ACIA_STATUS_COUNT++;
+#endif
+				break;
+
+			// CONSOLE_RX_DATA / AUX_RX_DATA handled via rx_read_count above.
 
 			// Tick timer status read is handled directly in the DMA read ISR.
 

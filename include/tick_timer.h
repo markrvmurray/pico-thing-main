@@ -17,8 +17,6 @@ class registers;
 class tick_timer {
 	static constexpr int64_t TICK_PERIOD_US = -20000; // 50 Hz, negative = fixed interval
 	registers &reg;
-	volatile uint8_t &pending_irq_flags;
-	uint8_t pend_irq_bit;
 	uint16_t control_offset;
 	uint16_t status_offset;
 	struct repeating_timer hw_timer{};
@@ -28,8 +26,7 @@ class tick_timer {
 	static bool callback(repeating_timer *rt);
 
 public:
-	tick_timer(registers &r, volatile uint8_t &pending, uint8_t pend_bit,
-	           uint16_t ctrl_off, uint16_t stat_off);
+	tick_timer(registers &r, uint16_t ctrl_off, uint16_t stat_off);
 
 	void start();
 	void control(uint8_t val);

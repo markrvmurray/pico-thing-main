@@ -164,12 +164,17 @@ union high_bus_pins {
 #define SYSTEM_SUBREQUEST	uint16_t(0x02u) // Write-only
 #define SYSTEM_REQUEST_RESPONSE	uint16_t(0x02u) // Read-only
 
-// Emulated UART
-// UART registers relative to REGISTER_DEVICES
+// Emulated UARTs — register offsets relative to REGISTER_DEVICES
+// Primary UART (console)
 #define CONSOLE_CONTROL		uint16_t(0x03u)
 #define CONSOLE_STATUS		uint16_t(0x03u)
 #define CONSOLE_TX_DATA		uint16_t(0x04u)
 #define CONSOLE_RX_DATA		uint16_t(0x04u)
+// Auxiliary UART
+#define AUX_CONTROL		uint16_t(0x05u)
+#define AUX_STATUS		uint16_t(0x05u)
+#define AUX_TX_DATA		uint16_t(0x06u)
+#define AUX_RX_DATA		uint16_t(0x06u)
 
 // Simple 50 Hz tick timer.
 // $FFC8 write: bit 0 = enable/disable.

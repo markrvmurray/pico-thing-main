@@ -7,17 +7,18 @@ VECTORS	EXPORT
 
 ATAIDE	EXPORT
 
-UARTC	EXPORT
-UARTS	EXPORT
-UARTTX	EXPORT
-UARTRX	EXPORT
+ACIAC	EXPORT
+ACIAS	EXPORT
+ACIATX	EXPORT
+ACIARX	EXPORT
 
-PTMC13	EXPORT
-PTMC2	EXPORT
-PTMSTA	EXPORT
-PTMTM1	EXPORT
-PTMTM2	EXPORT
-PTMTM3	EXPORT
+AUXAC	EXPORT
+AUXAS	EXPORT
+AUXATX	EXPORT
+AUXARX	EXPORT
+
+TICKC	EXPORT
+TICKS	EXPORT
 
 Start 	EXTERN
 
@@ -109,17 +110,17 @@ ATAIDE	RMB	16
 	SECTION	PICO2
 
 DEVICE	RMB	3		; Other devices provided by the Pico 2
-UARTC	RMB	0		; These two share an address
-UARTS	RMB	1
-UARTTX	RMB	0		; These two share an address
-UARTRX	RMB	1
-	RMB	3
-PTMC13	RMB	1		; Control registers 1 and 3
-PTMC2	RMB     0		; Control register 2
-PTMSTA	RMB	1		; Read status register
-PTMTM1	RMB	2		; Counter 1
-PTMTM2	RMB	2		; Counter 2
-PTMTM3	RMB	2		; Counter 3
+ACIAC	RMB	0		; These two share an address
+ACIAS	RMB	1
+ACIATX	RMB	0		; These two share an address
+ACIARX	RMB	1
+AUXAC	RMB	0		; Auxiliary ACIA control/status
+AUXAS	RMB	1
+AUXATX	RMB	0		; Auxiliary ACIA data
+AUXARX	RMB	1
+	RMB	1
+TICKC	RMB	1		; Tick timer control
+TICKS	RMB	1		; Tick timer status
 
 SHARED	RMB	16		; Address of a shared buffer for moving bytes
 

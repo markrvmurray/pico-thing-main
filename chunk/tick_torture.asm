@@ -41,10 +41,6 @@
 
 Start	EXPORT
 
-; Tick timer registers (same offsets as old PTM CR13/STA)
-TICK_CTRL	EQU	PTMC13		; $FFC8 write: bit 0 = enable/disable
-TICK_STAT	EQU	PTMSTA		; $FFC9 read: bit 7 = IRQ pending; cleared on read
-
 ; SHARED block layout
 IRQ_COUNT	EQU	SHARED+0	; 2 bytes
 IRQ_STATUS	EQU	SHARED+2	; 1 byte
@@ -81,11 +77,11 @@ ShrClr	CLR	,X+
 	BNE	ShrClr
 
 	; disable tick timer and reset ACIA
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 
 	; install our IRQ handler
 	LDX	#IRQ_DISPATCH
@@ -107,7 +103,7 @@ ShrClr	CLR	,X+
 	LBSR	ClrState
 	; enable tick timer
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	; unmask CPU IRQ
 	ANDCC	#$EF
 	; wait for first tick with timeout
@@ -119,13 +115,13 @@ T1Wait	LDA	IRQ_FLAGS
 	BNE	T1Wait
 	; timeout
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PFail
 	LDX	#FailTimeout
 	LBSR	PPuts
 	BRA	T1Done
 T1Got	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	; verify handler was called
 	LDD	IRQ_COUNT
 	BNE	T1A
@@ -157,27 +153,27 @@ T1Done
 	; keep CPU masked, enable timer
 	ORCC	#$50
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	; poll status until bit 7 set (timer will fire even with CPU masked)
 	LDX	#$0000
-T2Poll	LDA	TICK_STAT	; this READ also clears it!
+T2Poll	LDA	TICKS	; this READ also clears it!
 	BMI	T2Set
 	LEAX	-1,X
 	BNE	T2Poll
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PFail
 	LDX	#FailTimeout
 	LBSR	PPuts
 	BRA	T2Done
 T2Set	; bit 7 was set — the read just cleared it
 	; read again — should be zero now
-	LDA	TICK_STAT
+	LDA	TICKS
 	BMI	T2Fail
 	; pass — status cleared by read
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PPass
 	BRA	T2Done
-T2Fail	CLR	TICK_CTRL
+T2Fail	CLR	TICKC
 	LBSR	PFail
 	LDX	#FailSticky
 	LBSR	PPuts
@@ -195,7 +191,7 @@ T2Done
 
 	LBSR	ClrState
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	ANDCC	#$EF
 	; wait for 5 ticks
 T3W1	LDD	IRQ_COUNT
@@ -203,7 +199,7 @@ T3W1	LDD	IRQ_COUNT
 	BLO	T3W1
 	; disable
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	; save count
 	LDD	IRQ_COUNT
 	STD	SAVED_CNT
@@ -237,16 +233,16 @@ T3Done
 	LBSR	ClrState
 	ORCC	#$50
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	; poll for pending (read clears, so we need a fresh tick)
 	; wait long enough for at least one tick
 	LDX	#$0000
 T4Wait	LEAX	-1,X
 	BNE	T4Wait
 	; now disable — this should clear any pending IRQ
-	CLR	TICK_CTRL
+	CLR	TICKC
 	; read status — should be zero
-	LDA	TICK_STAT
+	LDA	TICKS
 	BMI	T4Fail
 	LBSR	PPass
 	BRA	T4Done
@@ -268,7 +264,7 @@ T4Done
 	LBSR	ClrState
 	ORCC	#$50
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	; wait long enough for tick to pend (~40 ms at 50 Hz)
 	LDX	#$0000
 T5Wait	LEAX	-1,X
@@ -277,7 +273,7 @@ T5Wait	LEAX	-1,X
 	LDA	IRQ_FLAGS
 	BITA	#1
 	BEQ	T5A
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PFail
 	LDX	#FailMasked
 	LBSR	PPuts
@@ -293,13 +289,13 @@ T5W2	LDA	IRQ_FLAGS
 	BNE	T5W2
 	; timeout
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PFail
 	LDX	#FailNoIRQ
 	LBSR	PPuts
 	BRA	T5Done
 T5Got	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PPass
 T5Done
 
@@ -315,7 +311,7 @@ T5Done
 
 	LBSR	ClrState
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	ANDCC	#$EF
 	; burn ~1 second: 2 × 65536 × 8 cycles = 1048576 cycles
 	LDY	#2
@@ -325,7 +321,7 @@ T6Inner	LEAX	-1,X
 	LEAY	-1,Y
 	BNE	T6Outer
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	; check tick count
 	LDD	IRQ_COUNT
 	; print actual count
@@ -360,7 +356,7 @@ T6Done
 
 	LBSR	ClrState
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	ANDCC	#$EF
 	; wait for 3 ticks
 T7W1	LDD	IRQ_COUNT
@@ -368,13 +364,13 @@ T7W1	LDD	IRQ_COUNT
 	BLO	T7W1
 	; disable
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	; save count
 	LDD	IRQ_COUNT
 	STD	SAVED_CNT
 	; re-enable
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	ANDCC	#$EF
 	; wait for 3 more ticks beyond saved count
 	LDD	SAVED_CNT
@@ -384,7 +380,7 @@ T7W2	LDD	IRQ_COUNT
 	CMPD	TARGET_CNT
 	BLO	T7W2
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LBSR	PPass
 T7Done
 
@@ -402,12 +398,12 @@ T7Done
 	ORCC	#$50
 	LDB	#100
 T8Loop	LDA	#$01
-	STA	TICK_CTRL	; enable
+	STA	TICKC	; enable
 	NOP
 	NOP
 	NOP
 	NOP
-	CLR	TICK_CTRL	; disable
+	CLR	TICKC	; disable
 	DECB
 	BNE	T8Loop
 	; save count
@@ -441,14 +437,14 @@ T8Done
 
 	LBSR	ClrState
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	ANDCC	#$EF
 	; wait for 500 ticks
 T9Wait	LDD	IRQ_COUNT
 	CMPD	#500
 	BLO	T9Wait
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	; print actual count
 	LDX	#T9ActStr
 	LBSR	PPuts
@@ -481,15 +477,15 @@ T9Done
 	LBSR	ClrState
 	; enable tick timer
 	LDA	#$01
-	STA	TICK_CTRL
+	STA	TICKC
 	; enable ACIA queue loopback with RX IRQ
 	LDA	#C_LOOPQUEUE|C_RX_IRQ
-	STA	UARTC
+	STA	ACIAC
 	; unmask
 	ANDCC	#$EF
 	; send a byte via loopback
 	LDA	#'Z'
-	STA	UARTTX
+	STA	ACIATX
 	; wait for ACIA handler
 	LDX	#$0000
 T10W1	LDA	ACIA_FLAGS
@@ -499,9 +495,9 @@ T10W1	LDA	ACIA_FLAGS
 	BNE	T10W1
 	; timeout on ACIA
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LBSR	PFail
 	LDX	#FailACIA
 	LBSR	PPuts
@@ -515,18 +511,18 @@ T10W2	LDD	IRQ_COUNT
 	BNE	T10W2
 	; timeout on tick
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	LBSR	PFail
 	LDX	#FailTimeout
 	LBSR	PPuts
 	BRA	T10Done
 T10GotT
 	ORCC	#$50
-	CLR	TICK_CTRL
+	CLR	TICKC
 	LDA	#C_RESET
-	STA	UARTC
+	STA	ACIAC
 	; verify ACIA got 'Z'
 	LDA	ACIA_DATA
 	CMPA	#'Z'
@@ -549,7 +545,7 @@ T10Done
 ; Summary
 ; ---------------------------------------------------------------
 	LDA	#C_NONE
-	STA	UARTC
+	STA	ACIAC
 
 	LDX	#Summary
 	LBSR	PPuts
@@ -576,10 +572,10 @@ Done	BRA	Done
 ; ===============================================================
 IRQ_DISPATCH
 	; check tick timer first
-	LDA	TICK_STAT	; read and acknowledge tick timer
+	LDA	TICKS	; read and acknowledge tick timer
 	BMI	TickIRQ		; bit 7 set = tick fired
 	; check ACIA
-	LDA	UARTS
+	LDA	ACIAS
 	BITA	#S_RDRF
 	BNE	AciaIRQ
 	; spurious
@@ -593,12 +589,12 @@ TickIRQ	; status register already read (and cleared) above
 	ADDD	#1
 	STD	IRQ_COUNT
 	; check if ACIA also needs service (shared IRQ line)
-	LDA	UARTS
+	LDA	ACIAS
 	BITA	#S_RDRF
 	BNE	AciaIRQ
 	RTS
 
-AciaIRQ	LDA	UARTRX		; read data clears ACIA IRQ
+AciaIRQ	LDA	ACIARX		; read data clears ACIA IRQ
 	STA	ACIA_DATA
 	LDA	#1
 	STA	ACIA_FLAGS
@@ -622,10 +618,10 @@ CS@	CLR	,X+
 
 ; Polled output: send byte in A
 POutch	PSHS	B
-P@W	LDB	UARTS
+P@W	LDB	ACIAS
 	BITB	#S_TDRE
 	BEQ	P@W
-	STA	UARTTX
+	STA	ACIATX
 	PULS	B,PC
 
 ; Polled puts: print NUL-terminated string at X, LF becomes CR+LF

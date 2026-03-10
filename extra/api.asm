@@ -19,6 +19,11 @@ UARTS	equ	$FFC3
 UARTTX	equ	$FFC4
 UARTRX	equ	$FFC4
 
+AUXC	equ	$FFC5
+AUXS	equ	$FFC5
+AUXTX	equ	$FFC6
+AUXRX	equ	$FFC6
+
 * Put these in a dedicated file, FFS!
 NUL	equ	$00
 LF	equ	$0A
@@ -214,17 +219,17 @@ B@0	LDB	A,S
 B@1	BRA	B@1
 	RTI
 
-* The test driver will need to copy_out the chunk, set the IRQ vector to ISR5 ($0200),
-* and run the chunk in interactive mode
+* UART_IRQ chunk: sends "Hello, World!" via IRQ-driven TX ring buffer.
+* The test driver copies this to $0130, sets the IRQ vector to ISR5,
+* and runs the chunk in interactive (no-wait) mode.
 	ORG	CHUNK
-	FDB	EUrtIRQ-CHUNK
 UartIRQ	LDS	#$2000
 	CLR	ERRNO
 	CLR	EXITC
-	LDA	#$40
-	STA	,X
+	LDA	#$03
+	STA	UARTC		; master reset
 	ANDCC	#%11101111	; Enable IRQ
-	LDX	HELLO
+	LDX	#HELLO
 u@0	LDA	,X+
 	BEQ	FINISH
 	BSR	OUTCH
@@ -238,13 +243,11 @@ OUTCH	PSHS	B,Y
 	ANDB	#$0F
 o@0	CMPB	POSOUT
 	BEQ	o@0
-	LDY	BUFFER
+	LDY	#BUFFER
 	STA	B,Y
 	STB	POSIN
-	LDB	UARTS
-	ANDB	#%00011111
-	ORB	#%10000000
-	STB	UARTC
+	LDA	#$20
+	STA	UARTC		; tx_irq=0b01 (TX IRQ enabled)
 	PULS	B,Y,PC
 	FCB	$DE,$AD,$C0,$DE
 	FCB	$DE,$AD,$C0,$DE
@@ -260,7 +263,7 @@ BUFFER	ZMB	16
 	FCB	$DE,$AD,$C0,$DE
 ISR5	LDX	#UARTC
 	LDA	,X
-	BITA	#%00010000
+	BITA	#%10000000
 	BEQ	NOTME
 	LDA	POSOUT
 	CMPA	POSIN
@@ -275,9 +278,7 @@ ISR5	LDX	#UARTC
 NOTME	LDA	#$76
 	STA	ERRNO
 	BRA	DONE
-EMPTY	LDA	,X
-	ANDA	#%01111111
-	STA	,x
+EMPTY	CLR	,X		; disable all UART IRQs
 DONE	RTI
 	FCB	$DE,$AD,$C0,$DE
 	FCB	$DE,$AD,$C0,$DE
