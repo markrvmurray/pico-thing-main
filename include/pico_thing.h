@@ -6,7 +6,7 @@
 
 #pragma once
 
-#define DEVICE_VERSION "vX.X.x"
+#define DEVICE_VERSION "v0.1.0"
 
 extern volatile bool verbose;
 

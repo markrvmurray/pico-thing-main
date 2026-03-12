@@ -1341,6 +1341,11 @@ process_command(char *buf)
 	case CMD_NITROS9: {
 		if (!MC6809.assert_stopped())
 			break;
+		snippet_copy(DAT_INIT);
+		if (!MC6809.start_with_timeout(4u)) {
+			printf("DAT_INIT failed — CPU did not respond\n");
+			break;
+		}
 		printf("Loading DBGMON v%u.%u.%u to $FC00\n",
 		       chunk_code[DBGMON][21], chunk_code[DBGMON][22], chunk_code[DBGMON][23]);
 		if (!copy(OUTWARDS, chunk_len[DBGMON], 0xFC00u, chunk_code[DBGMON]))
