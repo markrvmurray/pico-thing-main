@@ -28,7 +28,7 @@ S@1	BNE	S@0
 	LBSR	PUTCRLF
 	LBSR	PUTS
 	LBSR	PUTCRLF
-STOP	BRA	STOP		Loop instead of sysncing to allow queues to flush
+STOP	BRA	STOP		Loop instead of syncing to allow queues to flush
 	endc
 
 	ENDSECTION

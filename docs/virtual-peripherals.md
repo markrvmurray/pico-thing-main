@@ -73,7 +73,7 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 - `rdrf` (bit 0) — Receive Data Register Full
 - `tdre` (bit 1) — Transmit Data Register Empty
 - `dcd` (bit 2) — always 0
-- `cts` (bit 3) — CTS deasserted (TX queue >200/256)
+- `cts` (bit 3) — CTS deasserted (TX queue >800/1024 or USB host buffer full)
 - `fe` (bit 4), `ovrn` (bit 5), `pe` (bit 6) — always 0
 - `irq` (bit 7) — composite: `assert_receive_irq || assert_transmit_irq`
 
@@ -84,7 +84,7 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 - `receive_irq` — RX IRQ enabled (from control register)
 - `assert_transmit_irq` — `transmit_irq && transmit_buffer_empty && !tx_write_pending`
 - `assert_receive_irq` — `receive_irq && receive_buffer_full`
-- `cts_deasserted` — TX queue level > `CTS_THRESHOLD` (200) OR USB host can't accept data
+- `cts_deasserted` — TX queue level > `CTS_THRESHOLD` (800) OR USB host can't accept data
 - `rts_deasserted` — 6809 is signaling its ring buffer is full
 - `host_cts_deasserted` (volatile) — set by Core 0 when USB CDC write returns short (host buffer full)
 - `loopback_close` — TX→RX register directly (no queues)
@@ -97,8 +97,8 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 - `irq_dirty` (volatile) — set by any state-changing method (`write_received()`, `guest_control()`, `guest_transmit()`, `rx_read_fast_path()`, `guest_receive()`, `host_transmit()`, `reset()`). Cleared by `has_interrupt()` after recomputation. When clean, `has_interrupt()` returns `cached_irq_result` in ~2–4 cycles, avoiding ~30–50 cycles of full status recomputation.
 
 **Queues:**
-- `tx` — 256-entry lock-free `SpscQueue`. 6809 writes go in (via `guest_transmit()`), host reads come out (via `host_receive()`). Cross-core safe.
-- `rx` — 256-entry lock-free `SpscQueue`. Host writes go in (via `host_transmit()`), 6809 reads come out (via `guest_receive()`/`has_interrupt()`). Cross-core safe.
+- `tx` — 1024-entry lock-free `SpscQueue`. 6809 writes go in (via `guest_transmit()`), host reads come out (via `host_receive()`). Cross-core safe.
+- `rx` — 1024-entry lock-free `SpscQueue`. Host writes go in (via `host_transmit()`), 6809 reads come out (via `guest_receive()`/`has_interrupt()`). Cross-core safe.
 
 ### Method Execution Contexts
 
@@ -172,7 +172,7 @@ Every state-changing method sets `irq_dirty = true`. This ensures the next `has_
 
 **RTS flow control (6809 → host):** When `rts_deasserted=true`, neither `has_interrupt()` nor `guest_receive()` will stage bytes from the RX queue. Bytes accumulate in the queue until the 6809 re-asserts RTS (writes a control register value with `tx_irq != 0b10`). Core 0's `uart_port_pump()` uses `is_rts_deasserted()` to skip USB CDC reads when the 6809 isn't ready.
 
-**CTS flow control (host → 6809):** CTS deasserts (blocking 6809 TX) when either condition is true: (1) the TX queue level exceeds `CTS_THRESHOLD` (200/256), or (2) the USB host can't accept data (`host_cts_deasserted=true`). Core 0's `uart_port_pump()` calls `set_host_cts(true)` when a USB CDC write returns short (partial write — host buffer full), and `set_host_cts(false)` when the buffer drains. This provides true end-to-end backpressure: the 6809's OUTCH poll stalls on TDRE=0 until the USB host is ready. CTS deasserted also inhibits TX IRQ assertion.
+**CTS flow control (host → 6809):** CTS deasserts (blocking 6809 TX) when either condition is true: (1) the TX queue level exceeds `CTS_THRESHOLD` (800/1024), or (2) the USB host can't accept data (`host_cts_deasserted=true`). Core 0's `uart_port_pump()` calls `set_host_cts(true)` when a USB CDC write returns short (partial write — host buffer full), and `set_host_cts(false)` when the buffer drains. This provides true end-to-end backpressure: the 6809's OUTCH poll stalls on TDRE=0 until the USB host is ready. CTS deasserted also inhibits TX IRQ assertion.
 
 ### `rx_read_fast_path()` and PEND_IRQ Clearing
 

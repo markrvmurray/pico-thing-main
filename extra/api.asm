@@ -24,7 +24,7 @@ AUXS	equ	$FFC5
 AUXTX	equ	$FFC6
 AUXRX	equ	$FFC6
 
-* Put these in a dedicated file, FFS!
+* Put these in a dedicated file!
 NUL	equ	$00
 LF	equ	$0A
 CR	equ	$0D
