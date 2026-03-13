@@ -183,6 +183,9 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 			}
 		}
+		// E-cycle countdown NMI timer
+		if (system_tick.tick())
+			pending_interrupts |= PEND_NMI;
 		// Assert/deassert all interrupt pins from cached pending state.
 		// NMI is edge-triggered (one-shot): assert once and clear flag.
 		// IRQ/FIRQ are level-triggered: assert when pending, deassert
@@ -738,6 +741,28 @@ process_command(char *buf)
 		printf("Control: %5u\tTx: %5u\n", AUX_ACIA_CONTROL_COUNT, AUX_ACIA_TX_DATA_COUNT);
 		printf("Status:  %5u\tRx: %5u\n", AUX_ACIA_STATUS_COUNT, AUX_ACIA_RX_DATA_COUNT);
 #endif
+		{
+			extern volatile uint32_t _dbg_aux_pump_calls;
+			extern volatile uint32_t _dbg_aux_usb_read, _dbg_aux_usb_read_bytes;
+			extern volatile uint32_t _dbg_aux_rx_pushed;
+			extern volatile uint32_t _dbg_aux_tx_drained;
+			extern volatile uint32_t _dbg_aux_usb_write, _dbg_aux_usb_write_bytes;
+			extern volatile uint32_t _dbg_aux_usb_write_zero;
+			extern volatile uint32_t _dbg_aux_cts_set;
+			extern volatile uint16_t _dbg_aux_tx_qlevel, _dbg_aux_rx_qlevel;
+			extern volatile bool     _dbg_aux_host_cts;
+			printf("Aux pump debug:\n");
+			printf("  pump_calls:  %lu\n", _dbg_aux_pump_calls);
+			printf("  usb_read:    %lu calls, %lu bytes\n", _dbg_aux_usb_read, _dbg_aux_usb_read_bytes);
+			printf("  rx_pushed:   %lu bytes\n", _dbg_aux_rx_pushed);
+			printf("  tx_drained:  %lu bytes from queue\n", _dbg_aux_tx_drained);
+			printf("  usb_write:   %lu calls, %lu bytes, %lu zero-ret\n",
+			       _dbg_aux_usb_write, _dbg_aux_usb_write_bytes, _dbg_aux_usb_write_zero);
+			printf("  cts_set:     %lu  host_cts: %s\n",
+			       _dbg_aux_cts_set, _dbg_aux_host_cts ? "DEASSERTED" : "ok");
+			printf("  tx_qlevel:   %u  rx_qlevel: %u\n",
+			       _dbg_aux_tx_qlevel, _dbg_aux_rx_qlevel);
+		}
 		break;
 	}
 
@@ -949,10 +974,16 @@ process_command(char *buf)
 	}
 
 	case CMD_GO:
+		fast_serial.reset();
+		aux_serial.reset();
+		system_tick.reset();
 		MC6809.start();
 		break;
 
 	case CMD_GO_ADDR:
+		fast_serial.reset();
+		aux_serial.reset();
+		system_tick.reset();
 		reg[REGISTER_VECTOR_RESET_OFFSET] = cmd.go.address;
 		MC6809.start();
 		break;
@@ -1279,6 +1310,7 @@ process_command(char *buf)
 			snprintf(reinterpret_cast<char *>(buffer), 64u, "%s\r\n", word);
 			usb_cdc_write_n(itf, buffer, strlen(reinterpret_cast<char *>(buffer)));
 		}
+		usb_cdc_flush_n(itf);
 		break;
 	}
 
@@ -1292,8 +1324,8 @@ process_command(char *buf)
 			printf("Invalid S record\n");
 			break;
 		}
-		// S0 resets the ignore flag (start of a new S-record stream)
-		if (line[1] == '0')
+		// S0 and S9 reset the ignore flag (stream boundaries)
+		if (line[1] == '0' || line[1] == '9')
 			srecord_ignore = false;
 		if (srecord_ignore) {
 			printf("%s IGNORED\n", line);
@@ -1341,19 +1373,23 @@ process_command(char *buf)
 	case CMD_NITROS9: {
 		if (!MC6809.assert_stopped())
 			break;
+		if (verbose)
+			printf("Initialising DAT\n");
 		snippet_copy(DAT_INIT);
 		if (!MC6809.start_with_timeout(4u)) {
 			printf("DAT_INIT failed — CPU did not respond\n");
 			break;
 		}
-		printf("Loading DBGMON v%u.%u.%u to $FC00\n",
-		       chunk_code[DBGMON][21], chunk_code[DBGMON][22], chunk_code[DBGMON][23]);
+		if (verbose)
+			printf("Loading DBGMON v%u.%u.%u to $FC00\n",
+			       chunk_code[DBGMON][21], chunk_code[DBGMON][22], chunk_code[DBGMON][23]);
 		if (!copy(OUTWARDS, chunk_len[DBGMON], 0xFC00u, chunk_code[DBGMON]))
 			break;
 		/* Set illegal-opcode vector ($FFF0-$FFF1) to JT.IlOp ($FC12) */
 		reg[REGISTER_VECTOR_RESERVED_OFFSET] = static_cast<uint16_t>(0xFC12u);
-		printf("Loading NITROS9 v%u.%u.%u to $0130\n",
-		       chunk_code[NITROS9][3], chunk_code[NITROS9][4], chunk_code[NITROS9][5]);
+		if (verbose)
+			printf("Loading NITROS9 v%u.%u.%u to $0130\n",
+			       chunk_code[NITROS9][3], chunk_code[NITROS9][4], chunk_code[NITROS9][5]);
 		if (!copy(OUTWARDS, chunk_len[NITROS9], 0x0130u, chunk_code[NITROS9]))
 			break;
 		/* Set boot device byte at $0132 (0 = IDE, 1 = DriveWire) */

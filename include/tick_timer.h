@@ -22,6 +22,7 @@ class tick_timer {
 	struct repeating_timer hw_timer{};
 	volatile bool irq_pending = false;
 	volatile bool enabled = false;
+	volatile uint8_t nmi_countdown = 0;
 
 	static bool callback(repeating_timer *rt);
 
@@ -35,6 +36,11 @@ public:
 	[[nodiscard]] interrupt has_interrupt() const;
 	[[nodiscard]] bool is_enabled() const { return enabled; }
 	[[nodiscard]] bool is_irq_pending() const { return irq_pending; }
+	[[nodiscard]] uint8_t get_nmi_countdown() const { return nmi_countdown; }
+
+	// Called once per E-cycle (Q-rising ISR).  Returns true when the
+	// NMI countdown expires, signalling the caller to set PEND_NMI.
+	bool tick();
 
 	// Simulate a hardware timer fire (calls the SDK callback path).
 	// Used by unit tests; in production the SDK alarm calls callback() directly.

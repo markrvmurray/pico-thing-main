@@ -33,7 +33,7 @@ STOP	BRA	STOP		Loop instead of sysncing to allow queues to flush
 
 	ENDSECTION
 
-	SECTION	BSS
+	SECTION	bss
 
 BUFFER	RMB	256
 

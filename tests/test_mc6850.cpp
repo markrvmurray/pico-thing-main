@@ -532,6 +532,202 @@ TEST_CASE("switching from close to queue loopback") {
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'Q');
 }
 
+// -----------------------------------------------------------------------
+// Host CTS (USB backpressure) flow control
+// -----------------------------------------------------------------------
+
+TEST_CASE("set_host_cts(true) masks TDRE even when queue is empty") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	REQUIRE(status().tdre == 1);
+
+	uart.set_host_cts(true);
+	(void)uart.has_interrupt();
+
+	CHECK(status().tdre == 0);
+	CHECK(status().cts  == 1);
+}
+
+TEST_CASE("set_host_cts(false) restores TDRE") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	uart.set_host_cts(true);
+	(void)uart.has_interrupt();
+	REQUIRE(status().tdre == 0);
+
+	uart.set_host_cts(false);
+	(void)uart.has_interrupt();
+
+	CHECK(status().tdre == 1);
+	CHECK(status().cts  == 0);
+}
+
+TEST_CASE("host CTS + queue CTS: both must clear for TDRE=1") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Fill queue past threshold
+	for (int i = 0; i < 201; i++)
+		uart_write(uart, static_cast<uint8_t>(i));
+	REQUIRE(status().tdre == 0);
+
+	// Also set host CTS
+	uart.set_host_cts(true);
+
+	// Drain queue below threshold — host CTS still blocks
+	for (int i = 0; i < 3; i++)
+		uart.host_receive();
+	(void)uart.has_interrupt();
+	CHECK(status().tdre == 0);
+	CHECK(status().cts  == 1);
+
+	// Clear host CTS — now TDRE should restore
+	uart.set_host_cts(false);
+	(void)uart.has_interrupt();
+	CHECK(status().tdre == 1);
+	CHECK(status().cts  == 0);
+}
+
+TEST_CASE("reset() clears host CTS") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	uart.set_host_cts(true);
+	(void)uart.has_interrupt();
+	REQUIRE(status().cts == 1);
+
+	// Master reset (divide_select=0b11)
+	uart_control(uart, 0x03u);
+
+	CHECK(status().tdre == 1);
+	CHECK(status().cts  == 0);
+}
+
+TEST_CASE("is_rts_deasserted() returns correct state") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Default: RTS asserted
+	CHECK_FALSE(uart.is_rts_deasserted());
+
+	// tx_irq=0b10 (bits 5-6) → RTS deasserted
+	uart_control(uart, 0b01000000);
+	CHECK(uart.is_rts_deasserted());
+
+	// tx_irq=0b01 (bits 5-6) → RTS asserted
+	uart_control(uart, 0b00100000);
+	CHECK_FALSE(uart.is_rts_deasserted());
+
+	// tx_irq=0b11 (bits 5-6) → close loopback, RTS NOT deasserted
+	uart_control(uart, 0b01100000);
+	CHECK_FALSE(uart.is_rts_deasserted());
+}
+
+TEST_CASE("host CTS does not affect TX IRQ assertion") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Enable TX IRQ (tx_irq=0b01)
+	uart_control(uart, 0b00100000);
+	REQUIRE(uart.has_interrupt() == INTERRUPT_IRQ);
+
+	// Set host CTS — TDRE masked, TX IRQ should NOT fire
+	uart.set_host_cts(true);
+	CHECK(uart.has_interrupt() == INTERRUPT_NONE);
+
+	// Clear host CTS — TX IRQ fires again
+	uart.set_host_cts(false);
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
+}
+
+// -----------------------------------------------------------------------
+// Loopback mode transitions
+// -----------------------------------------------------------------------
+
+TEST_CASE("SpscQueue reset drains all queued bytes") {
+	SpscQueue q;
+	for (int i = 0; i < 100; i++)
+		q.put(static_cast<uint8_t>(i));
+	CHECK(q.get_level() == 100);
+	q.reset();
+	CHECK(q.is_empty());
+	CHECK(q.get_level() == 0);
+	CHECK(q.has_space());
+}
+
+TEST_CASE("mc6850 reset flushes TX queue") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Fill some bytes into TX queue
+	for (int i = 0; i < 50; i++)
+		uart_write(uart, static_cast<uint8_t>(i));
+	CHECK(uart.host_receive_avail());
+
+	// Master reset (divide_select=0b11)
+	uart_control(uart, 0x03);
+
+	// TX queue should be drained
+	CHECK_FALSE(uart.host_receive_avail());
+}
+
+TEST_CASE("mc6850 reset flushes RX queue") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Host pushes bytes into RX queue
+	for (int i = 0; i < 50; i++)
+		uart.host_transmit(static_cast<uint8_t>(i));
+
+	// Master reset
+	uart_control(uart, 0x03);
+
+	// RX queue should be drained — guest_receive stages nothing
+	uart.guest_receive();
+	CHECK(status().rdrf == 0);
+}
+
+TEST_CASE("mc6850 reset clears stale IRQ from previous run") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Enable TX IRQ (tx_irq=0b01 → bits 5-6 = 0b01 → byte 0x20 with divide_select=0b00)
+	uart_control(uart, 0b00100000);
+	// TX IRQ should be asserted (TDRE=1, tx_irq=true)
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
+
+	// Master reset
+	uart_control(uart, 0x03);
+
+	// IRQ should be gone
+	CHECK(uart.has_interrupt() == INTERRUPT_NONE);
+	CHECK(status().irq == 0);
+}
+
+TEST_CASE("host_transmit_level_avail returns 0 when RX queue is full") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Fill the RX queue to capacity (255 usable slots in 256-element ring buffer)
+	for (int i = 0; i < CONSOLE_QUEUE_LEN - 1; i++) {
+		CHECK(uart.host_transmit_level_avail() > 0);
+		uart.host_transmit(static_cast<uint8_t>(i));
+	}
+
+	// Queue is now full — must report 0 available
+	CHECK(uart.host_transmit_level_avail() == 0);
+
+	// Drain one byte: has_interrupt() stages it, rx_read_fast_path() acks the read
+	uart.has_interrupt();
+	CHECK(status().rdrf == 1);
+	uart.rx_read_fast_path();
+
+	// Should have space again (has_interrupt consumed 1 from queue)
+	CHECK(uart.host_transmit_level_avail() == 1);
+}
+
 TEST_CASE("close loopback takes priority over queue loopback") {
 	registers::clear();
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);

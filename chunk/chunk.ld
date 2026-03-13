@@ -4,7 +4,7 @@ define lensympat length_%s
 section TEXT load 0130
 section CONSTANT
 section BSSTART
-section BSS
+section bss
 section BSSEND
 section SYSVECTORS load FD00
 section DAT_RAM load FE00

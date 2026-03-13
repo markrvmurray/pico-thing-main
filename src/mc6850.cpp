@@ -46,10 +46,11 @@ mc6850::reset()
 	rts_deasserted = false;
 	loopback_close = false;
 	loopback_queue = false;
+	host_cts_deasserted = false;
 	tx_write_pending = false;
 	irq_dirty = true;
-	//tx.reset();
-	//rx.reset();
+	tx.reset();
+	rx.reset();
 	reg[ctl_offset] = reset_status.byte;
 	cached_status_byte = reset_status.byte;
 }
@@ -78,7 +79,7 @@ inline void
 mc6850::sync_transmit()
 {
 	transmit_buffer_empty = tx.has_space();
-	cts_deasserted = tx.get_level() > CTS_THRESHOLD;
+	cts_deasserted = (tx.get_level() > CTS_THRESHOLD) || host_cts_deasserted;
 	sync_status();
 }
 
@@ -93,6 +94,15 @@ mc6850::write_received()
 	tx_write_pending = true;
 	irq_dirty = true;
 	sync_status();
+}
+
+void
+mc6850::set_host_cts(bool deasserted)
+{
+	if (host_cts_deasserted != deasserted) {
+		host_cts_deasserted = deasserted;
+		irq_dirty = true;
+	}
 }
 
 void
@@ -186,7 +196,7 @@ mc6850::has_interrupt()
 
 	// Absorb TX queue state refresh (formerly update_task/sync_transmit).
 	transmit_buffer_empty = tx.has_space();
-	cts_deasserted = tx.get_level() > CTS_THRESHOLD;
+	cts_deasserted = (tx.get_level() > CTS_THRESHOLD) || host_cts_deasserted;
 
 	// Stage the next byte if the slot is empty. Called every Q-rising edge,
 	// so RDRF is current before apply_interrupts() drives /IRQ. There is an
@@ -198,7 +208,7 @@ mc6850::has_interrupt()
 		reg[data_offset] = rx.get();
 	}
 	assert_receive_irq = receive_irq && receive_buffer_full;
-	assert_transmit_irq = transmit_irq && transmit_buffer_empty && !tx_write_pending;
+	assert_transmit_irq = transmit_irq && transmit_buffer_empty && !tx_write_pending && !cts_deasserted;
 	sync_status();
 	cached_irq_result = (assert_transmit_irq || assert_receive_irq)
 		? INTERRUPT_IRQ : INTERRUPT_NONE;

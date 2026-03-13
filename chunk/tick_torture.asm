@@ -790,7 +790,7 @@ SomeFail	FCC	"*** FAILURES DETECTED ***\n"
 ; BSS
 ; ===============================================================
 
-	SECTION	BSS
+	SECTION	bss
 
 SAVED_CNT	RMB	2
 TARGET_CNT	RMB	2

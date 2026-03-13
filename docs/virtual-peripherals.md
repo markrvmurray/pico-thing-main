@@ -84,8 +84,9 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 - `receive_irq` — RX IRQ enabled (from control register)
 - `assert_transmit_irq` — `transmit_irq && transmit_buffer_empty && !tx_write_pending`
 - `assert_receive_irq` — `receive_irq && receive_buffer_full`
-- `cts_deasserted` — TX queue level > `CTS_THRESHOLD` (200)
+- `cts_deasserted` — TX queue level > `CTS_THRESHOLD` (200) OR USB host can't accept data
 - `rts_deasserted` — 6809 is signaling its ring buffer is full
+- `host_cts_deasserted` (volatile) — set by Core 0 when USB CDC write returns short (host buffer full)
 - `loopback_close` — TX→RX register directly (no queues)
 - `loopback_queue` — TX→RX queue (full staging pipeline)
 - `tx_write_pending` (volatile) — set by DMA write ISR, cleared by `guest_transmit()`
@@ -169,7 +170,9 @@ rx.put(byte) ──→          if !receive_buffer_full && rx.has_bytes():      
 
 Every state-changing method sets `irq_dirty = true`. This ensures the next `has_interrupt()` call picks up the change, while all intervening calls on unchanged state return instantly.
 
-**RTS flow control:** When `rts_deasserted=true`, neither `has_interrupt()` nor `guest_receive()` will stage bytes from the RX queue. Bytes accumulate in the queue until the 6809 re-asserts RTS (writes a control register value with `tx_irq != 0b10`).
+**RTS flow control (6809 → host):** When `rts_deasserted=true`, neither `has_interrupt()` nor `guest_receive()` will stage bytes from the RX queue. Bytes accumulate in the queue until the 6809 re-asserts RTS (writes a control register value with `tx_irq != 0b10`). Core 0's `uart_port_pump()` uses `is_rts_deasserted()` to skip USB CDC reads when the 6809 isn't ready.
+
+**CTS flow control (host → 6809):** CTS deasserts (blocking 6809 TX) when either condition is true: (1) the TX queue level exceeds `CTS_THRESHOLD` (200/256), or (2) the USB host can't accept data (`host_cts_deasserted=true`). Core 0's `uart_port_pump()` calls `set_host_cts(true)` when a USB CDC write returns short (partial write — host buffer full), and `set_host_cts(false)` when the buffer drains. This provides true end-to-end backpressure: the 6809's OUTCH poll stalls on TDRE=0 until the USB host is ready. CTS deasserted also inhibits TX IRQ assertion.
 
 ### `rx_read_fast_path()` and PEND_IRQ Clearing
 
@@ -206,16 +209,29 @@ A minimal 50 Hz tick timer using the Pico SDK's hardware timer alarm, implemente
 
 | Offset | Guest Addr | Read | Write |
 |--------|-----------|------|-------|
-| `0x08` | `$FFC8` | — | Control (bit 0: enable/disable) |
+| `0x08` | `$FFC8` | — | Control (bit 0: IRQ enable; bits 5–1: NMI countdown) |
 | `0x09` | `$FFC9` | Status (bit 7: IRQ pending; cleared on read) | — |
 
 Two registers, down from eight. All other offsets in the `$FFC8–$FFCF` range are unused.
+
+#### Control Register Bit Layout
+
+```
+  7   6   5   4   3   2   1   0
+┌───┬───┬───┬───┬───┬───┬───┬───┐
+│ — │ — │      NMI countdown    │IRQ│
+│   │   │     (5 bits, 0–31)    │en │
+└───┴───┴───┴───┴───┴───┴───┴───┘
+```
+
+- **Bit 0**: 50 Hz IRQ enable/disable (existing behaviour)
+- **Bits 5–1**: NMI countdown value (1–31). Writing a non-zero value arms a cycle-accurate countdown timer that decrements once per E-cycle. When it reaches zero, NMI is asserted (edge-triggered, one-shot). Writing 0 in these bits does not arm the countdown. The countdown is independent of the 50 Hz IRQ enable bit.
 
 ### Source Files
 
 - `src/tick_timer.cpp` — implementation
 - `include/tick_timer.h` — class definition
-- `tests/test_tick_timer.cpp` — unit tests (16 cases, 54 assertions)
+- `tests/test_tick_timer.cpp` — unit tests (23 cases, 116 assertions)
 
 ### Implementation
 
@@ -242,7 +258,7 @@ Runs on an SDK timer alarm IRQ (Core 1, separate from the GPIO and DMA ISRs). If
 
 ### `control(val)` — `$FFC8` write
 
-Called from the DMA write ISR. Bit 0 enables (1) or disables (0) the timer. Disabling immediately clears any pending IRQ and the status register.
+Called from the DMA write ISR. Bit 0 enables (1) or disables (0) the 50 Hz IRQ timer. Disabling immediately clears any pending IRQ and the status register. Bits 5–1 are extracted as a 5-bit NMI countdown value (0–31). If non-zero, the countdown is armed; see below.
 
 ### `acknowledge()` — `$FFC9` read
 
@@ -252,9 +268,13 @@ Called from the DMA read ISR when the 6809 reads `$FFC9`. Clears `irq_pending`, 
 
 Called from the `for(;;)` loop alongside `fast_serial.has_interrupt()`. Returns `INTERRUPT_IRQ` if `irq_pending` is set, `INTERRUPT_NONE` otherwise. If pending, contributes to `pending_interrupts`, and the GPIO ISR asserts `/IRQ` on the next Q-rising edge.
 
+### `tick()` — E-cycle Countdown (Q-rising ISR)
+
+Called once per E-cycle from the Q-rising GPIO ISR. If `nmi_countdown > 0`, decrements it. Returns `true` when the countdown reaches zero, signalling the ISR to set `PEND_NMI`. The ISR then asserts `/NMI` on the same Q-rising edge (edge-triggered, one-shot). Returns `false` at all other times (including when no countdown is armed).
+
 ### `reset()` — System Reset
 
-Called from `peripheral_clear()` during system reset. Disables the timer and clears all state. The hardware alarm continues running (harmless — the callback checks `enabled`).
+Called from `peripheral_clear()` during system reset. Disables the timer, clears the NMI countdown, and clears all state. The hardware alarm continues running (harmless — the callback checks `enabled`).
 
 ### 6809-Side Usage (NitrOS-9 Clock Module)
 
@@ -270,6 +290,14 @@ Called from `peripheral_clear()` during system reset. Disables the timer and cle
 
 ; Disable the tick timer
     CLR  $FFC8
+
+; Arm NMI countdown (fire NMI after 10 E-cycles)
+    LDA  #(10<<1)     ; bits 5-1 = 10, bit 0 = 0 (IRQ stays disabled)
+    STA  $FFC8         ; NMI fires 10 E-cycles later
+
+; Arm NMI countdown with IRQ enabled simultaneously
+    LDA  #((10<<1)|1)  ; countdown=10, IRQ enable=1
+    STA  $FFC8
 ```
 
 ---

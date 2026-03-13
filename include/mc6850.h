@@ -46,6 +46,11 @@ public:
 		buf[h] = ch;
 		head.store((h + 1) & MASK, std::memory_order_release);
 	}
+	void reset()
+	{
+		head.store(0, std::memory_order_release);
+		tail.store(0, std::memory_order_release);
+	}
 };
 
 union mc6850_control {
@@ -94,13 +99,14 @@ class mc6850 {
 	bool loopback_queue = false;	// divide_select==0b10 (÷64): TX→RX queue
 	volatile bool tx_write_pending = false;	// set by write ISR, cleared by guest_transmit()
 	volatile bool irq_dirty = true;		// set by any state change, cleared by has_interrupt()
+	volatile bool host_cts_deasserted = false;  // set by Core 0 when USB host can't accept data
 	void sync_status();
 	void sync_transmit();
 public:
 	mc6850(uint16_t ctl_off, uint16_t data_off);
 	void reset();
 	void write_received();		// called from Core 1 write ISR: clears TDRE until guest_transmit() runs
-	uint host_transmit_level_avail() { return CONSOLE_QUEUE_LEN - rx.get_level(); }
+	uint host_transmit_level_avail() { return (CONSOLE_QUEUE_LEN - 1) - rx.get_level(); }
 	uint transmit_level() { return rx.get_level(); }
 	uint host_receive_level_avail() { return tx.get_level(); }
 	uint receive_level() { return tx.get_level(); }
@@ -123,6 +129,8 @@ public:
 	void guest_control(uint8_t val);
 	void rx_read_fast_path();	// called from read ISR: clears RDRF immediately
 	[[nodiscard]] interrupt has_interrupt();
+	[[nodiscard]] bool is_rts_deasserted() const { return rts_deasserted; }
+	void set_host_cts(bool deasserted);
 	[[nodiscard]] uint16_t get_ctl_offset() const { return ctl_offset; }
 	[[nodiscard]] uint16_t get_data_offset() const { return data_offset; }
 };

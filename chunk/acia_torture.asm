@@ -1054,7 +1054,7 @@ SomeFail	FCC	"*** FAILURES DETECTED ***\n"
 ; BSS - receive buffer for test 8
 ; ===============================================================
 
-	SECTION	BSS
+	SECTION	bss
 
 RxBufPtr	RMB	2		; pointer into RxBuf (0 = buffering disabled)
 RxBuf		RMB	256		; 256-byte receive buffer

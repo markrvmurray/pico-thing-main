@@ -1,3 +1,15 @@
+# I/O mode: irq (interrupt-driven, default) or poll (polled).
+#   make IO=poll hello.srec    — build hello with polled I/O
+#   make IO=irq  dl.s19        — build dl with IRQ-driven I/O (default)
+IO ?= poll
+ifeq ($(IO),poll)
+IO_OBJ := io_noirq.obj
+else ifeq ($(IO),irq)
+IO_OBJ := io.obj
+else
+$(error IO must be 'irq' or 'poll')
+endif
+
 # Path to the cmoc standard library (derived from the cmoc binary location).
 CMOC_LIBDIR := $(patsubst %/bin/cmoc,%/share/cmoc/lib,$(shell which cmoc))
 # Libraries required by all cmoc-compiled programs.
@@ -9,27 +21,36 @@ CMOC_FLAGS  := --void-target --org=0x0130 --initial-s=0xf000 --mc6839
 # Common .inc dependencies for assembly sources that USE them.
 INCS := ascii.inc uart.inc syslib.inc
 
-all: assist09.s19 assist09.bin \
-     get.s19 get.bin put.s19 put.bin loop.s19 loop.bin \
+# Set ASSIST09=1 to include assist09 in the default build.
+#   make ASSIST09=1
+ASSIST09_TARGETS-1 := assist09.s19 assist09.bin
+ASSIST09_TARGETS := $(ASSIST09_TARGETS-$(ASSIST09))
+
+all: $(ASSIST09_TARGETS) \
+     get.s19 get.bin put.s19 put.bin loop.s19 loop.bin dl.s19 dl.bin \
      test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin \
      test_send.s19 test_send.bin \
      acia_torture.s19 acia_torture.bin tick_torture.s19 tick_torture.bin \
      hello.srec hello.raw disk_test.srec disk_test.raw \
-     diskload.srec diskload.raw dat_torture.srec dat_torture.raw
+     diskload.srec diskload.raw dat_torture.srec dat_torture.raw \
+     stress_acia.srec stress_acia.raw
 
 # -----------------------------------------------------------------------
-# Libraries
+# Libraries (IO_OBJ is io.obj or io_noirq.obj depending on IO= setting)
 # -----------------------------------------------------------------------
 
-# ASM runtime library (IRQ-driven I/O).
-CHUNK_LIB_OBJS := io.obj bss.obj syslib.obj putdec.obj puthex.obj
+# ASM runtime library.
+CHUNK_LIB_OBJS := $(IO_OBJ) bss.obj syslib.obj putdec.obj puthex.obj
 libchunk.a: $(CHUNK_LIB_OBJS)
 	lwar -c $@ $^
 
-# C runtime library (polling I/O).
-CCHUNK_LIB_OBJS := io_noirq.obj syslib.obj cstart.obj
+# C runtime library.
+CCHUNK_LIB_OBJS := $(IO_OBJ) syslib.obj cstart.obj
 libcchunk.a: $(CCHUNK_LIB_OBJS)
 	lwar -c $@ $^
+
+# Force library rebuild when IO= changes (lwar -c is fast).
+.PHONY: libchunk.a libcchunk.a
 
 # -----------------------------------------------------------------------
 # Pattern rules
@@ -39,11 +60,11 @@ libcchunk.a: $(CCHUNK_LIB_OBJS)
 %.obj: %.asm $(INCS)
 	lwasm --format=obj --list=$(basename $@).lst --output=$@ $<
 
-# ASM program → s19 (linked against libchunk.a).
+# ASM program → s19.
 %.s19: %.obj libchunk.a
 	lwlink --script=chunk.ld --map=$(basename $@).map --format=srec --output=$@ $< -L. -lchunk
 
-# ASM program → bin (linked against libchunk.a).
+# ASM program → bin.
 %.bin: %.obj libchunk.a
 	lwlink --script=chunk.ld --map=$(basename $@).map --format=decb --output=$@ $< -L. -lchunk
 
@@ -77,7 +98,7 @@ disk_test.o: ide_lib.h
 dat_torture.o: ide_lib.h
 
 # -----------------------------------------------------------------------
-# C program targets (linked against libcchunk.a)
+# C program targets
 # -----------------------------------------------------------------------
 
 hello.srec: hello.o pico.o libcchunk.a
@@ -111,6 +132,14 @@ dat_torture.srec: dat_torture.o pico.o ide_lib.o libcchunk.a
 dat_torture.raw: dat_torture.o pico.o ide_lib.o libcchunk.a
 	lwlink --script=cchunk.ld --map=$(basename $@).map --format=raw \
 		--output=$@ dat_torture.o pico.o ide_lib.o -L. -lcchunk -L$(CMOC_LIBDIR) $(CMOC_LIBS)
+
+stress_acia.srec: stress_acia.o pico.o libcchunk.a
+	lwlink --script=cchunk.ld --map=$(basename $@).map --format=srec \
+		--output=$@ stress_acia.o pico.o -L. -lcchunk -L$(CMOC_LIBDIR) $(CMOC_LIBS)
+
+stress_acia.raw: stress_acia.o pico.o libcchunk.a
+	lwlink --script=cchunk.ld --map=$(basename $@).map --format=raw \
+		--output=$@ stress_acia.o pico.o -L. -lcchunk -L$(CMOC_LIBDIR) $(CMOC_LIBS)
 
 # -----------------------------------------------------------------------
 clean:

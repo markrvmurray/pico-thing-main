@@ -59,16 +59,18 @@ TEST_CASE("tick_timer: enable via control", "[tick_timer]")
 	CHECK_FALSE(t.is_enabled());
 }
 
-TEST_CASE("tick_timer: only bit 0 of control matters", "[tick_timer]")
+TEST_CASE("tick_timer: bit 0 controls enable, bits 1-5 are countdown", "[tick_timer]")
 {
 	registers::clear();
 	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
-	t.control(0xFE);  // bit 0 = 0
+	t.control(0xC0);  // bits 6-7 only, bit 0 = 0
 	CHECK_FALSE(t.is_enabled());
+	CHECK(t.get_nmi_countdown() == 0);
 
-	t.control(0xFF);  // bit 0 = 1
+	t.control(0x01);  // bit 0 = 1, no countdown
 	CHECK(t.is_enabled());
+	CHECK(t.get_nmi_countdown() == 0);
 }
 
 TEST_CASE("tick_timer: tick while disabled has no effect", "[tick_timer]")
@@ -250,4 +252,132 @@ TEST_CASE("tick_timer: acknowledge without prior tick is safe", "[tick_timer]")
 
 	CHECK_FALSE(t.is_irq_pending());
 	CHECK(status_reg() == 0x00);
+}
+
+// -----------------------------------------------------------------------
+// NMI countdown tests
+// -----------------------------------------------------------------------
+
+TEST_CASE("tick_timer: countdown of 1 fires NMI after 1 tick", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	t.control(0x02);  // bits 1-5 = 1, countdown = 1
+	CHECK(t.get_nmi_countdown() == 1);
+
+	bool nmi = t.tick();
+	CHECK(nmi);
+	CHECK(t.get_nmi_countdown() == 0);
+}
+
+TEST_CASE("tick_timer: countdown of 5 fires NMI after exactly 5 ticks", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	t.control(0x0A);  // bits 1-5 = 5, countdown = 5
+	CHECK(t.get_nmi_countdown() == 5);
+
+	for (int i = 0; i < 4; i++) {
+		CHECK_FALSE(t.tick());
+		CHECK(t.get_nmi_countdown() == (uint8_t)(4 - i));
+	}
+
+	CHECK(t.tick());
+	CHECK(t.get_nmi_countdown() == 0);
+}
+
+TEST_CASE("tick_timer: countdown of 31 (max) fires after 31 ticks", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	t.control(0x3E);  // bits 1-5 = 0x1F = 31
+	CHECK(t.get_nmi_countdown() == 31);
+
+	for (int i = 0; i < 30; i++)
+		CHECK_FALSE(t.tick());
+
+	CHECK(t.tick());
+	CHECK(t.get_nmi_countdown() == 0);
+}
+
+TEST_CASE("tick_timer: tick with no countdown returns false", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	CHECK_FALSE(t.tick());
+	CHECK_FALSE(t.tick());
+}
+
+TEST_CASE("tick_timer: countdown does not re-fire after expiry", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	t.control(0x02);  // countdown = 1
+	CHECK(t.tick());   // fires
+
+	// Subsequent ticks should not fire again.
+	CHECK_FALSE(t.tick());
+	CHECK_FALSE(t.tick());
+}
+
+TEST_CASE("tick_timer: countdown is independent of 50 Hz IRQ enable", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	// Countdown with IRQ disabled (bit 0 = 0)
+	t.control(0x06);  // bits 1-5 = 3, bit 0 = 0
+	CHECK_FALSE(t.is_enabled());
+	CHECK(t.get_nmi_countdown() == 3);
+
+	CHECK_FALSE(t.tick());
+	CHECK_FALSE(t.tick());
+	CHECK(t.tick());
+}
+
+TEST_CASE("tick_timer: countdown with IRQ enabled simultaneously", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+	t.start();
+
+	// Enable IRQ (bit 0) and set countdown = 2 (bits 1-5)
+	t.control(0x05);  // 0b00000101 → enable=1, countdown=2
+	CHECK(t.is_enabled());
+	CHECK(t.get_nmi_countdown() == 2);
+
+	CHECK_FALSE(t.tick());
+	CHECK(t.tick());
+
+	// 50 Hz IRQ should still work independently
+	t.simulate_tick();
+	CHECK(t.is_irq_pending());
+}
+
+TEST_CASE("tick_timer: reset clears countdown", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	t.control(0x0A);  // countdown = 5
+	CHECK(t.get_nmi_countdown() == 5);
+
+	t.reset();
+	CHECK(t.get_nmi_countdown() == 0);
+	CHECK_FALSE(t.tick());
+}
+
+TEST_CASE("tick_timer: writing zero countdown does not arm", "[tick_timer][nmi]")
+{
+	registers::clear();
+	tick_timer t(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+
+	t.control(0x01);  // enable IRQ, bits 1-5 = 0
+	CHECK(t.get_nmi_countdown() == 0);
+	CHECK_FALSE(t.tick());
 }

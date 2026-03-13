@@ -90,11 +90,16 @@ usb_cdc_write(const uint8_t *buf, const uint16_t buf_len)
 	if (!tud_cdc_ready())
 		return 0u;
 
-	if (buf_len > 0) {
+	if (buf_len > 0)
 		ret_val = tud_cdc_write(buf, buf_len);
-		tud_cdc_write_flush();
-	}
 	return ret_val;
+}
+
+void
+usb_cdc_flush(void)
+{
+	if (tud_cdc_connected())
+		tud_cdc_write_flush();
 }
 
 uint16_t
@@ -115,11 +120,16 @@ usb_cdc_write_n(uint8_t itf, const uint8_t *buf, const uint16_t buf_len)
 	if (!tud_cdc_n_connected(itf))
 		return 0u;
 
-	if (buf_len > 0) {
+	if (buf_len > 0)
 		ret_val = tud_cdc_n_write(itf, buf, buf_len);
-		tud_cdc_n_write_flush(itf);
-	}
 	return ret_val;
+}
+
+void
+usb_cdc_flush_n(uint8_t itf)
+{
+	if (tud_cdc_n_connected(itf))
+		tud_cdc_n_write_flush(itf);
 }
 
 /* Called when device mounted (enumerated) */

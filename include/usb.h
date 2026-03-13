@@ -17,6 +17,8 @@ uint16_t usb_cdc_read(uint8_t *buf, uint16_t buf_len);
 uint16_t usb_cdc_write(const uint8_t *buf, uint16_t buf_len);
 uint16_t usb_cdc_read_n(uint8_t itf, uint8_t *buf, uint16_t buf_len);
 uint16_t usb_cdc_write_n(uint8_t itf, const uint8_t *buf, uint16_t buf_len);
+void usb_cdc_flush(void);
+void usb_cdc_flush_n(uint8_t itf);
 
 #ifdef __cplusplus
 }

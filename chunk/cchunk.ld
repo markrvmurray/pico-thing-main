@@ -11,8 +11,7 @@
 ;   rodata                - cmoc string literals and real constants
 ;   rwdata                - cmoc initialised global variables
 ;   CONSTANT              - lwasm constants (io.asm IQ_* bytes)
-;   bss,bss               - cmoc BSS (zero-init at runtime by INILIB)
-;   BSS                   - lwasm BSS (io.asm ring buffers, zeroed in SREC)
+;   bss,bss               - all BSS (cmoc + lwasm, zero-init at runtime by INILIB)
 ;   program_end           - cmoc end marker
 ;   SYSVECTORS load FD00  - ISR dispatch code + handler tables
 ;   DAT_RAM    load FE00  - DAT RAM
@@ -40,7 +39,6 @@ section rodata
 section rwdata
 section CONSTANT
 section bss,bss
-section BSS
 section program_end
 section SYSVECTORS load FD00
 section DAT_RAM load FE00

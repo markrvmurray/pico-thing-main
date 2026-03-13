@@ -139,6 +139,7 @@ def main() -> None:
                              "Use --window 256 to cap RTT and prevent queue build-up.")
     args = parser.parse_args()
 
+    time.sleep(10)
     print(f"Serial echo test: port={args.port}  count={args.count}  chunk={args.chunk}  baud={args.baud}  window={'unlimited' if args.window == 0 else args.window}")
     errors = run(args.port, args.count, args.chunk, args.baud, args.window)
     sys.exit(0 if errors == 0 else 1)

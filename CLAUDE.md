@@ -56,7 +56,7 @@ $FE00–$FEFF   DAT RAM (256 bytes, 8kB page mapping for NitrOS9)
 $FFC0–$FFFF   Emulated peripheral registers + vectors
   $FFC3–$FFC4   MC6850 UART (CONSOLE)
   $FFC5–$FFC6   MC6850 UART (AUXILIARY)
-  $FFC8–$FFC9   50 Hz Tick Timer
+  $FFC8–$FFC9   Tick Timer (50 Hz IRQ + NMI countdown)
   $FFD0–$FFDF   Shared data buffer
   $FFE0–$FFEF   Snippet execution area (16-byte programs)
   $FFF0–$FFFF   CPU vectors (RESET, NMI, FIRQ, IRQ, SWI*)
@@ -69,13 +69,14 @@ $FFC0–$FFFF   Emulated peripheral registers + vectors
 | `mc6809` | `mc6809.cpp` | Processor state machine (bus state, run state, LIC counting, interrupt management) |
 | `registers` | `pico_thing.cpp` | 64-byte read/write register arrays; `ReadProxy`/`WriteProxy` handle 6809 big-endian conversion |
 | `mc6850` | `mc6850.cpp` | UART emulation with TX/RX queues; generates IRQ. Two instances: `fast_serial` (console, $FFC3–$FFC4) and `aux_serial` (auxiliary, $FFC5–$FFC6) |
-| `tick_timer` | `tick_timer.cpp` | 50 Hz tick timer; generates IRQ ($FFC8–$FFC9) |
+| `tick_timer` | `tick_timer.cpp` | 50 Hz tick timer (IRQ) + E-cycle countdown NMI ($FFC8–$FFC9) |
 
 ### Snippet/Chunk System
 
 Small 6809 programs are embedded in firmware as byte arrays:
 - **Snippets** (`extra/api.asm`): ≤16 bytes, assembled into `api.inc`, run at `$FFE0`. Used for atomic operations: DATInit, Zero, BlockFill, CopyOut, CopyIn, Sync, LoopRW, and interrupt tests.
-- **Chunks** (`chunk/*.asm`, `chunk/*.c`): Larger programs (ASSIST09 monitor, test programs), loaded at `$0130`.
+- **Chunks** (`chunk/*.asm`, `chunk/*.c`): Larger programs (ASSIST09 monitor, test programs), loaded at `$0130`. DBGMON is a special chunk loaded at `$FC00` (512 bytes, debug monitor with jump table).
+- **NitrOS-9 boot** (`nitros9` console command): Loads DBGMON at `$FC00`, NITROS9 bootloader at `$0130`, sets illegal-opcode vector to JT.IlOp (`$FC12`), and boots.
 
 ### GPIO Assignment Summary
 

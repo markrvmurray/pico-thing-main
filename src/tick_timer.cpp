@@ -41,6 +41,19 @@ tick_timer::control(uint8_t val)
 		irq_pending = false;
 		reg[status_offset] = static_cast<uint8_t>(0x00u);
 	}
+	uint8_t countdown = (val >> 1) & 0x1Fu;
+	if (countdown)
+		nmi_countdown = countdown;
+}
+
+bool
+tick_timer::tick()
+{
+	if (nmi_countdown == 0u)
+		return false;
+	if (--nmi_countdown == 0u)
+		return true;
+	return false;
 }
 
 void
@@ -57,6 +70,7 @@ tick_timer::reset()
 {
 	enabled = false;
 	irq_pending = false;
+	nmi_countdown = 0;
 	reg[status_offset] = static_cast<uint8_t>(0x00u);
 }
 
