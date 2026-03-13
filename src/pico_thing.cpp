@@ -337,12 +337,15 @@ __time_critical_func(dma_bus_write_irq_handler())
 			reg[SYSTEM_TASK] = new_task;
 			task_pins_update(new_task);
 		}
-		// CONSOLE_CONTROL is NOT handled here — guest_control() must run
-		// from the for(;;) loop's write_ring processing so it is sequenced
-		// AFTER any pending CONSOLE_TX_DATA entries.  If we call it here,
-		// a mode change (e.g. loopback enable) takes effect before the
-		// for(;;) loop processes the last TX byte from the previous mode,
-		// routing it through the wrong path (loopback vs normal TX queue).
+		// CONSOLE_CONTROL / AUX_CONTROL: full guest_control() is deferred
+		// to the write_ring so mode changes are sequenced after pending TX
+		// data.  But RTS must take effect immediately — otherwise
+		// has_interrupt() can stage another byte in the window between the
+		// 6809 deasserting RTS and the for(;;) loop processing the write.
+		else if (wloc == CONSOLE_CONTROL)
+			fast_serial.control_written_isr(wval);
+		else if (wloc == AUX_CONTROL)
+			aux_serial.control_written_isr(wval);
 		else if (wloc == CONSOLE_TX_DATA)
 			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
 		else if (wloc == AUX_TX_DATA)

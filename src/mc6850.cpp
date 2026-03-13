@@ -105,6 +105,19 @@ mc6850::set_host_cts(bool deasserted)
 	}
 }
 
+// Called from Core 1 write ISR to update RTS immediately, before the
+// write_ring delivers the full guest_control() call.  This closes the
+// window where has_interrupt() could stage another byte after the 6809
+// deasserted RTS but before the for(;;) loop processed the control write.
+void
+mc6850::control_written_isr(uint8_t val)
+{
+	mc6850_control cr = {val};
+	if (cr.divide_select != 0b11u)		// not a reset
+		rts_deasserted = (cr.tx_irq == 0b10u);
+	irq_dirty = true;
+}
+
 void
 mc6850::guest_control(uint8_t val)
 {

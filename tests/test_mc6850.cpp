@@ -625,6 +625,33 @@ TEST_CASE("is_rts_deasserted() returns correct state") {
 	CHECK_FALSE(uart.is_rts_deasserted());
 }
 
+TEST_CASE("control_written_isr updates RTS immediately") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	// Default: RTS asserted
+	CHECK_FALSE(uart.is_rts_deasserted());
+
+	// tx_irq=0b10 (bits 5-6) → RTS deasserted
+	uart.control_written_isr(0b01000000);
+	CHECK(uart.is_rts_deasserted());
+
+	// tx_irq=0b01 → RTS asserted again
+	uart.control_written_isr(0b00100000);
+	CHECK_FALSE(uart.is_rts_deasserted());
+
+	// divide_select=0b11 (reset) → RTS not changed by ISR path
+	uart.control_written_isr(0b01000000);	// deassert first
+	CHECK(uart.is_rts_deasserted());
+	uart.control_written_isr(0b00000011);	// reset — should NOT touch RTS
+	CHECK(uart.is_rts_deasserted());		// still deasserted
+
+	// has_interrupt() respects ISR-set RTS: no staging while deasserted
+	uart.control_written_isr(0b01000000);	// deassert RTS
+	uart.host_transmit('Z');
+	CHECK(uart.has_interrupt() == INTERRUPT_NONE);	// byte not staged
+}
+
 TEST_CASE("host CTS does not affect TX IRQ assertion") {
 	registers::clear();
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);

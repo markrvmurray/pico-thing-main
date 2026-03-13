@@ -106,6 +106,7 @@ public:
 	mc6850(uint16_t ctl_off, uint16_t data_off);
 	void reset();
 	void write_received();		// called from Core 1 write ISR: clears TDRE until guest_transmit() runs
+	void control_written_isr(uint8_t val);	// called from Core 1 write ISR: updates RTS immediately
 	uint host_transmit_level_avail() { return (CONSOLE_QUEUE_LEN - 1) - rx.get_level(); }
 	uint transmit_level() { return rx.get_level(); }
 	uint host_receive_level_avail() { return tx.get_level(); }
