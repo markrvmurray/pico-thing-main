@@ -132,24 +132,23 @@ static constexpr uint8_t PEND_NMI  = 1u << 0;
 static constexpr uint8_t PEND_FIRQ = 1u << 1;
 static constexpr uint8_t PEND_IRQ  = 1u << 2;
 
-// Simple 50 Hz IRQ clock — replaces MC6840.
+// 50 Hz tick timer (IRQ) + E-cycle countdown (NMI).
 static tick_timer system_tick(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
-static volatile uint32_t _debug_qrise_count = 0u;
-static volatile uint32_t _debug_irq_assert_count = 0u;
-static volatile uint32_t _debug_loop_count = 0u;
-static volatile uint32_t _debug_write_ring_count = 0u;
-static volatile uint32_t _debug_read_irq_count = 0u;
-static volatile uint8_t _debug_loop_phase = 0u;
-static volatile uint8_t _debug_last_write_loc = 0u;
-static volatile uint8_t _debug_last_read_loc = 0u;
-static volatile uint32_t _debug_isr_count = 0u;	// incremented in GPIO ISR
+static volatile uint32_t core1_qrise_count = 0u;
+static volatile uint32_t core1_irq_assert_count = 0u;
+static volatile uint32_t core1_loop_count = 0u;
+static volatile uint32_t core1_write_ring_count = 0u;
+static volatile uint32_t core1_read_irq_count = 0u;
+static volatile uint8_t core1_loop_phase = 0u;
+static volatile uint8_t core1_last_write_loc = 0u;
+static volatile uint8_t core1_last_read_loc = 0u;
+static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 
 // Stack watermark for Core 1 — paint stack with 0xDEADBEEF, then scan
 // from the bottom to find the high-water mark.
 extern "C" uint32_t __StackOneBottom;	// linker symbol
 extern "C" uint32_t __StackOneTop;	// linker symbol
-static volatile uint32_t _debug_core1_stack_free = 0u;
 
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
@@ -157,7 +156,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, true); // scope timing
 #endif
-	_debug_isr_count++;
+	core1_isr_count++;
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
 		q_rising_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
@@ -708,12 +707,12 @@ process_command(char *buf)
 		printf("Tick timer: enabled=%d  irq_pending=%d\n",
 		       (int)system_tick.is_enabled(), (int)system_tick.is_irq_pending());
 		printf("Core1 loop: %lu  q_rise: %lu  irq_assert: %lu\n",
-		       _debug_loop_count, _debug_qrise_count, _debug_irq_assert_count);
+		       core1_loop_count, core1_qrise_count, core1_irq_assert_count);
 		printf("Core1 write_ring: %lu  read_irq: %lu\n",
-		       _debug_write_ring_count, _debug_read_irq_count);
+		       core1_write_ring_count, core1_read_irq_count);
 		printf("Core1 phase: %u  last_write: %02X  last_read: %02X  isr: %lu\n",
-		       _debug_loop_phase, _debug_last_write_loc, _debug_last_read_loc,
-		       _debug_isr_count);
+		       core1_loop_phase, core1_last_write_loc, core1_last_read_loc,
+		       core1_isr_count);
 		{
 			// Scan stack watermark from bottom to find high-water mark
 			volatile uint32_t *bottom = &__StackOneBottom;
@@ -744,28 +743,6 @@ process_command(char *buf)
 		printf("Control: %5u\tTx: %5u\n", AUX_ACIA_CONTROL_COUNT, AUX_ACIA_TX_DATA_COUNT);
 		printf("Status:  %5u\tRx: %5u\n", AUX_ACIA_STATUS_COUNT, AUX_ACIA_RX_DATA_COUNT);
 #endif
-		{
-			extern volatile uint32_t _dbg_aux_pump_calls;
-			extern volatile uint32_t _dbg_aux_usb_read, _dbg_aux_usb_read_bytes;
-			extern volatile uint32_t _dbg_aux_rx_pushed;
-			extern volatile uint32_t _dbg_aux_tx_drained;
-			extern volatile uint32_t _dbg_aux_usb_write, _dbg_aux_usb_write_bytes;
-			extern volatile uint32_t _dbg_aux_usb_write_zero;
-			extern volatile uint32_t _dbg_aux_cts_set;
-			extern volatile uint16_t _dbg_aux_tx_qlevel, _dbg_aux_rx_qlevel;
-			extern volatile bool     _dbg_aux_host_cts;
-			printf("Aux pump debug:\n");
-			printf("  pump_calls:  %lu\n", _dbg_aux_pump_calls);
-			printf("  usb_read:    %lu calls, %lu bytes\n", _dbg_aux_usb_read, _dbg_aux_usb_read_bytes);
-			printf("  rx_pushed:   %lu bytes\n", _dbg_aux_rx_pushed);
-			printf("  tx_drained:  %lu bytes from queue\n", _dbg_aux_tx_drained);
-			printf("  usb_write:   %lu calls, %lu bytes, %lu zero-ret\n",
-			       _dbg_aux_usb_write, _dbg_aux_usb_write_bytes, _dbg_aux_usb_write_zero);
-			printf("  cts_set:     %lu  host_cts: %s\n",
-			       _dbg_aux_cts_set, _dbg_aux_host_cts ? "DEASSERTED" : "ok");
-			printf("  tx_qlevel:   %u  rx_qlevel: %u\n",
-			       _dbg_aux_tx_qlevel, _dbg_aux_rx_qlevel);
-		}
 		break;
 	}
 
@@ -1433,8 +1410,8 @@ poll_console()
 	// WATCHDOG_THRESHOLD consecutive misses before alerting, so transient
 	// ISR starvation during heavy bus activity (e.g. NitrOS9 boot) doesn't
 	// trigger false alarms.
-	uint32_t watchdog_last_loop_count = _debug_loop_count;
-	uint32_t watchdog_last_isr_count = _debug_isr_count;
+	uint32_t watchdog_last_loop_count = core1_loop_count;
+	uint32_t watchdog_last_isr_count = core1_isr_count;
 	static constexpr uint32_t WATCHDOG_INTERVAL_MS = 10u;
 	static constexpr uint32_t WATCHDOG_THRESHOLD = 10u;	// 10 × 10ms = 100ms
 	uint32_t watchdog_miss_count = 0u;
@@ -1443,8 +1420,8 @@ poll_console()
 
 	for (;;) {
 		if (absolute_time_diff_us(get_absolute_time(), watchdog_next) <= 0) {
-			const uint32_t cur_loop = _debug_loop_count;
-			const uint32_t cur_isr = _debug_isr_count;
+			const uint32_t cur_loop = core1_loop_count;
+			const uint32_t cur_isr = core1_isr_count;
 			if (cur_loop == watchdog_last_loop_count && core1_initialised) {
 				watchdog_miss_count++;
 				if (!watchdog_stalled && watchdog_miss_count >= WATCHDOG_THRESHOLD) {
@@ -1456,9 +1433,9 @@ poll_console()
 					else
 						printf("*** ISRs still running — thread mode starved or hung\n");
 					printf("  phase=%u  loop=%lu  isr=%lu\n",
-					       _debug_loop_phase, cur_loop, cur_isr);
+					       core1_loop_phase, cur_loop, cur_isr);
 					printf("  last_write=%02X  last_read=%02X\n",
-					       _debug_last_write_loc, _debug_last_read_loc);
+					       core1_last_write_loc, core1_last_read_loc);
 					printf("  pending_interrupts=%02X  write_ring: head=%u tail=%u\n",
 					       pending_interrupts, write_ring_head, write_ring_tail);
 					printf("  ACIA: int_status=%02X  Aux: int_status=%02X\n",
@@ -1516,8 +1493,8 @@ poll_console()
 				// Resample watchdog baseline — process_command() may have
 				// run a snippet/chunk that legitimately starved the for(;;)
 				// loop for its duration.
-				watchdog_last_loop_count = _debug_loop_count;
-				watchdog_last_isr_count = _debug_isr_count;
+				watchdog_last_loop_count = core1_loop_count;
+				watchdog_last_isr_count = core1_isr_count;
 				watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
 				idx = 0;
 				prompted = false;
@@ -1614,41 +1591,41 @@ __no_inline_not_in_flash_func(main_core1)()
 		// Leave 64 bytes headroom below current SP
 		for (volatile uint32_t *p = bottom; p < sp - 16; p++)
 			*p = 0xDEADBEEFu;
-		_debug_core1_stack_free = (sp - bottom) * sizeof(uint32_t);
+		uint32_t stack_free = (sp - bottom) * sizeof(uint32_t);
 		printf("Pico2 MC6809E core1 stack: %lu bytes total, %lu bytes free at start\n",
 		       (&__StackOneTop - &__StackOneBottom) * sizeof(uint32_t),
-		       _debug_core1_stack_free);
+		       stack_free);
 	}
 
 	core1_initialised = true;
 
 	for (;;) {
-		_debug_loop_phase = 1;
-		_debug_loop_count++;
+		core1_loop_phase = 1;
+		core1_loop_count++;
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {
 			q_rising_edge = false;
-			_debug_qrise_count++;
-			_debug_loop_phase = 2;
+			core1_qrise_count++;
+			core1_loop_phase = 2;
 			uint32_t interrupt_refcount[NUM_INTERRUPTS] = {};
 			interrupt eirq;
 			// FOR_EACH interrupt_source:
-			_debug_loop_phase = 20;
+			core1_loop_phase = 20;
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
-			_debug_loop_phase = 21;
+			core1_loop_phase = 21;
 			eirq = system_tick.has_interrupt();
 			interrupt_refcount[eirq]++;
-			_debug_loop_phase = 22;
+			core1_loop_phase = 22;
 			eirq = fast_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
-			_debug_loop_phase = 23;
+			core1_loop_phase = 23;
 			eirq = aux_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
-			_debug_loop_phase = 3;
+			core1_loop_phase = 3;
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
-				_debug_irq_assert_count++;
-			_debug_loop_phase = 30;
+				core1_irq_assert_count++;
+			core1_loop_phase = 30;
 			// Update cached state so the Q-rising ISR can assert/deassert
 			// interrupt pins.  Single volatile write; the ISR handles all
 			// GPIO assertion and deassertion — no apply_interrupts() here.
@@ -1656,20 +1633,20 @@ __no_inline_not_in_flash_func(main_core1)()
 				(interrupt_refcount[INTERRUPT_NMI]  > 0u ? PEND_NMI  : 0u) |
 				(interrupt_refcount[INTERRUPT_FIRQ] > 0u ? PEND_FIRQ : 0u) |
 				(interrupt_refcount[INTERRUPT_IRQ]  > 0u ? PEND_IRQ  : 0u);
-			_debug_loop_phase = 31;
+			core1_loop_phase = 31;
 			// END FOR_EACH
 			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
 
-		_debug_loop_phase = 4;
+		core1_loop_phase = 4;
 		while (write_ring_tail != write_ring_head) {
-			_debug_write_ring_count++;
+			core1_write_ring_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			const uint8_t t = write_ring_tail;
 			const uint8_t written_location = write_ring[t].location;
 			const uint8_t written_byte = write_ring[t].value;
-			_debug_last_write_loc = written_location;
-			_debug_loop_phase = 5;
+			core1_last_write_loc = written_location;
+			core1_loop_phase = 5;
 			write_ring_tail = (t + 1u) & WRITE_RING_MASK;
 			switch (written_location) {
 			default:
@@ -1689,7 +1666,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				switch (written_byte) {
 				default:
 					registers::write(SYSTEM_REQUEST) = reg[SYSTEM_REQUEST] = REQUEST_NULL;
-					reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNKNOWN;;
+					reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNKNOWN;
 					break;
 				case REQUEST_TIME:
 				case REQUEST_SET_TIME:
@@ -1847,7 +1824,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 		// Drain the CONSOLE_RX_DATA counter before checking the shared slot.
 		// Each ISR-detected RX data read must call guest_receive() exactly once.
-		_debug_loop_phase = 6;
+		core1_loop_phase = 6;
 		while (rx_processed_count != rx_read_count) {
 #ifdef DEBUG
 			ACIA_RX_DATA_COUNT++;
@@ -1863,13 +1840,13 @@ __no_inline_not_in_flash_func(main_core1)()
 			aux_rx_processed_count++;
 		}
 
-		_debug_loop_phase = 7;
+		core1_loop_phase = 7;
 		if (read_irq_received) {
-			_debug_read_irq_count++;
+			core1_read_irq_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
-			_debug_last_read_loc = read_location;
-			_debug_loop_phase = 8;
+			core1_last_read_loc = read_location;
+			core1_loop_phase = 8;
 			switch (read_location) {
 			default:
 				// The MC6809 got whatever byte was here. By default, do nothing else.

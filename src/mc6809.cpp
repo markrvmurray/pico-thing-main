@@ -252,76 +252,36 @@ struct uart_port_state {
 static uart_port_state port_state[2];
 
 // Debug counters for aux ACIA (CDC port 1) diagnostics
-volatile uint32_t _dbg_aux_pump_calls = 0;
-volatile uint32_t _dbg_aux_usb_read = 0;
-volatile uint32_t _dbg_aux_usb_read_bytes = 0;
-volatile uint32_t _dbg_aux_rx_pushed = 0;
-volatile uint32_t _dbg_aux_tx_drained = 0;
-volatile uint32_t _dbg_aux_usb_write = 0;
-volatile uint32_t _dbg_aux_usb_write_bytes = 0;
-volatile uint32_t _dbg_aux_usb_write_zero = 0;
-volatile uint32_t _dbg_aux_cts_set = 0;
-volatile uint16_t _dbg_aux_tx_qlevel = 0;
-volatile uint16_t _dbg_aux_rx_qlevel = 0;
-volatile bool     _dbg_aux_host_cts = false;
-
 static void
 uart_port_pump(mc6850 &serial, uint8_t cdc_port, uart_port_state &st, bool suppress_read)
 {
-	bool is_aux = (cdc_port == 1);
-
-	if (is_aux)
-		_dbg_aux_pump_calls++;
-
 	// READ USB -> Guest (only if 6809 has asserted RTS)
-	{
-		if (!serial.is_rts_deasserted() && !suppress_read) {
-			if (st.rx_count == 0u) {
-				st.rx_count = usb_cdc_read_n(cdc_port, st.rx_buf, USB_BUFFER_SIZE);
-				st.rx_index = 0u;
-				if (is_aux && st.rx_count > 0u) {
-					_dbg_aux_usb_read++;
-					_dbg_aux_usb_read_bytes += st.rx_count;
-				}
-			}
-			uint uart_level_avail = serial.host_transmit_level_avail();
-			uint transmit_amount = MIN(uart_level_avail, st.rx_count - st.rx_index);
-			for (uint i = 0u; i < transmit_amount; i++)
-				serial.host_transmit(st.rx_buf[st.rx_index + i]);
-			if (is_aux)
-				_dbg_aux_rx_pushed += transmit_amount;
-			st.rx_index += transmit_amount;
-			if (st.rx_index >= st.rx_count)
-				st.rx_count = 0u;
+	if (!serial.is_rts_deasserted() && !suppress_read) {
+		if (st.rx_count == 0u) {
+			st.rx_count = usb_cdc_read_n(cdc_port, st.rx_buf, USB_BUFFER_SIZE);
+			st.rx_index = 0u;
 		}
+		uint uart_level_avail = serial.host_transmit_level_avail();
+		uint transmit_amount = MIN(uart_level_avail, st.rx_count - st.rx_index);
+		for (uint i = 0u; i < transmit_amount; i++)
+			serial.host_transmit(st.rx_buf[st.rx_index + i]);
+		st.rx_index += transmit_amount;
+		if (st.rx_index >= st.rx_count)
+			st.rx_count = 0u;
 	}
 	// WRITE Guest -> USB
 	if (st.tx_count == 0u) {
 		while (serial.host_receive_avail() && st.tx_count < USB_BUFFER_SIZE)
 			st.tx_buf[st.tx_count++] = serial.host_receive();
 		st.tx_index = 0u;
-		if (is_aux && st.tx_count > 0u)
-			_dbg_aux_tx_drained += st.tx_count;
 	}
 	uint16_t written = usb_cdc_write_n(cdc_port, st.tx_buf + st.tx_index, st.tx_count - st.tx_index);
 	st.tx_index += written;
-	if (is_aux && st.tx_count > 0u) {
-		_dbg_aux_usb_write++;
-		_dbg_aux_usb_write_bytes += written;
-		if (written == 0u)
-			_dbg_aux_usb_write_zero++;
-	}
 	if (st.tx_index >= st.tx_count)
 		st.tx_count = 0u;
 	// Feed USB host readiness back to CTS
 	bool cts = st.tx_count > 0u && st.tx_index < st.tx_count;
 	serial.set_host_cts(cts);
-	if (is_aux) {
-		_dbg_aux_cts_set = cts;
-		_dbg_aux_host_cts = cts;
-		_dbg_aux_tx_qlevel = serial.receive_level();
-		_dbg_aux_rx_qlevel = serial.transmit_level();
-	}
 }
 
 void
