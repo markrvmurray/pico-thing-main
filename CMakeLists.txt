@@ -74,6 +74,7 @@ pico_generate_pio_header(pico-thing ${CMAKE_CURRENT_LIST_DIR}/src/pico_thing.pio
 
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/api.bin
 	DEPENDS ${CMAKE_CURRENT_LIST_DIR}/extra/api.asm
+		${CMAKE_CURRENT_LIST_DIR}/extra/rel_dl
 		${CMAKE_CURRENT_LIST_DIR}/extra/rel_picothing
 	COMMAND lwasm --format=decb
 			--list=${CMAKE_CURRENT_BINARY_DIR}/api.lst

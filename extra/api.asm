@@ -219,92 +219,8 @@ B@0	LDB	A,S
 B@1	BRA	B@1
 	RTI
 
-* UART_IRQ chunk: sends "Hello, World!" via IRQ-driven TX ring buffer.
-* The test driver copies this to $0130, sets the IRQ vector to ISR5,
-* and runs the chunk in interactive (no-wait) mode.
 	ORG	CHUNK
-UartIRQ	LDS	#$2000
-	CLR	ERRNO
-	CLR	EXITC
-	LDA	#$03
-	STA	UARTC		; master reset
-	ANDCC	I		; Enable IRQ
-	LDX	#HELLO
-u@0	LDA	,X+
-	BEQ	FINISH
-	BSR	OUTCH
-	BRA	u@0
-FINISH	LDA	#$88
-	STA	ERRNO
-	SYNC
-OUTCH	PSHS	B,Y
-	LDB	POSIN
-	INCB
-	ANDB	#$0F
-o@0	CMPB	POSOUT
-	BEQ	o@0
-	LDY	#BUFFER
-	STA	B,Y
-	STB	POSIN
-	LDA	#$20
-	STA	UARTC		; tx_irq=0b01 (TX IRQ enabled)
-	PULS	B,Y,PC
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-POSIN	FCB	0
-POSOUT	FCB	0
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-BUFFER	ZMB	16
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FILL	$42,$0200-*-8
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-ISR5	LDX	#UARTC
-	LDA	,X
-	BITA	#%10000000
-	BEQ	NOTME
-	LDA	POSOUT
-	CMPA	POSIN
-	BEQ	EMPTY
-	INCA
-	ANDA	#$0F
-	STA	POSOUT
-	LDY	#BUFFER
-	LDB	A,Y
-	STB	1,X
-	BRA	DONE
-NOTME	LDA	#$76
-	STA	ERRNO
-	BRA	DONE
-EMPTY	CLR	,X		; disable all UART IRQs
-DONE	RTI
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-ABORT	LDA	#$B1
-	STA	ERRNO
-	SYNC
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-HELLO	FCS	'Hello, World! '
-	FCS	'Hello, World! '
-	FCS	'Hello, World! '
-	FCS	'Hello, World! '
-	FCB	$0C,$0A,$00
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-ERRNO	FCB	0
-EXITC	FCB	0
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-	FCB	$DE,$AD,$C0,$DE
-EUrtIRQ	EQU	*
+	INCLUDEBIN	rel_dl
 
 	ORG	CHUNK
 	INCLUDEBIN	rel_picothing
@@ -587,7 +503,7 @@ str.TK              fcn       "  TK = "
 	FCB	' '
 	FCC	"BREAK"
 	FCB	' '
-	FCC	"UART_IRQ"
+	FCC	"DOWNLOAD"
 	FCB	' '
 	FCC	"NITROS9"
 	FCB	' '
