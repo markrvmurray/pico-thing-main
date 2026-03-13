@@ -396,7 +396,7 @@ static const char *snippet_string[] = {
 	foreach_snippet(enum_list_strings)
 };
 
-static uint8_t snippet_code[SNIPPET_LEN][16u] = {
+static const uint8_t snippet_code[SNIPPET_LEN][16u] = {
 #define SNIPPET_INITIALISERS_INC 1
 #include "api.inc"
 #undef  SNIPPET_INITIALISERS_INC
@@ -415,7 +415,7 @@ enum copy_type {
 };
 
 static bool
-copy(const copy_type direction, const uint16_t count, const uint16_t address, uint8_t *data)
+copy(const copy_type direction, const uint16_t count, const uint16_t address, const uint8_t *data)
 {
 	uint16_t start = address;
 	const uint16_t end = address + count;
@@ -446,7 +446,7 @@ copy(const copy_type direction, const uint16_t count, const uint16_t address, ui
 				printf("Snippet execution failed — CPU did not respond\n");
 				return false;
 			}
-			registers::copy_out(data + pos, REGISTER_BUFFER_OFFSET, len);
+			registers::copy_out(const_cast<uint8_t *>(data) + pos, REGISTER_BUFFER_OFFSET, len);
 		}
 		start += len;
 		pos += len;

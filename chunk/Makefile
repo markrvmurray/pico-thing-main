@@ -27,7 +27,7 @@ ASSIST09_TARGETS-1 := assist09.s19 assist09.bin
 ASSIST09_TARGETS := $(ASSIST09_TARGETS-$(ASSIST09))
 
 all: $(ASSIST09_TARGETS) \
-     get.s19 get.bin put.s19 put.bin loop.s19 loop.bin dl.s19 dl.bin \
+     get.s19 get.bin put.s19 put.bin loop.s19 loop.bin dl.s19 dl.bin dl.raw \
      test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin \
      test_send.s19 test_send.bin \
      acia_torture.s19 acia_torture.bin tick_torture.s19 tick_torture.bin \
@@ -44,13 +44,18 @@ CHUNK_LIB_OBJS := $(IO_OBJ) bss.obj syslib.obj putdec.obj puthex.obj
 libchunk.a: $(CHUNK_LIB_OBJS)
 	lwar -c $@ $^
 
+# ASM runtime library for embeddable chunks (flat device addresses).
+CHUNK_FLAT_LIB_OBJS := $(IO_OBJ) bss.obj syslib_flat.obj putdec.obj puthex.obj
+libchunk_flat.a: $(CHUNK_FLAT_LIB_OBJS)
+	lwar -c $@ $^
+
 # C runtime library.
 CCHUNK_LIB_OBJS := $(IO_OBJ) syslib.obj cstart.obj
 libcchunk.a: $(CCHUNK_LIB_OBJS)
 	lwar -c $@ $^
 
 # Force library rebuild when IO= changes (lwar -c is fast).
-.PHONY: libchunk.a libcchunk.a
+.PHONY: libchunk.a libchunk_flat.a libcchunk.a
 
 # -----------------------------------------------------------------------
 # Pattern rules
@@ -67,6 +72,10 @@ libcchunk.a: $(CCHUNK_LIB_OBJS)
 # ASM program → bin.
 %.bin: %.obj libchunk.a
 	lwlink --script=chunk.ld --map=$(basename $@).map --format=decb --output=$@ $< -L. -lchunk
+
+# ASM program → raw (flat binary for INCLUDEBIN embedding).
+%.raw: %.obj trampoline.obj libchunk_flat.a
+	lwlink --script=embed.ld --map=$(basename $@).map --format=raw --output=$@ trampoline.obj $< -L. -lchunk_flat
 
 # C source → object file.
 %.o: %.c pico.h

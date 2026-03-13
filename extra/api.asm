@@ -220,7 +220,7 @@ B@1	BRA	B@1
 	RTI
 
 	ORG	CHUNK
-	INCLUDEBIN	rel_dl
+	INCLUDEBIN	download
 
 	ORG	CHUNK
 	INCLUDEBIN	rel_picothing

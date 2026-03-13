@@ -79,13 +79,13 @@ with open(sys.argv[1], "rb") as bin_file:
 		inc_file.write("#if defined(CHUNK_INITIALISERS_INC)\n")
 		for i in range(len(names)):
 			if locations[i] == 0x0130 or locations[i] == 0xFC00:
-				inc_file.write(f"static uint8_t chunk_{i}[] = {{ {initialisers[i]} }};\n")
+				inc_file.write(f"static const uint8_t chunk_{i}[] = {{ {initialisers[i]} }};\n")
 		inc_file.write("static const uint chunk_len[CHUNK_LEN] = {\n")
 		for i in range(len(names)):
 			if locations[i] == 0x0130 or locations[i] == 0xFC00:
 				inc_file.write(f"\t{lengths[i]},\n")
 		inc_file.write("};\n")
-		inc_file.write("static uint8_t *(chunk_code[CHUNK_LEN]) = {\n")
+		inc_file.write("static const uint8_t *(chunk_code[CHUNK_LEN]) = {\n")
 		for i in range(len(names)):
 			if locations[i] == 0x0130 or locations[i] == 0xFC00:
 				inc_file.write(f"\tchunk_{i},\n")
