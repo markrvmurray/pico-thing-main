@@ -346,7 +346,9 @@ __time_critical_func(dma_bus_write_irq_handler())
 			aux_serial.write_received();
 		else if (wloc == SYSTEM_TIMER_CONTROL_13)
 			system_tick.control(wval);
-		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN)
+		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
+		// CPU is concerned.
+		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
 			reg[wloc] = wval;
 		// Queue for the for(;;) loop to do full dispatch.
 		const uint8_t h = write_ring_head;
@@ -1133,9 +1135,9 @@ process_command(char *buf)
 
 	case CMD_RUN_LIST:
 		for (uint16_t i = DAT_INIT; i < SNIPPET_LEN; i++)
-			printf("%d: %s\n", i, snippet_string[i]);
+			printf("%X: %s\n", i, snippet_string[i]);
 		for (uint16_t i = 0; i < CHUNK_LEN; i++)
-			printf("%d: %s\n", i + SNIPPET_LEN, chunk_string[i]);
+			printf("%X: %s\n", i + SNIPPET_LEN, chunk_string[i]);
 		break;
 
 	case CMD_RUN:
@@ -1333,6 +1335,29 @@ process_command(char *buf)
 				reg[REGISTER_VECTOR_RESET_OFFSET] = address;
 			srecord_ignore = false;	// end of stream — reset for next load
 		}
+		break;
+	}
+
+	case CMD_NITROS9: {
+		if (!MC6809.assert_stopped())
+			break;
+		printf("Loading DBGMON v%u.%u.%u to $FC00\n",
+		       chunk_code[DBGMON][21], chunk_code[DBGMON][22], chunk_code[DBGMON][23]);
+		if (!copy(OUTWARDS, chunk_len[DBGMON], 0xFC00u, chunk_code[DBGMON]))
+			break;
+		/* Set illegal-opcode vector ($FFF0-$FFF1) to JT.IlOp ($FC12) */
+		reg[REGISTER_VECTOR_RESERVED_OFFSET] = static_cast<uint16_t>(0xFC12u);
+		printf("Loading NITROS9 v%u.%u.%u to $0130\n",
+		       chunk_code[NITROS9][3], chunk_code[NITROS9][4], chunk_code[NITROS9][5]);
+		if (!copy(OUTWARDS, chunk_len[NITROS9], 0x0130u, chunk_code[NITROS9]))
+			break;
+		/* Set boot device byte at $0132 (0 = IDE, 1 = DriveWire) */
+		uint8_t bdev = cmd.nitros9.boot_device;
+		if (!copy(OUTWARDS, 1u, 0x0132u, &bdev))
+			break;
+		reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
+		printf("Booting NitrOS-9 (%s)\n", bdev ? "DriveWire" : "IDE");
+		MC6809.start();
 		break;
 	}
 
@@ -1723,6 +1748,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 			// Tick timer writes are handled directly in the DMA write ISR.
 
+			// Everything else is RAM. See the write ISR
 			case REGISTER_BUFFER_OFFSET + 0x00:
 			case REGISTER_BUFFER_OFFSET + 0x01:
 			case REGISTER_BUFFER_OFFSET + 0x02:
@@ -1739,10 +1765,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			case REGISTER_BUFFER_OFFSET + 0x0D:
 			case REGISTER_BUFFER_OFFSET + 0x0E:
 			case REGISTER_BUFFER_OFFSET + 0x0F:
-				// This is a shared block of emulated RAM for
-				// moving around blocks of data. The ISR will
-				// copy this over to the read registers for us.
-
 			case REGISTER_SNIPPET_OFFSET + 0x00:
 			case REGISTER_SNIPPET_OFFSET + 0x01:
 			case REGISTER_SNIPPET_OFFSET + 0x02:
@@ -1759,10 +1781,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			case REGISTER_SNIPPET_OFFSET + 0x0D:
 			case REGISTER_SNIPPET_OFFSET + 0x0E:
 			case REGISTER_SNIPPET_OFFSET + 0x0F:
-			// Use this block as write-only memory for debugging. The MC6809
-			// may write useful debugging info here.
-
-			case REGISTER_VECTORS_OFFSET + 0x00:
 			case REGISTER_VECTORS_OFFSET + 0x01:
 			case REGISTER_VECTORS_OFFSET + 0x02:
 			case REGISTER_VECTORS_OFFSET + 0x03:
@@ -1778,8 +1796,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			case REGISTER_VECTORS_OFFSET + 0x0D:
 			case REGISTER_VECTORS_OFFSET + 0x0E:
 			case REGISTER_VECTORS_OFFSET + 0x0F:
-				// Use this block as write-only memory for debugging. The MC6809
-				// may write useful debugging info here.
 				break;
 			}
 			//gpio_put(GPIO_TRACE_CORE1, false);

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2025 Mark R V Murray.
+# Copyright (c) 2025-2026 Mark R V Murray.
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Converts a binary snippet file into a format able to be included into the main program
+# Converts a binary snippet/chunk file into a format able to be included into the main program
 
 import sys
 
@@ -28,10 +28,10 @@ with open(sys.argv[1], "rb") as bin_file:
 				pos += 2
 				block = byte_block[pos:pos + size]
 				pos += size
-				if not (loc == 0x0000 or loc == 0xFFE0 or loc == 0x0130):
-					print("Entry point for each snippet must be FFE0 and each chunk must be 0130")
+				if not (loc == 0x0000 or loc == 0xFFE0 or loc == 0x0130 or loc == 0xFC00):
+					print("Entry point for each snippet must be FFE0 and each chunk must be 0130. There is one block loaded at FC00 in addition.")
 					sys.exit(2)
-				if loc == 0xFFE0 or loc == 0x0130:
+				if loc == 0xFFE0 or loc == 0x0130 or loc == 0xFC00:
 					s = ", ".join([ f"0x{byte:02X}" for byte in block ])
 					initialisers.append(s)
 					lengths.append(size)
@@ -51,6 +51,10 @@ with open(sys.argv[1], "rb") as bin_file:
 				if lengths[i] > 16:
 					print(f"Snippet may not exceed 16 bytes - snippet {names[i]} is {lengths[i]} bytes")
 					sys.exit(3)
+			if locations[i] == 0xFC00:
+				if lengths[i] > 512:
+					print(f"Debug chunk may not exceed 512 bytes - debug chunk {names[i]} is {lengths[i]} bytes")
+					sys.exit(3)
 		# Snippets
 		inc_file.write("#if defined(SNIPPET_NAMES_INC)\n")
 		inc_file.write("#define foreach_snippet(snippet) \\\n")
@@ -68,22 +72,22 @@ with open(sys.argv[1], "rb") as bin_file:
 		inc_file.write("#if defined(CHUNK_NAMES_INC)\n")
 		inc_file.write("#define foreach_chunk(chunk) \\\n")
 		for i in range(len(names)):
-			if locations[i] == 0x0130:
+			if locations[i] == 0x0130 or locations[i] == 0xFC00:
 				inc_file.write(f"\tchunk({names[i]}) \\\n")
 		inc_file.write(f"\tchunk(CHUNK_LEN)\n")
 		inc_file.write("#endif // defined(CHUNK_NAMES_INC)\n")
 		inc_file.write("#if defined(CHUNK_INITIALISERS_INC)\n")
 		for i in range(len(names)):
-			if locations[i] == 0x0130:
+			if locations[i] == 0x0130 or locations[i] == 0xFC00:
 				inc_file.write(f"static uint8_t chunk_{i}[] = {{ {initialisers[i]} }};\n")
 		inc_file.write("static const uint chunk_len[CHUNK_LEN] = {\n")
 		for i in range(len(names)):
-			if locations[i] == 0x0130:
+			if locations[i] == 0x0130 or locations[i] == 0xFC00:
 				inc_file.write(f"\t{lengths[i]},\n")
 		inc_file.write("};\n")
 		inc_file.write("static uint8_t *(chunk_code[CHUNK_LEN]) = {\n")
 		for i in range(len(names)):
-			if locations[i] == 0x0130:
+			if locations[i] == 0x0130 or locations[i] == 0xFC00:
 				inc_file.write(f"\tchunk_{i},\n")
 		inc_file.write("};\n")
 		inc_file.write("#endif // defined(CHUNK_INITIALISERS_INC)\n")

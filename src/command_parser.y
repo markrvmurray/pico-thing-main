@@ -126,6 +126,7 @@ static int _t_count;
 %token TOK_RESET
 %token TOK_BREAK
 %token TOK_USB
+%token TOK_NITROS9
 
 /* Subcommand keywords */
 %token TOK_DAT
@@ -133,6 +134,8 @@ static int _t_count;
 %token TOK_HALT
 %token TOK_RESTART
 %token TOK_RETURN
+%token TOK_IDE
+%token TOK_DRIVEWIRE
 
 /* Loop access types */
 %token TOK_r
@@ -182,6 +185,7 @@ command:
 	| break_cmd
 	| usb_cmd
 	| srecord_cmd
+	| nitros9_cmd
 	| TOK_WORD        { printf("Unknown command \"%s\"\n", $1); YYERROR; }
 	;
 
@@ -695,6 +699,24 @@ srecord_cmd:
 		result->tag = CMD_SRECORD;
 		strncpy(result->srecord.line, $1, sizeof(result->srecord.line) - 1u);
 		result->srecord.line[sizeof(result->srecord.line) - 1u] = '\0';
+	}
+	;
+
+/* -----------------------------------------------------------------------
+ * nitros9 [ ide | drivewire ]
+ * ----------------------------------------------------------------------- */
+nitros9_cmd:
+	  TOK_NITROS9 {
+		result->tag = CMD_NITROS9;
+		result->nitros9.boot_device = 0; /* IDE default */
+	}
+	| TOK_NITROS9 TOK_IDE {
+		result->tag = CMD_NITROS9;
+		result->nitros9.boot_device = 0;
+	}
+	| TOK_NITROS9 TOK_DRIVEWIRE {
+		result->tag = CMD_NITROS9;
+		result->nitros9.boot_device = 1;
 	}
 	;
 

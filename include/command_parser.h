@@ -70,6 +70,8 @@ typedef enum cmd_tag {
 	CMD_BREAK_RETURN,
 
 	CMD_SRECORD,
+
+	CMD_NITROS9,
 } cmd_tag_t;
 
 typedef struct parsed_cmd {
@@ -167,6 +169,11 @@ typedef struct parsed_cmd {
 		struct {
 			char line[256]; /* full S-record line */
 		} srecord;
+
+		/* CMD_NITROS9 */
+		struct {
+			uint8_t boot_device; /* 0 = IDE, 1 = DriveWire */
+		} nitros9;
 	};
 } parsed_cmd_t;
 

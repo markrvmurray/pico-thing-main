@@ -103,6 +103,7 @@ match_command_keyword(const char *text)
 		{ "reset",   "rs", TOK_RESET   },
 		{ "break",   "br", TOK_BREAK   },
 		{ "usb",     "ub", TOK_USB     },
+		{ "nitros9", "ni", TOK_NITROS9 },
 		{ NULL, NULL, 0 }
 	};
 
@@ -134,6 +135,8 @@ match_command_keyword(const char *text)
 [Hh][Aa][Ll][Tt]                    { return TOK_HALT; }
 [Rr][Ee][Ss][Tt][Aa][Rr][Tt]        { return TOK_RESTART; }
 [Rr][Ee][Tt][Uu][Rr][Nn]            { return TOK_RETURN; }
+[Ii][Dd][Ee]                        { return TOK_IDE; }
+[Dd][Rr][Ii][Vv][Ee][Ww][Ii][Rr][Ee] { return TOK_DRIVEWIRE; }
 
 	/* ---- Loop types (exact, CASE-SENSITIVE per original behaviour) ---- */
 "rw"|"RW"                           { return TOK_RW; }
