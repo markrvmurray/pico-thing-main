@@ -28,9 +28,9 @@ AP_RXPIN	EQU	6	; RX ring write pointer (1 byte)
 AP_RXPOU	EQU	7	; RX ring read pointer (1 byte)
 AP_RXFL		EQU	8	; RX full flag (1 byte)
 AP_ERRNO	EQU	9	; error code (1 byte)
-AP_TXBUF	EQU	10	; TX ring buffer (16 bytes)
-AP_RXBUF	EQU	26	; RX ring buffer (16 bytes)
-AP_SIZE		EQU	42
+AP_TXBUF	EQU	10	; TX ring buffer (64 bytes)
+AP_RXBUF	EQU	74	; RX ring buffer (64 bytes)
+AP_SIZE		EQU	138
 
 * I/O routines (all take U = port descriptor)
 INIT_CON	EXTERN

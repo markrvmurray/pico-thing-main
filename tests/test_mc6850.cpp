@@ -63,9 +63,12 @@ static void uart_write(mc6850 &uart, uint8_t byte)
 }
 
 // Simulate a 6809 write to UARTC (control register).
+// Mirrors the real path: write ISR calls control_written_isr() (immediate),
+// then the for(;;) loop calls guest_control() (deferred via write_ring).
 static void uart_control(mc6850 &uart, uint8_t val)
 {
 	registers::write(CONSOLE_CONTROL) = val;
+	uart.control_written_isr(val);
 	uart.guest_control(val);
 }
 
@@ -254,8 +257,8 @@ TEST_CASE("TDRE remains 1 below CTS threshold") {
 	registers::clear();
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
-	// Fill to exactly the threshold (200 bytes)
-	for (int i = 0; i < 200; i++)
+	// Fill to exactly the threshold
+	for (uint i = 0; i < mc6850::CTS_THRESHOLD; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
 
 	CHECK(status().tdre == 1);
@@ -266,7 +269,7 @@ TEST_CASE("CTS deasserts TDRE at threshold+1") {
 	registers::clear();
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
-	for (int i = 0; i < 201; i++)
+	for (uint i = 0; i < mc6850::CTS_THRESHOLD + 1; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
 
 	CHECK(status().tdre == 0);
@@ -277,11 +280,11 @@ TEST_CASE("TDRE recovers after draining below CTS threshold") {
 	registers::clear();
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
-	for (int i = 0; i < 201; i++)
+	for (uint i = 0; i < mc6850::CTS_THRESHOLD + 1; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
 	REQUIRE(status().tdre == 0);
 
-	// Drain two bytes to bring level back to 199 (below 200)
+	// Drain two bytes to bring level below threshold
 	uart.host_receive();
 	uart.host_receive();
 	(void)uart.has_interrupt();
@@ -569,7 +572,7 @@ TEST_CASE("host CTS + queue CTS: both must clear for TDRE=1") {
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
 	// Fill queue past threshold
-	for (int i = 0; i < 201; i++)
+	for (uint i = 0; i < mc6850::CTS_THRESHOLD + 1; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
 	REQUIRE(status().tdre == 0);
 
@@ -577,7 +580,7 @@ TEST_CASE("host CTS + queue CTS: both must clear for TDRE=1") {
 	uart.set_host_cts(true);
 
 	// Drain queue below threshold — host CTS still blocks
-	for (int i = 0; i < 3; i++)
+	for (uint i = 0; i < 3; i++)
 		uart.host_receive();
 	(void)uart.has_interrupt();
 	CHECK(status().tdre == 0);

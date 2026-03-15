@@ -240,7 +240,7 @@ mc6809::apply_rti()
 #endif
 }
 
-#define USB_BUFFER_SIZE 64
+#define USB_BUFFER_SIZE 512
 
 struct uart_port_state {
 	uint8_t rx_buf[USB_BUFFER_SIZE];

@@ -9,7 +9,7 @@
 #include <atomic>
 #include <cstdint>
 
-#define CONSOLE_QUEUE_LEN	256
+#define CONSOLE_QUEUE_LEN	1024
 
 // UART register bits
 #define CONSOLE_NONE		uint8_t(0b00000000u)
@@ -78,12 +78,14 @@ union mc6850_status {
 };
 
 class mc6850 {
+public:
+	static constexpr uint CTS_THRESHOLD = 800u;  // out of CONSOLE_QUEUE_LEN=1024
+private:
 	const uint16_t ctl_offset;	// control (write) / status (read) register offset
 	const uint16_t data_offset;	// TX data (write) / RX data (read) register offset
 	SpscQueue tx;
 	SpscQueue rx;
 	registers &reg;
-	static constexpr uint CTS_THRESHOLD = 200u;  // out of CONSOLE_QUEUE_LEN=256
 	const mc6850_status reset_status = { .tdre = 1 };
 	uint8_t cached_status_byte = 0;
 	interrupt cached_irq_result = INTERRUPT_NONE;

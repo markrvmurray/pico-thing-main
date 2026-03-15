@@ -38,6 +38,9 @@
 #define NUM_FRAMES  16u
 #define TIMEOUT     3000000UL	/* ~30s at 1 MHz E clock */
 
+/* Buffer for block receive — verified in C after the tight asm loop. */
+static uint8_t rx_payload[PAYLOAD_LEN];
+
 /* --- I/O helpers (work with both IRQ and polled io.asm) ---------- */
 
 /* Send one byte via OUTCH (blocks until sent/queued).
@@ -95,7 +98,6 @@ static uint8_t
 send_frame(uint8_t seq, uint16_t len, uint8_t *tx_val)
 {
 	uint8_t chk = 0;
-	uint16_t i;
 	uint8_t b;
 
 	if (aux_send(SOF))       return 1;
@@ -106,11 +108,34 @@ send_frame(uint8_t seq, uint16_t len, uint8_t *tx_val)
 	b = len & 0xFF; chk ^= b;
 	if (aux_send(b))         return 1;
 
-	for (i = 0; i < len; i++) {
-		b = *tx_val;
-		chk ^= b;
-		if (aux_send(b))  return 1;
-		(*tx_val)++;		/* wraps at 256 */
+	/* Payload — tight asm block, ~47 cycles/byte vs ~120 in C.
+	 * OUTCH preserves B,X,Y,U.  A may be destroyed on the O@D
+	 * drain path, so we save/restore it around each call.
+	 * 6809 has no register-to-register XOR, so we XOR via the stack. */
+	{
+		uint8_t sv = *tx_val;
+		uint8_t payload_chk = 0;
+		uint16_t count = len;
+		asm {
+			EXTERN OUTCH, AUX_PORT
+			lda :sv
+			ldx :count
+			clrb
+			pshs u
+			ldu #AUX_PORT
+@sloop			pshs a
+			eorb ,s
+			lbsr OUTCH
+			puls a
+			inca
+			leax -1,x
+			bne @sloop
+			puls u
+			sta :sv
+			stb :payload_chk
+		}
+		*tx_val = sv;
+		chk ^= payload_chk;
 	}
 
 	if (aux_send(chk))       return 1;
@@ -157,19 +182,50 @@ recv_frame(uint8_t expected_seq, uint16_t expected_len,
 		return 3;
 	}
 
-	/* PAYLOAD — verify pattern and accumulate checksum */
-	for (i = 0; i < len; i++) {
-		if (aux_recv(&b))  return 1;
-		chk ^= b;
-		if (b != *rx_expected) {
-			if (*errors < 10)
-				printf("ERR @%u: exp=%02X got=%02X\n",
-					*got, (unsigned)*rx_expected, (unsigned)b);
-			(*errors)++;
-			*rx_expected = b;
+	/* PAYLOAD — tight asm receive into rx_payload[], then verify in C.
+	 * INCH preserves B,X,Y,U; returns byte in A, carry set = got byte.
+	 * No per-byte timeout: spins until each byte arrives.  The Python
+	 * host script has its own 30s timeout if something goes wrong.
+	 * Checksum is computed in the C verification loop to keep the
+	 * asm receive loop as tight as possible (~36 cycles/byte). */
+	{
+		uint16_t count = len;
+		uint8_t *buf = rx_payload;
+		asm {
+			EXTERN INCH, AUX_PORT
+			ldx :buf
+			ldy :count
+			pshs u
+			ldu #AUX_PORT
+@rloop			lbsr INCH
+			bcc @rloop
+			sta ,x+
+			leay -1,y
+			bne @rloop
+			puls u
 		}
-		(*rx_expected)++;
-		(*got)++;
+	}
+	/* Verify pattern and accumulate checksum (in-memory, no I/O). */
+	{
+		uint8_t exp_val = *rx_expected;
+		uint16_t local_got = *got;
+		uint16_t local_errors = *errors;
+		for (i = 0; i < len; i++) {
+			chk ^= rx_payload[i];
+			if (rx_payload[i] != exp_val) {
+				if (local_errors < 10)
+					printf("ERR @%u: exp=%02X got=%02X\n",
+						local_got, (unsigned)exp_val,
+						(unsigned)rx_payload[i]);
+				local_errors++;
+				exp_val = rx_payload[i];
+			}
+			exp_val++;
+			local_got++;
+		}
+		*rx_expected = exp_val;
+		*got = local_got;
+		*errors = local_errors;
 	}
 
 	/* CHK */

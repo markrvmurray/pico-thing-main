@@ -131,7 +131,10 @@ mc6850::guest_control(uint8_t val)
 		loopback_queue = !loopback_close && (cr.divide_select == 0b10u);
 		transmit_irq = cr.tx_irq == 0b01u;
 		receive_irq = cr.rx_irq;
-		rts_deasserted = (cr.tx_irq == 0b10u);	// 0b11 is now close loopback, not RTS
+		// rts_deasserted is NOT set here — control_written_isr() already
+		// updated it immediately in the write ISR.  Setting it here from
+		// the (deferred) write_ring would clobber the current state with
+		// a stale value when write_ring entries pile up.
 		irq_dirty = true;
 		sync_transmit();
 	}

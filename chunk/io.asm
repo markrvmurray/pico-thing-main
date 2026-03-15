@@ -191,7 +191,7 @@ OUTCH	PSHS	CC,B,X
 	LEAX	AP_TXBUF,U
 	LDB	AP_TXPIN,U
 	INCB
-	ANDB	#%00001111	gives MOD 16
+	ANDB	#%00111111	gives MOD 64
 O@0	CMPB	AP_TXPOU,U
 	BEQ	O@0
 	PSHS	B
@@ -213,7 +213,7 @@ O@W	LDA	[AP_CTL,U]	wait for TDRE before each write
 	LDA	B,X
 	STA	[AP_DATA,U]
 	INCB
-	ANDB	#%00001111
+	ANDB	#%00111111
 	STB	AP_TXPOU,U
 	BRA	O@D
 O@X	PULS	CC,B,X,PC
@@ -255,8 +255,27 @@ INCH	PSHS	CC,B,X
 	LEAX	AP_RXBUF,U
 	LDA	B,X		get the byte from the buffer
 	INCB
-	ANDB	#%00001111	gives MOD 16
+	ANDB	#%00111111	gives MOD 64
 	STB	AP_RXPOU,U
+* Re-assert RTS early when ring is half-empty (level <= 32).
+* This lets the Pico stage new bytes while we continue reading,
+* pipelining fill and drain instead of waiting until fully empty.
+	TST	AP_RXFL,U	RTS deasserted?
+	BEQ	I@1		no -> just return the byte
+	LDB	AP_RXPIN,U	level = (in - out) & 63
+	SUBB	AP_RXPOU,U
+	ANDB	#%00111111
+	CMPB	#32
+	BHI	I@1		level > 32 -> too full, keep RTS off
+	CLR	AP_RXFL,U	level <= 32 -> re-assert RTS
+	LDB	AP_TXPIN,U
+	CMPB	AP_TXPOU,U
+	BEQ	I@1A		TX empty -> IQ_RX
+	LDB	IQ_RXTX		TX has data -> IQ_RXTX
+	STB	[AP_CTL,U]
+	BRA	I@1
+I@1A	LDB	IQ_RX
+	STB	[AP_CTL,U]
 I@1	PULS	CC
 	ORCC	C		carry set means got a byte
 	PULS	B,X,PC
@@ -307,79 +326,86 @@ ISR_PORT
 * FALLTHROUGH
 ISR_RET	RTS
 
-TXIRQ	LDB	AP_TXPOU,U
+* TXIRQ — drain loop.  Send bytes while TDRE=1 and the ring has data.
+* When the ring empties: disable TX IRQ (preserve RX/RTS state).
+* When TDRE=0: return normally (TX IRQ still enabled for next TDRE).
+* OUTCH re-enables TX IRQ when it adds data to the ring.
+
+TXIRQ	LEAX	AP_TXBUF,U
+	LDB	AP_TXPOU,U
 	CMPB	AP_TXPIN,U
-	BEQ	TXEMPTY
-	LEAX	AP_TXBUF,U
-	LDA	B,X
-	STA	[AP_DATA,U]	clears the interrupt
+	BEQ	TXEMPTY		ring empty on entry (shouldn't happen)
+TX@L	LDA	B,X		get byte from ring
+	STA	[AP_DATA,U]	send it (clears TDRE)
 	INCB
-	ANDB	#%00001111	gives MOD 16
+	ANDB	#%00111111
 	STB	AP_TXPOU,U
-	BRA	ISR_RET
-
-TXEMPTY	LDA	IQ_RX		interrupts on receiver only
-	STA	[AP_CTL,U]
-	LDA	#$EA
-	STA	AP_ERRNO,U
-	BRA	ISR_RET
-
-RXIRQ	LDB	AP_RXPIN,U
-	INCB
-	ANDB	#%00001111	gives MOD 16
-	CMPB	AP_RXPOU,U
-
-	IFDEF	RXFULL_SAFETY_NET
-	BEQ	RXFULL		if the input buffer is full
-	ELSE
-	BEQ	ISR_RET		if the input buffer is full
-	ENDC
-
-	PSHS	B		save next_in
-	INCB			check: will buffer be full after this store?
-	ANDB	#%00001111
-	CMPB	AP_RXPOU,U
-	BNE	R@0		no room pressure -> normal
-	LDA	#1		buffer will be full: deassert RTS NOW, before LDA ACIARX
-	STA	AP_RXFL,U	so guest_receive() sees rts_deasserted and skips staging
-	LDA	IQ_RTSOFF
-	STA	[AP_CTL,U]
-R@0	LDA	[AP_DATA,U]	clears the interrupt (no next-byte staged if rts_deasserted)
-	LDB	AP_RXPIN,U
-	LEAX	AP_RXBUF,U
-	STA	B,X
-	PULS	B
-	STB	AP_RXPIN,U
-	BRA	ISR_RET
-
-	IFDEF	RXFULL_SAFETY_NET
-
-RXFULL	LDA	#1		safety net: RXIRQ should have caught this earlier
-	STA	AP_RXFL,U
-	LDA	IQ_RTSOFF
-	STA	[AP_CTL,U]	deassert RTS BEFORE LDA ACIARX so guest_receive() skips staging
-
-	LDA	[AP_DATA,U]	clear the interrupt
-	LDA	#$BE		set errno for the user
-	STA	AP_ERRNO,U
-
-* Drain TX ring buffer. Cannot spin on TDRE inside ISR: if TDRE=0, stop
-* early and leave remaining bytes for OUTCH O@D (main loop) to finish.
-	LEAX	AP_TXBUF,U
-F@0	LDB	AP_TXPOU,U
-	CMPB	AP_TXPIN,U
-	BEQ	ISR_RET		TX ring buffer empty
-	LDA	[AP_CTL,U]	check TDRE
+	CMPB	AP_TXPIN,U	ring now empty?
+	BEQ	TX@D		yes -> disable TX IRQ
+	LDA	[AP_CTL,U]	check TDRE for next byte
 	BITA	#S_TDRE
-	BEQ	ISR_RET		TDRE not set: defer remaining bytes to OUTCH O@D
-	LDA	B,X		get byte
-	STA	[AP_DATA,U]	send it
-	INCB
-	ANDB	#%00001111
-	STB	AP_TXPOU,U
-	BRA	F@0
+	BNE	TX@L		TDRE=1 -> send another
+	RTS			TDRE=0 -> done, TX IRQ stays enabled
+TXEMPTY	LDA	#$EA
+	STA	AP_ERRNO,U
+TX@D	TST	AP_RXFL,U	disable TX IRQ, preserve RX/RTS state
+	BNE	TX@R
+	LDA	IQ_RX		RX IRQ only (RTS asserted)
+	STA	[AP_CTL,U]
+	RTS
+TX@R	LDA	IQ_RTSONLY	all off, RTS deasserted
+	STA	[AP_CTL,U]
+	RTS
 
-	ENDC
+* RXIRQ — drain loop.  Read bytes while RDRF=1 and the ring has space.
+* When the ring is full: deassert RTS and disable RX IRQ.
+* When RDRF=0: return normally (IRQ still enabled for next staging).
+* INCH re-enables RX IRQ when the ring drains to half-empty or empty.
+
+RXIRQ	LEAX	AP_RXBUF,U
+RX@L	LDB	AP_RXPIN,U
+	INCB
+	ANDB	#%00111111	next_in
+	CMPB	AP_RXPOU,U
+	BEQ	RX@F		ring full -> deassert RTS, disable RX IRQ
+	PSHS	B		save next_in
+	INCB			will ring be full AFTER this store?
+	ANDB	#%00111111
+	CMPB	AP_RXPOU,U
+	BNE	RX@S		still room -> normal read
+* Last slot: deassert RTS + disable RX IRQ BEFORE reading data
+* register so the Pico sees rts_deasserted and skips staging.
+	LDA	#1
+	STA	AP_RXFL,U
+	LDA	IQ_RTSONLY
+	STA	[AP_CTL,U]
+	LDA	[AP_DATA,U]	read data (clears RDRF)
+	LDB	AP_RXPIN,U
+	STA	B,X		store in ring
+	PULS	B		B = next_in
+	STB	AP_RXPIN,U
+	RTS			ring full -> done
+RX@S	LDA	[AP_DATA,U]	read data (clears RDRF)
+	LDB	AP_RXPIN,U
+	STA	B,X		store in ring
+	PULS	B		B = next_in
+	STB	AP_RXPIN,U
+* More data available? Check RDRF.
+	LDA	[AP_CTL,U]
+	BITA	#S_RDRF
+	BNE	RX@L		yes -> drain another byte
+	RTS			no -> done, IRQ stays enabled
+RX@F
+* Ring is already full when ISR entered.  Deassert RTS + disable RX IRQ.
+* Read and discard the data register byte to clear the interrupt.
+	LDA	#1
+	STA	AP_RXFL,U
+	LDA	IQ_RTSONLY
+	STA	[AP_CTL,U]
+	LDA	[AP_DATA,U]	clear interrupt (byte lost)
+	LDA	#$BE
+	STA	AP_ERRNO,U
+	RTS
 
 	ENDC
 
@@ -391,7 +417,7 @@ F@0	LDB	AP_TXPOU,U
 
 IQ_RX	FCB	C_RX_IRQ
 IQ_RXTX	FCB	C_RX_IRQ|C_TX_IRQ
-IQ_RTSOFF	FCB	C_RX_IRQ|C_RTS_OFF	; rx irq on, rts deasserted (pauses Pico->6809)
+IQ_RTSONLY	FCB	C_RTS_OFF		; rx irq off, rts deasserted (buffer full)
 
 	ENDC
 
