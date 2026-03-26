@@ -57,7 +57,8 @@ busstate(BS_HALT)          \
 busstate(BS_RUNNING_RESET) \
 busstate(BS_IRQ_RESET)     \
 busstate(BS_SYNC_RESET)    \
-busstate(BS_HALT_RESET)
+busstate(BS_HALT_RESET)    \
+busstate(BS_UNPOWERED)
 
 enum ba_bs {
 	foreach_busstate(enum_list)
@@ -70,7 +71,8 @@ union ba_bs_u {
 		uint8_t BS: 1;
 		uint8_t BA: 1;
 		uint8_t RESET: 1;
-		uint8_t : 5;
+		uint8_t UNPOWERED: 1;
+		uint8_t : 4;
 	} bit;
 	enum ba_bs state;
 };
@@ -80,7 +82,8 @@ runstate(RS_STARTED) \
 runstate(RS_INTERRUPTED) \
 runstate(RS_HALTED) \
 runstate(RS_SYNCED) \
-runstate(RS_STOPPED)
+runstate(RS_STOPPED) \
+runstate(RS_UNPOWERED)
 
 enum run_state {
 	foreach_runstate(enum_list)
@@ -119,10 +122,13 @@ private:
 	static constexpr unsigned trace_size = TRACE_SIZE;
 	volatile uint32_t _count_lic;
 	volatile uint32_t _count_rti;
+	volatile uint32_t _count_irq_ack;
 	volatile unsigned trace_pos = 0u;
 	volatile uint32_t trace[trace_size][4u];
 #endif
 	float e_freq;
+	using setup_callback_t = void(*)();
+	setup_callback_t setup_callback = nullptr;
 	void task_initialise();
 	void setup(enum run_state rs);
 	// This is a singleton class
@@ -153,11 +159,17 @@ public:
 	void clear_rti_count() { _count_rti = 0u; }
 	[[nodiscard]] uint32_t get_rti_count() const { return _count_rti; }
 	void count_rti() { _count_rti++; }
+	void clear_irq_ack_count() { _count_irq_ack = 0u; }
+	[[nodiscard]] uint32_t get_irq_ack_count() const { return _count_irq_ack; }
+	void count_irq_ack() { _count_irq_ack++; }
 #endif
 	void init();
+	void deinit();
+	void set_setup_callback(setup_callback_t cb) { setup_callback = cb; }
 	uint8_t task_change(uint8_t new_task);
 	void apply_rti();
 
+	[[nodiscard]] bool assert_powered() const;
 	[[nodiscard]] bool assert_stopped() const;
 	[[nodiscard]] uint8_t task_get() const;
 	void start();
@@ -175,7 +187,13 @@ public:
 	[[nodiscard]] bool is_synced() const { return run_state == RS_SYNCED; };
 	[[nodiscard]] bool is_halted() const { return run_state == RS_HALTED; };
 	[[nodiscard]] bool is_stopped() const { return run_state == RS_STOPPED; }
+	[[nodiscard]] bool is_unpowered() const { return run_state == RS_UNPOWERED; }
 	[[nodiscard]] float get_e_frequency() const;
+	[[nodiscard]] enum run_state get_run_state() const { return run_state; }
+	[[nodiscard]] enum ba_bs get_bus_state() const { return bus_state.state; }
+	[[nodiscard]] enum ba_bs get_old_bus_state() const { return old_bus_state.state; }
+	[[nodiscard]] uint8_t get_task() const { return task; }
+	[[nodiscard]] uint16_t get_task_stack_ptr() const { return task_stack_ptr; }
 	friend void gpio_clock_eq_irq_handler();
 	friend void dma_bus_read_irq_handler();
 	friend void dma_bus_write_irq_handler();

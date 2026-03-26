@@ -24,3 +24,10 @@ static inline bool add_repeating_timer_us(int64_t delay_us,
 	out->user_data = user_data;
 	return true;
 }
+
+// Stub: in tests, nothing to cancel.
+static inline bool cancel_repeating_timer(struct repeating_timer *timer)
+{
+	(void)timer;
+	return true;
+}

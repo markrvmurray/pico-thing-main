@@ -33,7 +33,8 @@ all: $(ASSIST09_TARGETS) \
      acia_torture.s19 acia_torture.bin tick_torture.s19 tick_torture.bin \
      hello.srec hello.raw disk_test.srec disk_test.raw \
      diskload.srec diskload.raw dat_torture.srec dat_torture.raw \
-     stress_acia.srec stress_acia.raw
+     stress_acia.srec stress_acia.raw \
+     irq_test.s19
 
 # -----------------------------------------------------------------------
 # Libraries (IO_OBJ is io.obj or io_noirq.obj depending on IO= setting)

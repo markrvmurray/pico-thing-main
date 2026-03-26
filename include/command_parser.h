@@ -18,6 +18,8 @@ typedef enum cmd_tag {
 	CMD_SYNTAX_ERROR,
 
 	CMD_POWER,
+	CMD_POWER_ON,
+	CMD_POWER_OFF,
 	CMD_VERBOSE,
 	CMD_STATUS,
 	CMD_RESET,
@@ -174,6 +176,11 @@ typedef struct parsed_cmd {
 		struct {
 			uint8_t boot_device; /* 0 = IDE, 1 = DriveWire */
 		} nitros9;
+
+		/* CMD_STATUS */
+		struct {
+			uint32_t period; /* 0 = one-shot, >0 = repeat interval in seconds */
+		} status;
 	};
 } parsed_cmd_t;
 

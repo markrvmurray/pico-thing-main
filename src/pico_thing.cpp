@@ -36,6 +36,7 @@
 #include "tick_timer.h"
 #include "build_time.h"
 #include "command_parser.h"
+#include "status.h"
 
 /* Flex/bison generated scanner API (yy_buffer_state is flex's internal type) */
 extern "C" {
@@ -91,6 +92,12 @@ static pio_dma piodma_write = {
 	DMA_IRQ_1
 };
 
+// PIO program offsets (needed for pio_remove_program on shutdown)
+static int pio_clock_offset;
+static int pio_read_offset;
+static int pio_write_offset;
+static int pio_task_offset;
+
 // PIO-driven task pins (pio2, GPIO base 16, pins 40-45)
 static PIO task_pio;
 static uint task_pio_sm;
@@ -135,12 +142,18 @@ static constexpr uint8_t PEND_IRQ  = 1u << 2;
 // 50 Hz tick timer (IRQ) + E-cycle countdown (NMI).
 static tick_timer system_tick(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
+#ifdef DEBUG
+static volatile uint32_t bs_irq_even_address = 0u;
+static volatile uint32_t bs_irq_odd_address = 0u;
+static volatile uint8_t bs_irq_seq = 0u;       // which order: 1=even first, 2=odd first
+static volatile uint8_t bs_irq_first_a = 0u;   // A[5:0] of first BS_IRQ transition
+static volatile uint8_t bs_irq_second_a = 0u;  // A[5:0] of second BS_IRQ transition
+#endif
 static volatile uint32_t core1_qrise_count = 0u;
 static volatile uint32_t core1_irq_assert_count = 0u;
 static volatile uint32_t core1_loop_count = 0u;
 static volatile uint32_t core1_write_ring_count = 0u;
 static volatile uint32_t core1_read_irq_count = 0u;
-static volatile uint8_t core1_loop_phase = 0u;
 static volatile uint8_t core1_last_write_loc = 0u;
 static volatile uint8_t core1_last_read_loc = 0u;
 static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
@@ -166,8 +179,8 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// by Q-falling the 6809 has already updated them for the next cycle). Unpack
 		// immediately so that vma is valid before the DMA read ISR fires (~20 cycles later).
 		MC6809.set_busy_lic_avma(static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA));
-		ba_bs_u new_bus_state{};
-		new_bus_state.byte = ((bus_pins.bits.BS_BA) & 0b00000011u);
+		ba_bs_u new_bus_state = { .byte = static_cast<uint8_t>(bus_pins.bits.BS_BA) };
+		uint8_t address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
 		new_bus_state.bit.RESET = RESET_IS_ASSERTED;
 #ifdef DEBUG
 		MC6809.count_lic();
@@ -177,14 +190,35 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			MC6809.bus_state.state = new_bus_state.state;
 			MC6809.run_state = run_state_table[MC6809.run_state][MC6809.bus_state.state];
 			if (new_bus_state.state == BS_IRQ) {
-				auto eirq = static_cast<interrupt>(bus_pins.bits.A >> 1);
+				auto eirq = static_cast<interrupt>(address_lsb >> 1);
 				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < MAX_INT_NEST_DEPTH)
 					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
+#ifdef DEBUG
+				// The 6809 asserts BS_IRQ twice per interrupt (high and
+				// low vector byte fetch). Count raw transitions; the
+				// test harness divides by 2 and checks for evenness.
+				if ((address_lsb & 0x3E) != 0x3E) {
+					// Not RESET
+					MC6809.count_irq_ack();
+					// Diagnostic: record A[5:0] in arrival order
+					if (bs_irq_seq == 0u)
+						bs_irq_first_a = bus_pins.bits.A;
+					else if (bs_irq_seq == 1u)
+						bs_irq_second_a = bus_pins.bits.A;
+					bs_irq_seq++;
+					if (bs_irq_seq == 2u)
+						bs_irq_seq = 0u;
+				}
+
+#endif
 			}
 		}
 		// E-cycle countdown NMI timer
+#if 0
 		if (system_tick.tick())
 			pending_interrupts |= PEND_NMI;
+#endif
+
 		// Assert/deassert all interrupt pins from cached pending state.
 		// NMI is edge-triggered (one-shot): assert once and clear flag.
 		// IRQ/FIRQ are level-triggered: assert when pending, deassert
@@ -196,7 +230,8 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			if (pend & PEND_NMI) {
 				ASSERT_NMI;
 				pending_interrupts = pend & ~PEND_NMI;
-			}
+			} else
+				DEASSERT_NMI;
 			if (pend & PEND_FIRQ) ASSERT_FIRQ; else DEASSERT_FIRQ;
 			if (pend & PEND_IRQ)  ASSERT_IRQ;  else DEASSERT_IRQ;
 		}
@@ -206,10 +241,10 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
-		// Grab the current 8 D pins if this is a read cycle, and the LIC timing lets us
-		// know it is an instruction, and it is the last byte of the snippet block.
-		// I want to catch RTI (0x3B).
-		if (MC6809.get_lic() && bus_pins.bits.RW && !bus_pins.bits.CS && bus_pins.bits.A == ((REGISTER_SNIPPET + REGISTER_SNIPPET_LEN - 1) & registers::register_mask) && bus_pins.bits.D == 0x3Bu)
+		// Universal RTI detection: LIC=1 means the 6809 is fetching the
+		// next opcode. If it's a read cycle and D=$3B, that opcode is RTI.
+		// Works for any address — no CS or address check needed.
+		if (MC6809.get_lic() && bus_pins.bits.RW && bus_pins.bits.D == 0x3Bu)
 			MC6809.apply_rti();
 		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
 		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
@@ -499,9 +534,7 @@ peripheral_clear(const bool sysvectors)
 	AUX_ACIA_RX_DATA_COUNT = 0u;
 #endif
 
-	// Reset emulated peripherals (as a real !RESET would)
-	fast_serial.reset();
-	aux_serial.reset();
+	// Reset tick timer (ACIA resets are owned by Core 1)
 	system_tick.reset();
 }
 
@@ -636,6 +669,254 @@ console_has_interrupt()
 }
 
 void
+status_gather(status_snapshot_t *s)
+{
+	s->run_state = MC6809.get_run_state();
+	s->bus_state = MC6809.get_bus_state();
+	s->old_bus_state = MC6809.get_old_bus_state();
+	s->task = MC6809.get_task();
+	s->task_stack_ptr = MC6809.get_task_stack_ptr();
+	for (uint16_t i = 0; i < s->task_stack_ptr && i < STATUS_MAX_INT_NEST_DEPTH; i++)
+		s->task_history[i] = task_stack[i];
+
+	s->power = POWER_IS_ASSERTED;
+	s->reset = RESET_IS_ASSERTED;
+	s->halt = HALT_IS_ASSERTED;
+	s->nmi = NMI_IS_ASSERTED;
+	s->firq = FIRQ_IS_ASSERTED;
+	s->irq = IRQ_IS_ASSERTED;
+
+#ifdef DEBUG
+	static uint32_t last_LIC = 0u;
+	s->lic_count = MC6809.get_lic_count();
+	s->rti_count = MC6809.get_rti_count();
+	s->last_lic = last_LIC;
+	s->lic_stalled = false;
+	if (MC6809.is_started()) {
+		if (last_LIC != s->lic_count)
+			last_LIC = s->lic_count;
+		else
+			s->lic_stalled = true;
+	}
+#endif
+
+	registers::copy_out_write(s->write_regs, 0, 64);
+	registers::copy_out(s->read_regs, 0, 64);
+
+	s->tick_enabled = system_tick.is_enabled();
+	s->tick_irq_pending = system_tick.is_irq_pending();
+
+	s->core1_loop = core1_loop_count;
+	s->core1_qrise = core1_qrise_count;
+	s->core1_irq_assert = core1_irq_assert_count;
+	s->core1_write_ring = core1_write_ring_count;
+	s->core1_read_irq = core1_read_irq_count;
+	s->core1_last_write = core1_last_write_loc;
+	s->core1_last_read = core1_last_read_loc;
+	s->core1_isr = core1_isr_count;
+	{
+		volatile uint32_t *bottom = &__StackOneBottom;
+		volatile uint32_t *top = &__StackOneTop;
+		volatile uint32_t *p = bottom;
+		while (p < top && *p == 0xDEADBEEFu)
+			p++;
+		s->core1_stack_total = (top - bottom) * sizeof(uint32_t);
+		s->core1_stack_free = (p - bottom) * sizeof(uint32_t);
+	}
+
+	s->console_acia.interrupt_status = fast_serial.interrupt_status();
+	s->console_acia.tx_level = fast_serial.receive_level();
+	s->console_acia.rx_level = fast_serial.transmit_level();
+#ifdef DEBUG
+	s->console_acia.control_count = ACIA_CONTROL_COUNT;
+	s->console_acia.tx_data_count = ACIA_TX_DATA_COUNT;
+	s->console_acia.status_count = ACIA_STATUS_COUNT;
+	s->console_acia.rx_data_count = ACIA_RX_DATA_COUNT;
+#endif
+
+	s->aux_acia.interrupt_status = aux_serial.interrupt_status();
+	s->aux_acia.tx_level = aux_serial.receive_level();
+	s->aux_acia.rx_level = aux_serial.transmit_level();
+#ifdef DEBUG
+	s->aux_acia.control_count = AUX_ACIA_CONTROL_COUNT;
+	s->aux_acia.tx_data_count = AUX_ACIA_TX_DATA_COUNT;
+	s->aux_acia.status_count = AUX_ACIA_STATUS_COUNT;
+	s->aux_acia.rx_data_count = AUX_ACIA_RX_DATA_COUNT;
+#endif
+}
+
+static void
+status_print_regs(const char *label, const uint8_t *regs)
+{
+	uint8_t printables[17];
+	printf("%s:\n", label);
+	for (uint16_t i = 0u; i < 4u; i++) {
+		memcpy(printables, regs + i * 16u, 16u);
+		printf("%04X:", REGISTER_BASE + i * 16u);
+		for (uint16_t j = 0u; j < 16u; j++) {
+			auto ch = static_cast<unsigned char>(printables[j]) & 0x7F;
+			printf(" %02X", printables[j]);
+			if (j == 7u)
+				printf(" ");
+			printables[j] = std::isprint(ch) ? static_cast<char>(ch) : '.';
+		}
+		printables[16] = '\0';
+		printf(" |%.8s|%.8s|\n", reinterpret_cast<char *>(printables), reinterpret_cast<char *>(printables + 8));
+	}
+}
+
+void
+status_print(const status_snapshot_t *s)
+{
+	// 1. Signals — POWER/RESET/HALT lined up with NMI/FIRQ/IRQ
+	//    Columns at 0, 19, 38.  Colons at 6, 25, 44.  Values at 8, 27, 46.
+	printf("POWER: %-12sRESET: %-12s HALT: %s\n",
+	       s->power ? "HIGH" : "low",
+	       !s->reset ? "high" : "LOW",
+	       !s->halt ? "high" : "LOW");
+	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
+	       s->nmi ? "OUTPUT LOW" : "hi-z",
+	       s->firq ? "OUTPUT LOW" : "hi-z",
+	       s->irq ? "OUTPUT LOW" : "hi-z");
+	printf("\n");
+
+	// 2. Bus state, run state
+	printf("Bus State: %-16s  Prev: %-16s\n",
+	       ba_bs_string[s->bus_state], ba_bs_string[s->old_bus_state]);
+	printf("Run State: %s\n", run_state_string[s->run_state]);
+	printf("Task: %u  History:", s->task);
+	if (s->task_stack_ptr == 0)
+		printf(" -");
+	else
+		for (uint16_t i = 0; i < s->task_stack_ptr; i++)
+			printf(" %u", s->task_history[i]);
+	printf("\n");
+
+	// 3. LIC / RTI (DEBUG only)
+#ifdef DEBUG
+	printf("LIC: %-10lu  RTI: %-10lu\n", s->lic_count, s->rti_count);
+	if (s->lic_stalled)
+		printf("WARNING: LIC stalled at %lu, run state is %s\n",
+		       s->lic_count, run_state_string[s->run_state]);
+	printf("\n");
+#endif
+
+	// 4. Register hex dump
+	printf("Registers:\n");
+	status_print_regs("Write block", s->write_regs);
+	status_print_regs("Read block", s->read_regs);
+	printf("\n");
+
+	// 5. Tick timer + Core 1 table
+	printf("Tick:  Enabled: %-3s  IRQ Pending: %-3s\n",
+	       s->tick_enabled ? "yes" : "no",
+	       s->tick_irq_pending ? "yes" : "no");
+	printf("Core 1:\n");
+	printf("       Loop     Q Rise   IRQ Asrt   Wrt Ring   Read IRQ        ISR\n");
+	printf("  %9lu  %9lu  %9lu  %9lu  %9lu  %9lu\n",
+	       s->core1_loop, s->core1_qrise, s->core1_irq_assert,
+	       s->core1_write_ring, s->core1_read_irq, s->core1_isr);
+	printf("  Last Write: %02X   Last Read: %02X\n",
+	       s->core1_last_write, s->core1_last_read);
+	printf("  Stack Total: %lu  Free (min): %lu  Used (max): %lu\n",
+	       s->core1_stack_total, s->core1_stack_free,
+	       s->core1_stack_total - s->core1_stack_free);
+	printf("\n");
+
+	// 6. ACIA table — two data rows
+#ifdef DEBUG
+	printf("ACIA:        IRQ  Tx Lvl  Rx Lvl  Control  Tx Data   Status  Rx Data\n");
+	printf("  Console     %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
+	       s->console_acia.interrupt_status,
+	       s->console_acia.tx_level, s->console_acia.rx_level,
+	       s->console_acia.control_count, s->console_acia.tx_data_count,
+	       s->console_acia.status_count, s->console_acia.rx_data_count);
+	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
+	       s->aux_acia.interrupt_status,
+	       s->aux_acia.tx_level, s->aux_acia.rx_level,
+	       s->aux_acia.control_count, s->aux_acia.tx_data_count,
+	       s->aux_acia.status_count, s->aux_acia.rx_data_count);
+#else
+	printf("ACIA:        IRQ  Tx Lvl  Rx Lvl\n");
+	printf("  Console     %02X  %6u  %6u\n",
+	       s->console_acia.interrupt_status,
+	       s->console_acia.tx_level, s->console_acia.rx_level);
+	printf("  Aux         %02X  %6u  %6u\n",
+	       s->aux_acia.interrupt_status,
+	       s->aux_acia.tx_level, s->aux_acia.rx_level);
+#endif
+}
+
+static void
+status_json_regs(const char *name, const uint8_t *regs)
+{
+	printf("\"%s\":\"", name);
+	for (int i = 0; i < 64; i++) {
+		if (i > 0) printf(" ");
+		printf("%02X", regs[i]);
+	}
+	printf("\"");
+}
+
+static void
+status_json_acia(const char *name, const acia_status_t *a)
+{
+	printf("\"%s\":{\"interrupt_status\":%u,\"tx_level\":%u,\"rx_level\":%u", name,
+	       a->interrupt_status, a->tx_level, a->rx_level);
+#ifdef DEBUG
+	printf(",\"control_count\":%u,\"tx_data_count\":%u,\"status_count\":%u,\"rx_data_count\":%u",
+	       a->control_count, a->tx_data_count, a->status_count, a->rx_data_count);
+#endif
+	printf("}");
+}
+
+void
+status_json(const status_snapshot_t *s)
+{
+	printf("{\"run_state\":\"%s\",\"bus_state\":\"%s\",\"old_bus_state\":\"%s\"",
+	       run_state_string[s->run_state], ba_bs_string[s->bus_state],
+	       ba_bs_string[s->old_bus_state]);
+	printf(",\"task\":%u,\"task_stack_ptr\":%u", s->task, s->task_stack_ptr);
+	printf(",\"task_history\":[");
+	for (uint16_t i = 0; i < s->task_stack_ptr; i++) {
+		if (i > 0) printf(",");
+		printf("%u", s->task_history[i]);
+	}
+	printf("]");
+	printf(",\"power\":%s,\"reset\":%s,\"halt\":%s,\"nmi\":%s,\"firq\":%s,\"irq\":%s",
+	       s->power ? "true" : "false", s->reset ? "true" : "false",
+	       s->halt ? "true" : "false", s->nmi ? "true" : "false",
+	       s->firq ? "true" : "false", s->irq ? "true" : "false");
+#ifdef DEBUG
+	printf(",\"lic_count\":%lu,\"rti_count\":%lu,\"lic_stalled\":%s",
+	       s->lic_count, s->rti_count, s->lic_stalled ? "true" : "false");
+#endif
+	printf(",");
+	status_json_regs("write_regs", s->write_regs);
+	printf(",");
+	status_json_regs("read_regs", s->read_regs);
+	printf(",\"tick_enabled\":%s,\"tick_irq_pending\":%s",
+	       s->tick_enabled ? "true" : "false",
+	       s->tick_irq_pending ? "true" : "false");
+	printf(",\"core1_loop\":%lu,\"core1_qrise\":%lu,\"core1_irq_assert\":%lu",
+	       s->core1_loop, s->core1_qrise, s->core1_irq_assert);
+	printf(",\"core1_write_ring\":%lu,\"core1_read_irq\":%lu",
+	       s->core1_write_ring, s->core1_read_irq);
+	printf(",\"core1_last_write\":%u,\"core1_last_read\":%u,\"core1_isr\":%lu",
+	       s->core1_last_write, s->core1_last_read, s->core1_isr);
+	printf(",\"core1_stack_total\":%lu,\"core1_stack_free\":%lu",
+	       s->core1_stack_total, s->core1_stack_free);
+	printf(",");
+	status_json_acia("console_acia", &s->console_acia);
+	printf(",");
+	status_json_acia("aux_acia", &s->aux_acia);
+	printf("}\n");
+}
+
+static void set_power();
+static void reset_power();
+
+void
 process_command(char *buf)
 {
 	static uint8_t buffer[256];
@@ -653,7 +934,23 @@ process_command(char *buf)
 	switch (cmd.tag) {
 
 	case CMD_POWER:
-		// TODO: MarkM: Start powered-down, and refactor for user-controlled power-on and -off.
+		printf("Power is %s\n", POWER_IS_ASSERTED ? "on" : "off");
+		break;
+
+	case CMD_POWER_ON:
+		if (POWER_IS_ASSERTED) {
+			printf("Power is already on\n");
+		} else {
+			set_power();
+		}
+		break;
+
+	case CMD_POWER_OFF:
+		if (!POWER_IS_ASSERTED) {
+			printf("Power is already off\n");
+		} else {
+			reset_power();
+		}
 		break;
 
 	case CMD_VERBOSE:
@@ -662,91 +959,29 @@ process_command(char *buf)
 		break;
 
 	case CMD_STATUS: {
-#ifdef NO_ADC_YET
-		constexpr float conversion_factor = ((2.5334f*2.0f)/5.0f)*3.3f/(1 << 12);
-		adc_select_input(7);
-		uint16_t raw_vcc = adc_read();
-		printf("External Vcc = %.1f V\n", 2.0f * conversion_factor * static_cast<float>(raw_vcc));
-		adc_select_input(8);
-		uint16_t raw_temp = adc_read();
-		float voltage_temp = conversion_factor * static_cast<float>(raw_temp);
-		float temperature = 27.0f - (voltage_temp - 0.706f)/0.001721f;
-		printf("Pico2 temperature = %.1f C\n", temperature);
-#endif
-		printf("Run state: %u = %s\n", MC6809.run_state, run_state_string[MC6809.run_state]);
-		printf("Bus State: %u = %s\t(previous is %u = %s)\n",
-		       MC6809.bus_state.state,
-		       ba_bs_string[MC6809.bus_state.state],
-		       MC6809.old_bus_state.state,
-		       ba_bs_string[MC6809.old_bus_state.state]);
-		printf("Task: %u\n", MC6809.task);
-		printf("Interrupt task history:");
-		for (uint16_t i = 0; i < MC6809.task_stack_ptr; i++)
-			printf(" %u", task_stack[i]);
-		printf("\n");
-		printf("POWER pin: %s\n", POWER_IS_ASSERTED ? "HIGH" : "low");
-		printf("RESET pin: %s\n", !RESET_IS_ASSERTED ? "high" : "LOW");
-		printf(" HALT pin: %s\n", !HALT_IS_ASSERTED ? "high" : "LOW");
-		printf("  NMI pin: %s\n", NMI_IS_ASSERTED ? "OUTPUT LOW" : "hi-z");
-		printf(" FIRQ pin: %s\n", FIRQ_IS_ASSERTED ? "OUTPUT LOW" : "hi-z");
-		printf("  IRQ pin: %s\n", IRQ_IS_ASSERTED ? "OUTPUT LOW" : "hi-z");
-#ifdef DEBUG
-		static uint32_t last_LIC = 0u;
-		printf("LIC count: %lu\n", MC6809.get_lic_count());
-		if (MC6809.is_started()) {
-			uint32_t LIC = MC6809.get_lic_count();
-			if (last_LIC != LIC)
-				last_LIC = LIC;
-			else
-				printf("WARNING: LIC count is same as last time (%u), but the run state is %s\n", LIC, run_state_string[MC6809.run_state]);
+		status_snapshot_t snap;
+		status_gather(&snap);
+		status_print(&snap);
+		uint32_t period = cmd.status.period;
+		while (period > 0u) {
+			for (uint32_t i = 0u; i < period * 1000u; i++) {
+				usb_poll();
+				if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT)
+					goto status_done;
+				MC6809.uart_task(true);
+				sleep_ms(1u);
+			}
+			printf("%s%s", ANSI_CLEAR_SCREEN, ANSI_CURSOR_HOME);
+			status_gather(&snap);
+			status_print(&snap);
 		}
-		printf("RTI count: %lu\n", MC6809.get_rti_count());
-#endif
-		printf("Register and emulated RAM block:\n");
-		registers::dump();
-		printf("Tick timer: enabled=%d  irq_pending=%d\n",
-		       (int)system_tick.is_enabled(), (int)system_tick.is_irq_pending());
-		printf("Core1 loop: %lu  q_rise: %lu  irq_assert: %lu\n",
-		       core1_loop_count, core1_qrise_count, core1_irq_assert_count);
-		printf("Core1 write_ring: %lu  read_irq: %lu\n",
-		       core1_write_ring_count, core1_read_irq_count);
-		printf("Core1 phase: %u  last_write: %02X  last_read: %02X  isr: %lu\n",
-		       core1_loop_phase, core1_last_write_loc, core1_last_read_loc,
-		       core1_isr_count);
-		{
-			// Scan stack watermark from bottom to find high-water mark
-			volatile uint32_t *bottom = &__StackOneBottom;
-			volatile uint32_t *top = &__StackOneTop;
-			volatile uint32_t *p = bottom;
-			while (p < top && *p == 0xDEADBEEFu)
-				p++;
-			uint32_t stack_total = (top - bottom) * sizeof(uint32_t);
-			uint32_t stack_free = (p - bottom) * sizeof(uint32_t);
-			printf("Core1 stack: %lu total, %lu free (min), %lu used (max)\n",
-			       stack_total, stack_free, stack_total - stack_free);
-		}
-		printf("Console ACIA:\n");
-		printf("Interrupt status: %02X\n", fast_serial.interrupt_status());
-		printf("TxQueue: %u\n", fast_serial.receive_level());
-		printf("RxQueue: %u\n", fast_serial.transmit_level());
-#ifdef DEBUG
-		printf("Register access counts\n");
-		printf("Control: %5u\tTx: %5u\n", ACIA_CONTROL_COUNT, ACIA_TX_DATA_COUNT);
-		printf("Status:  %5u\tRx: %5u\n", ACIA_STATUS_COUNT, ACIA_RX_DATA_COUNT);
-#endif
-		printf("Aux ACIA:\n");
-		printf("Interrupt status: %02X\n", aux_serial.interrupt_status());
-		printf("TxQueue: %u\n", aux_serial.receive_level());
-		printf("RxQueue: %u\n", aux_serial.transmit_level());
-#ifdef DEBUG
-		printf("Register access counts\n");
-		printf("Control: %5u\tTx: %5u\n", AUX_ACIA_CONTROL_COUNT, AUX_ACIA_TX_DATA_COUNT);
-		printf("Status:  %5u\tRx: %5u\n", AUX_ACIA_STATUS_COUNT, AUX_ACIA_RX_DATA_COUNT);
-#endif
+status_done:
 		break;
 	}
 
 	case CMD_RESET:
+		if (!MC6809.assert_powered())
+			break;
 		peripheral_clear(false);
 		break;
 
@@ -886,6 +1121,8 @@ process_command(char *buf)
 	}
 
 	case CMD_SNIPPET: {
+		if (!MC6809.assert_powered())
+			break;
 		const uint8_t count = cmd.snippet.count;
 		printf("%04X:", 0xFFE0u);
 		for (uint16_t i = 0; i < count; i++) {
@@ -899,6 +1136,8 @@ process_command(char *buf)
 	}
 
 	case CMD_LOOP:
+		if (!MC6809.assert_powered())
+			break;
 		snippet_copy(LOOP_RW);
 		reg[REGISTER_SNIPPET_OFFSET + 0u] = cmd.loop.opcode;
 		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.loop.address;
@@ -906,6 +1145,8 @@ process_command(char *buf)
 		break;
 
 	case CMD_VECTOR:
+		if (!MC6809.assert_powered())
+			break;
 		printf("%04X:", 0xFFF0u);
 		for (uint16_t i = 0; i < 8u; i++) {
 			reg[REGISTER_VECTORS_OFFSET + 2u*i] = cmd.vector.vec[i];
@@ -954,6 +1195,8 @@ process_command(char *buf)
 	}
 
 	case CMD_GO:
+		if (!MC6809.assert_powered())
+			break;
 		fast_serial.reset();
 		aux_serial.reset();
 		system_tick.reset();
@@ -961,6 +1204,8 @@ process_command(char *buf)
 		break;
 
 	case CMD_GO_ADDR:
+		if (!MC6809.assert_powered())
+			break;
 		fast_serial.reset();
 		aux_serial.reset();
 		system_tick.reset();
@@ -969,10 +1214,14 @@ process_command(char *buf)
 		break;
 
 	case CMD_TASK_QUERY:
+		if (!MC6809.assert_powered())
+			break;
 		printf("Task = %u\n", MC6809.task);
 		break;
 
 	case CMD_TASK_SET: {
+		if (!MC6809.assert_powered())
+			break;
 		uint8_t task = MC6809.task_change(cmd.task.tasknum);
 		task_pins_update(task);
 		printf("Task = %u\n", task);
@@ -985,9 +1234,19 @@ process_command(char *buf)
 		uint16_t final_stack_length = 0u;
 		const char *test_name = nullptr;
 		const uint8_t hexnum = cmd.irq.testnum;
+#ifdef DEBUG
+		uint32_t expected_rti_count = 0u;
+		uint32_t expected_irq_ack_count = 0u;
+#endif
 
 		if (!MC6809.assert_stopped())
 			break;
+
+		// Chunk-based test (irq 6) handles its own setup — skip the
+		// ZERO preamble which would wipe the S-record-loaded vectors.
+		if (hexnum == 6)
+			goto irq_chunk_test;
+
 		for (int i = 0; i < 16; i++) {
 			registers::write(REGISTER_BUFFER_OFFSET + i) = static_cast<uint8_t>(0x00);
 			reg[REGISTER_BUFFER_OFFSET + i] = static_cast<uint8_t>(0x00);
@@ -999,6 +1258,15 @@ process_command(char *buf)
 			printf("Zero failed — CPU did not respond\n");
 			break;
 		}
+#ifdef DEBUG
+		MC6809.clear_rti_count();
+		MC6809.clear_irq_ack_count();
+		bs_irq_even_address = 0u;
+		bs_irq_odd_address = 0u;
+		bs_irq_seq = 0u;
+		bs_irq_first_a = 0u;
+		bs_irq_second_a = 0u;
+#endif
 
 		if (hexnum == 0) {
 			printf("Interrupt strobe test. Hit any key to continue.\n");
@@ -1032,6 +1300,9 @@ process_command(char *buf)
 			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
 			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
+#ifdef DEBUG
+			expected_irq_ack_count = 1u;
+#endif
 		} else if (hexnum == 2) {
 			static constexpr const char *testname = "NMI";
 			static constexpr uint16_t stack_result_length = 12u;
@@ -1048,6 +1319,9 @@ process_command(char *buf)
 			MC6809.stop();
 			console_set_interrupt(INTERRUPT_NONE);
 			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
+#ifdef DEBUG
+			expected_irq_ack_count = 1u;
+#endif
 		} else if (hexnum == 3) {
 			static constexpr const char *testname = "IRQ";
 			static constexpr uint16_t stack_result_length = 12u;
@@ -1064,6 +1338,9 @@ process_command(char *buf)
 			MC6809.stop();
 			console_set_interrupt(INTERRUPT_NONE);
 			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
+#ifdef DEBUG
+			expected_irq_ack_count = 1u;
+#endif
 		} else if (hexnum == 4) {
 			static constexpr const char *testname = "FIRQ";
 			static constexpr uint16_t stack_result_length = 3u;
@@ -1080,13 +1357,20 @@ process_command(char *buf)
 			MC6809.stop();
 			console_set_interrupt(INTERRUPT_NONE);
 			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
-		} else {
+#ifdef DEBUG
+			expected_irq_ack_count = 1u;
+#endif
+		} else if (hexnum == 5) {
 			static constexpr const char *testname = "RTI";
 			static constexpr uint16_t stack_result_length = 12u;
 			static constexpr uint8_t stack_result[stack_result_length] = {
 				0x80, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x90, 0xFF, 0xE7
 			};
 			printf("RTI Test\n");
+#ifdef DEBUG
+			expected_rti_count = 2u;
+			expected_irq_ack_count = 1u;
+#endif
 			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 9);
 			for (uint16_t i = 0; i < stack_result_length; i++)
 				reg[REGISTER_BUFFER_OFFSET + (16u - stack_result_length) + i] = stack_result[i];
@@ -1096,6 +1380,86 @@ process_command(char *buf)
 			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
 			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
+		} else {
+		irq_chunk_test:
+			// Chunk-based interrupt test (irq 6)
+			// Requires irq_test.s19 pre-loaded by pasting at console.
+			// The chunk sets up its own vectors, runs SWI/SWI2/SWI3,
+			// then signals DONE. Pico delivers NMI, FIRQ, IRQ and checks results.
+			printf("Interrupt chunk test\n");
+			printf("(Requires irq_test.s19 pasted at console)\n");
+
+			// Reset vector already set by S9 record
+#ifdef DEBUG
+			MC6809.clear_rti_count();
+			MC6809.clear_irq_ack_count();
+#endif
+			MC6809.start();
+
+			// Wait for READY signal (chunk has installed vectors)
+			while (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 0]) == 0u) {
+				sleep_us(1);
+				if (++timeout > 1000000u) break;
+			}
+			if (timeout > 1000000u) {
+				printf("Timeout waiting for READY\n");
+				MC6809.stop();
+				break;
+			}
+
+			// Wait for DONE signal (SWI/SWI2/SWI3 complete, interrupts unmasked)
+			while (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 7]) == 0u) {
+				sleep_us(1);
+				if (++timeout > 1000000u) break;
+			}
+			if (timeout > 1000000u) {
+				printf("Timeout waiting for DONE\n");
+				MC6809.stop();
+				break;
+			}
+
+			// Deliver hardware interrupts — assert briefly, deassert,
+			// then delay to let the 6809 process the ISR and RTI.
+			console_set_interrupt(INTERRUPT_NMI);
+			sleep_us(5u);
+			console_set_interrupt(INTERRUPT_NONE);
+			sleep_ms(2u);
+
+			console_set_interrupt(INTERRUPT_FIRQ);
+			sleep_us(5u);
+			console_set_interrupt(INTERRUPT_NONE);
+			sleep_ms(2u);
+
+			console_set_interrupt(INTERRUPT_IRQ);
+			sleep_us(5u);
+			console_set_interrupt(INTERRUPT_NONE);
+			sleep_ms(2u);
+
+			MC6809.stop();
+
+			// Check results in SHARED buffer
+			static const struct { const char *name; uint8_t offset; uint8_t expected; } checks[] = {
+				{"SWI",  1, 0x11},
+				{"SWI2", 2, 0x22},
+				{"SWI3", 3, 0x33},
+				{"NMI",  4, 0xAA},
+				{"FIRQ", 5, 0xBB},
+				{"IRQ",  6, 0xCC},
+			};
+			bool success = true;
+			for (const auto &c : checks) {
+				const uint8_t got = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + c.offset]);
+				const bool ok = (got == c.expected);
+				if (!ok) success = false;
+				printf("  %s: %s (expected 0x%02X, got 0x%02X)\n",
+				       c.name, ok ? "PASS" : "FAIL", c.expected, got);
+			}
+#ifdef DEBUG
+			printf("  IRQ ack: raw %lu, RTI: %lu\n",
+			       MC6809.get_irq_ack_count(), MC6809.get_rti_count());
+#endif
+			printf("Interrupt chunk test: %s\n", success ? "PASS" : "FAIL");
+			break;
 		}
 
 		if (final_stack_length) {
@@ -1114,12 +1478,37 @@ process_command(char *buf)
 			}
 			printf("%s: Timeout counter: %u  Test result: %s\n",
 			       test_name, timeout, success ? "PASS" : "FAIL");
+#ifdef DEBUG
+			// The 6809 asserts BS_IRQ twice per interrupt (2 vector bytes).
+			// Raw count should be 2x expected and always even.
+			const uint32_t irq_ack_raw = MC6809.get_irq_ack_count();
+			const bool irq_ack_even = (irq_ack_raw % 2u == 0u);
+			const uint32_t irq_ack_count = irq_ack_raw / 2u;
+			const bool irq_ack_ok = irq_ack_even && (irq_ack_count == expected_irq_ack_count);
+			if (!irq_ack_ok)
+				success = false;
+			printf("%s: IRQ acknowledge: %s (expected %lu, got %lu, raw %lu %s)\n",
+			       test_name, irq_ack_ok ? "PASS" : "FAIL",
+			       expected_irq_ack_count, irq_ack_count,
+			       irq_ack_raw, irq_ack_even ? "even" : "ODD");
+			printf("%s: BS_IRQ diagnostic: 1st=0x%02X 2nd=0x%02X count=%u\n",
+			       test_name, bs_irq_first_a, bs_irq_second_a, bs_irq_seq);
+			const uint32_t rti_caught = MC6809.get_rti_count();
+			const bool rti_ok = (rti_caught == expected_rti_count);
+			if (!rti_ok)
+				success = false;
+			printf("%s: RTI capture: %s (expected %lu, got %lu)\n",
+			       test_name, rti_ok ? "PASS" : "FAIL",
+			       expected_rti_count, rti_caught);
+#endif
 		}
 		break;
 	}
 
 	case CMD_TRACE:
 	case CMD_TRACE_LEN:
+		if (!MC6809.assert_powered())
+			break;
 #ifdef DEBUG_NOT_NOW
 	{
 		uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, trace_pos) : trace_pos;
@@ -1188,22 +1577,32 @@ process_command(char *buf)
 	}
 
 	case CMD_STOP:
+		if (!MC6809.assert_powered())
+			break;
 		MC6809.stop();
 		break;
 
 	case CMD_STOP_HALT:
+		if (!MC6809.assert_powered())
+			break;
 		MC6809.halt();
 		break;
 
 	case CMD_STOP_RESTART:
+		if (!MC6809.assert_powered())
+			break;
 		MC6809.release();
 		break;
 
 	case CMD_STOP_STOP:
+		if (!MC6809.assert_powered())
+			break;
 		MC6809.stop();
 		break;
 
 	case CMD_BREAK: {
+		if (!MC6809.assert_powered())
+			break;
 		if (break_active != INTERRUPT_NONE) {
 			printf("Break already active (use 'break return' first)\n");
 			break;
@@ -1256,6 +1655,8 @@ process_command(char *buf)
 		break;
 
 	case CMD_BREAK_RETURN:
+		if (!MC6809.assert_powered())
+			break;
 		if (break_active == INTERRUPT_NONE) {
 			printf("No active break to return from\n");
 			break;
@@ -1268,6 +1669,8 @@ process_command(char *buf)
 		break;
 
 	case CMD_FREQ:
+		if (!MC6809.assert_powered())
+			break;
 		MC6809.set_e_frequency(cmd.freq.mhz, pio_clock);
 		printf("Set E to %.1f MHz\n", MC6809.get_e_frequency());
 		break;
@@ -1295,6 +1698,8 @@ process_command(char *buf)
 	}
 
 	case CMD_SRECORD: {
+		if (!MC6809.assert_powered())
+			break;
 		static bool srecord_ignore = false;
 		uint8_t count;
 		uint16_t address;
@@ -1432,8 +1837,8 @@ poll_console()
 						printf("*** ISRs also stopped — probable hard fault or deadlock\n");
 					else
 						printf("*** ISRs still running — thread mode starved or hung\n");
-					printf("  phase=%u  loop=%lu  isr=%lu\n",
-					       core1_loop_phase, cur_loop, cur_isr);
+					printf("  loop=%lu  isr=%lu\n",
+					       cur_loop, cur_isr);
 					printf("  last_write=%02X  last_read=%02X\n",
 					       core1_last_write_loc, core1_last_read_loc);
 					printf("  pending_interrupts=%02X  write_ring: head=%u tail=%u\n",
@@ -1526,25 +1931,25 @@ init_pins_range(const uint8_t base, const uint8_t count)
 static void
 __no_inline_not_in_flash_func(main_core1)()
 {
-	printf("Pico2 MC6809E core1 process starting\n");
+	printf("Core1 process starting\n");
 
 	init_pins_range(GPIO_TRACE_CORE1, 4); // trace pins - isr set
 	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_CORE1);
 
 	fast_serial.reset();
 	aux_serial.reset();
-	printf("Pico2 MC6809E console initialised/reset\n");
+	printf("Core1 console initialised/reset\n");
 
 	pio_sm_set_enabled(pio_clock.pio, pio_clock.sm, true);
-	printf("Pico2 MC6809E E/Q clocks started\n");
+	printf("Core1 E/Q clocks started\n");
 	MC6809.set_e_frequency(GUEST_CLK_DEFAULT, pio_clock);
-	printf("Pico2 MC6809E E/Q clock set to %.1f MHz\n", MC6809.get_e_frequency());
+	printf("Core1 E/Q clock set to %.1f MHz\n", MC6809.get_e_frequency());
 
 	gpio_add_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
 	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
 	irq_set_priority(pio_clock.irq, 1);
 	irq_set_enabled(pio_clock.irq, true);
-	printf("Pico2 MC6809E BA/BS and BUSY/LIC/AVMA bus observer started\n");
+	printf("Core1 BA/BS and BUSY/LIC/AVMA bus observer started\n");
 
 	irq_set_exclusive_handler(piodma_read.irq, dma_bus_read_irq_handler);
 	irq_set_priority(piodma_read.irq, 0);
@@ -1552,7 +1957,7 @@ __no_inline_not_in_flash_func(main_core1)()
 	dma_channel_set_irq0_enabled(piodma_read.data_channel, true);
 	dma_channel_start(piodma_read.address_channel);
 	pio_sm_put(piodma_read.pio, piodma_read.sm, registers::read_address() >> 6); // Six bits for A0-5
-	printf("Pico2 MC6809E Main read DMA chain configured\n");
+	printf("Core1 Main read DMA chain configured\n");
 
 	irq_set_exclusive_handler(piodma_write.irq, dma_bus_write_irq_handler);
 	irq_set_priority(piodma_write.irq, 0);
@@ -1560,26 +1965,26 @@ __no_inline_not_in_flash_func(main_core1)()
 	dma_channel_set_irq1_enabled(piodma_write.data_channel, true);
 	dma_channel_start(piodma_write.address_channel);
 	pio_sm_put(piodma_write.pio, piodma_write.sm, registers::write_address() >> 6); // Six bits for A0-5
-	printf("Pico2 MC6809E Main write DMA chain configured\n");
+	printf("Core1 Main write DMA chain configured\n");
 
 	pio_sm_set_enabled(piodma_read.pio, piodma_read.sm, true);
 	pio_sm_set_enabled(piodma_write.pio, piodma_write.sm, true);
-	printf("Pico2 MC6809E read pio%d/sm%d and write pio%d/sm%d started\n",
+	printf("Core1 read pio%d/sm%d and write pio%d/sm%d started\n",
 	       PIO_NUM(piodma_read.pio),
 	       piodma_read.sm,
 	       PIO_NUM(piodma_write.pio),
 	       piodma_write.sm);
 
 	pio_sm_set_enabled(task_pio, task_pio_sm, true);
-	printf("Pico2 MC6809E task pio%d/sm%d started\n", PIO_NUM(task_pio), task_pio_sm);
+	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_pio), task_pio_sm);
 
 	sysreq_initialise();
 
 	// Start the 50 Hz tick timer (hardware alarm, runs independently of E clock).
 	system_tick.start();
-	printf("Pico2 MC6809E 50 Hz tick timer started\n");
+	printf("Core1 50 Hz tick timer started\n");
 
-	printf("Pico2 MC6809E core1 process started\n");
+	printf("Core1 process started\n");
 
 	// Paint the unused portion of Core 1's stack with a canary pattern.
 	// SP points to the current top; everything between StackOneBottom and
@@ -1592,7 +1997,7 @@ __no_inline_not_in_flash_func(main_core1)()
 		for (volatile uint32_t *p = bottom; p < sp - 16; p++)
 			*p = 0xDEADBEEFu;
 		uint32_t stack_free = (sp - bottom) * sizeof(uint32_t);
-		printf("Pico2 MC6809E core1 stack: %lu bytes total, %lu bytes free at start\n",
+		printf("Core1 stack: %lu bytes total, %lu bytes free at start\n",
 		       (&__StackOneTop - &__StackOneBottom) * sizeof(uint32_t),
 		       stack_free);
 	}
@@ -1600,32 +2005,28 @@ __no_inline_not_in_flash_func(main_core1)()
 	core1_initialised = true;
 
 	for (;;) {
-		core1_loop_phase = 1;
+
 		core1_loop_count++;
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {
 			q_rising_edge = false;
 			core1_qrise_count++;
-			core1_loop_phase = 2;
+
 			uint32_t interrupt_refcount[NUM_INTERRUPTS] = {};
 			interrupt eirq;
 			// FOR_EACH interrupt_source:
-			core1_loop_phase = 20;
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
-			core1_loop_phase = 21;
+#if 0
 			eirq = system_tick.has_interrupt();
 			interrupt_refcount[eirq]++;
-			core1_loop_phase = 22;
 			eirq = fast_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
-			core1_loop_phase = 23;
 			eirq = aux_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
-			core1_loop_phase = 3;
+#endif
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
 				core1_irq_assert_count++;
-			core1_loop_phase = 30;
 			// Update cached state so the Q-rising ISR can assert/deassert
 			// interrupt pins.  Single volatile write; the ISR handles all
 			// GPIO assertion and deassertion — no apply_interrupts() here.
@@ -1633,12 +2034,9 @@ __no_inline_not_in_flash_func(main_core1)()
 				(interrupt_refcount[INTERRUPT_NMI]  > 0u ? PEND_NMI  : 0u) |
 				(interrupt_refcount[INTERRUPT_FIRQ] > 0u ? PEND_FIRQ : 0u) |
 				(interrupt_refcount[INTERRUPT_IRQ]  > 0u ? PEND_IRQ  : 0u);
-			core1_loop_phase = 31;
 			// END FOR_EACH
-			//gpio_put(GPIO_TRACE_CORE1, false);
 		}
 
-		core1_loop_phase = 4;
 		while (write_ring_tail != write_ring_head) {
 			core1_write_ring_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
@@ -1646,7 +2044,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			const uint8_t written_location = write_ring[t].location;
 			const uint8_t written_byte = write_ring[t].value;
 			core1_last_write_loc = written_location;
-			core1_loop_phase = 5;
 			write_ring_tail = (t + 1u) & WRITE_RING_MASK;
 			switch (written_location) {
 			default:
@@ -1824,7 +2221,6 @@ __no_inline_not_in_flash_func(main_core1)()
 
 		// Drain the CONSOLE_RX_DATA counter before checking the shared slot.
 		// Each ISR-detected RX data read must call guest_receive() exactly once.
-		core1_loop_phase = 6;
 		while (rx_processed_count != rx_read_count) {
 #ifdef DEBUG
 			ACIA_RX_DATA_COUNT++;
@@ -1840,13 +2236,11 @@ __no_inline_not_in_flash_func(main_core1)()
 			aux_rx_processed_count++;
 		}
 
-		core1_loop_phase = 7;
 		if (read_irq_received) {
 			core1_read_irq_count++;
 			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
 			core1_last_read_loc = read_location;
-			core1_loop_phase = 8;
 			switch (read_location) {
 			default:
 				// The MC6809 got whatever byte was here. By default, do nothing else.
@@ -1894,19 +2288,19 @@ static void
 clock_pio_init()
 {
 	// SM0: E/Q clock
-	const int ofs = pio_add_program(pio_clock.pio, &mc6809_clock_program);
-	if (ofs < 0) {
-		printf("Pico2 MC6809E insufficient space for E/Q program\n");
+	pio_clock_offset = pio_add_program(pio_clock.pio, &mc6809_clock_program);
+	if (pio_clock_offset < 0) {
+		printf("Core0 insufficient space for E/Q program\n");
 		panic("Unable to proceed");
 	}
 	pio_clock.sm = pio_claim_unused_sm(pio_clock.pio, false);
 	if (pio_clock.sm < 0) {
-		printf("Pico2 MC6809E unable to claim unused SM for E/Q program\n");
+		printf("Core0 unable to claim unused SM for E/Q program\n");
 		panic("Unable to proceed");
 	}
-	mc6809_clock_program_init(pio_clock.pio, pio_clock.sm, ofs);
+	mc6809_clock_program_init(pio_clock.pio, pio_clock.sm, pio_clock_offset);
 
-	printf("Pico2 MC6809E E/Q clocks pio%d sm%d configured\n", PIO_NUM(BUS_CLOCK_PIO), pio_clock.sm);
+	printf("Core0 E/Q clocks pio%d sm%d configured\n", PIO_NUM(BUS_CLOCK_PIO), pio_clock.sm);
 }
 
 static void
@@ -1932,30 +2326,30 @@ bus_pio_dma_init()
 
 	// DMA for the main MC6809 bus read loop
 	if (dma_channel_is_claimed(piodma_read.address_channel)) {
-		printf("Pico2 MC6809E DMA channel %d for bus_read address is already claimed\n",
+		printf("Core0 DMA channel %d for bus_read address is already claimed\n",
 		       piodma_read.address_channel);
 		panic("Unable to proceed");
 	}
 	dma_channel_claim(piodma_read.address_channel);
 	if (dma_channel_is_claimed(piodma_read.data_channel)) {
-		printf("Pico2 MC6809E DMA channel %d for bus_read data is already claimed\n", piodma_read.data_channel);
+		printf("Core0 DMA channel %d for bus_read data is already claimed\n", piodma_read.data_channel);
 		panic("Unable to proceed");
 	}
 	dma_channel_claim(piodma_read.data_channel);
 
 	// SM: Bus read responder
-	const int ofs_read_bus = pio_add_program(piodma_read.pio, &mc6809_bus_read_program);
-	if (ofs_read_bus < 0) {
-		printf("Pico2 MC6809E insufficient space for bus_read program\n");
+	pio_read_offset = pio_add_program(piodma_read.pio, &mc6809_bus_read_program);
+	if (pio_read_offset < 0) {
+		printf("Core0 insufficient space for bus_read program\n");
 		panic("Unable to proceed");
 	}
 	piodma_read.sm = pio_claim_unused_sm(piodma_read.pio, true);
 	if (piodma_read.sm < 0) {
-		printf("Pico2 MC6809E unable to claim unused SM for bus_read program\n");
+		printf("Core0 unable to claim unused SM for bus_read program\n");
 		panic("Unable to proceed");
 	}
-	mc6809_bus_read_program_init(piodma_read.pio, piodma_read.sm, ofs_read_bus);
-	printf("Pico2 MC6809E read pio%u sm%d configured\n", PIO_NUM(piodma_read.pio), piodma_read.sm);
+	mc6809_bus_read_program_init(piodma_read.pio, piodma_read.sm, pio_read_offset);
+	printf("Core0 read pio%u sm%d configured\n", PIO_NUM(piodma_read.pio), piodma_read.sm);
 	// DMA move the requested memory data to PIO for output
 	dma_channel_config read_out_dma = dma_channel_get_default_config(piodma_read.data_channel);
 	channel_config_set_high_priority(&read_out_dma, true);
@@ -1971,7 +2365,7 @@ bus_pio_dma_init()
 		nullptr,				// src - will be overwritten by the below DMA
 		dma_encode_transfer_count(1),
 		false);
-	printf("Pico2 MC6809E DMA read_out channel configured\n");
+	printf("Core0 DMA read_out channel configured\n");
 	// DMA move address from PIO into the data DMA config
 	dma_channel_config read_address_dma = dma_channel_get_default_config(piodma_read.address_channel);
 	channel_config_set_high_priority(&read_address_dma, true);
@@ -1987,30 +2381,30 @@ bus_pio_dma_init()
 		&piodma_read.pio->rxf[piodma_read.sm],				// src
 		dma_encode_transfer_count(1),
 		false);
-	printf("Pico2 MC6809E DMA read_address channel configured\n");
+	printf("Core0 DMA read_address channel configured\n");
 
 	// SM: Bus write responder
-	const int ofs_write_bus = pio_add_program(piodma_write.pio, &mc6809_bus_write_program);
-	if (ofs_write_bus < 0) {
-		printf("Pico2 MC6809E insufficient space for bus_write program\n");
+	pio_write_offset = pio_add_program(piodma_write.pio, &mc6809_bus_write_program);
+	if (pio_write_offset < 0) {
+		printf("Core0 insufficient space for bus_write program\n");
 		panic("Unable to proceed");
 	}
 	piodma_write.sm = pio_claim_unused_sm(piodma_write.pio, true);
 	if (piodma_write.sm < 0) {
-		printf("Pico2 MC6809E unable to claim unused SM for bus_write program\n");
+		printf("Core0 unable to claim unused SM for bus_write program\n");
 		panic("Unable to proceed");
 	}
-	mc6809_bus_write_program_init(piodma_write.pio, piodma_write.sm, ofs_write_bus);
-	printf("Pico2 MC6809E write pio%u sm%d configured\n", PIO_NUM(piodma_write.pio), piodma_write.sm);
+	mc6809_bus_write_program_init(piodma_write.pio, piodma_write.sm, pio_write_offset);
+	printf("Core0 write pio%u sm%d configured\n", PIO_NUM(piodma_write.pio), piodma_write.sm);
 	// DMA for the main MC6809 bus write loop
 	if (dma_channel_is_claimed(piodma_write.address_channel)) {
-		printf("Pico2 MC6809E DMA channel %d for bus_write address is already claimed\n",
+		printf("Core0 DMA channel %d for bus_write address is already claimed\n",
 		       piodma_write.address_channel);
 		panic("Unable to proceed");
 	}
 	dma_channel_claim(piodma_write.address_channel);
 	if (dma_channel_is_claimed(piodma_write.data_channel)) {
-		printf("Pico2 MC6809E DMA channel %d for bus_write data is already claimed\n",
+		printf("Core0 DMA channel %d for bus_write data is already claimed\n",
 		       piodma_write.data_channel);
 		panic("Unable to proceed");
 	}
@@ -2029,7 +2423,7 @@ bus_pio_dma_init()
 		&piodma_write.pio->rxf[piodma_write.sm],	// src
 		dma_encode_transfer_count(1),
 		false);
-	printf("Pico2 MC6809E DMA write_in channel configured\n");
+	printf("Core0 DMA write_in channel configured\n");
 	// DMA move address from PIO into the write data DMA config
 	dma_channel_config write_address_dma = dma_channel_get_default_config(piodma_write.address_channel);
 	channel_config_set_high_priority(&write_address_dma, true);
@@ -2045,19 +2439,19 @@ bus_pio_dma_init()
 		&piodma_write.pio->rxf[piodma_write.sm],			// src
 		dma_encode_transfer_count(1),
 		false);
-	printf("Pico2 MC6809E DMA write_address channel configured\n");
+	printf("Core0 DMA write_address channel configured\n");
 
 	// SM: Task pin output driver (pio2 with GPIO base 16 for access to GPIO 40-45)
 	task_pio = pio2;
 	pio_set_gpio_base(task_pio, 16);
-	const int ofs_task = pio_add_program(task_pio, &task_output_program);
-	if (ofs_task < 0) {
-		printf("Pico2 MC6809E insufficient space for task_output program\n");
+	pio_task_offset = pio_add_program(task_pio, &task_output_program);
+	if (pio_task_offset < 0) {
+		printf("Core0 insufficient space for task_output program\n");
 		panic("Unable to proceed");
 	}
 	task_pio_sm = pio_claim_unused_sm(task_pio, true);
-	task_output_program_init(task_pio, task_pio_sm, ofs_task);
-	printf("Pico2 MC6809E task output pio%u sm%u configured\n", PIO_NUM(task_pio), task_pio_sm);
+	task_output_program_init(task_pio, task_pio_sm, pio_task_offset);
+	printf("Core0 task output pio%u sm%u configured\n", PIO_NUM(task_pio), task_pio_sm);
 }
 
 #define MEASURE_FREQS
@@ -2089,52 +2483,99 @@ measure_freqs()
 }
 #endif
 
-// Stub: disable PIO state machines for power-down
 static void
 pio_shutdown()
 {
-	// TODO: disable and unclaim PIO state machines, DMA channels, IRQs
+	// --- Disable IRQs first (handlers reference DMA/PIO resources) ---
+
+	// GPIO Q edge IRQ (bus observer)
+	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+	irq_set_enabled(pio_clock.irq, false);
+	gpio_remove_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
+
+	// DMA read IRQ
+	dma_channel_set_irq0_enabled(piodma_read.data_channel, false);
+	irq_set_enabled(piodma_read.irq, false);
+	irq_remove_handler(piodma_read.irq, dma_bus_read_irq_handler);
+
+	// DMA write IRQ
+	dma_channel_set_irq1_enabled(piodma_write.data_channel, false);
+	irq_set_enabled(piodma_write.irq, false);
+	irq_remove_handler(piodma_write.irq, dma_bus_write_irq_handler);
+
+	// --- Task output (pio2) ---
+	task_output_program_deinit(task_pio, task_pio_sm);
+	pio_remove_program(task_pio, &task_output_program, pio_task_offset);
+
+	// --- Bus write SM + DMA ---
+	dma_channel_abort(piodma_write.address_channel);
+	dma_channel_abort(piodma_write.data_channel);
+	dma_channel_unclaim(piodma_write.address_channel);
+	dma_channel_unclaim(piodma_write.data_channel);
+	mc6809_bus_write_program_deinit(piodma_write.pio, piodma_write.sm);
+	pio_remove_program(piodma_write.pio, &mc6809_bus_write_program, pio_write_offset);
+
+	// --- Bus read SM + DMA ---
+	dma_channel_abort(piodma_read.address_channel);
+	dma_channel_abort(piodma_read.data_channel);
+	dma_channel_unclaim(piodma_read.address_channel);
+	dma_channel_unclaim(piodma_read.data_channel);
+	mc6809_bus_read_program_deinit(piodma_read.pio, piodma_read.sm);
+	pio_remove_program(piodma_read.pio, &mc6809_bus_read_program, pio_read_offset);
+
+	// --- E/Q clock (stop last — other SMs synchronise to it) ---
+	mc6809_clock_program_deinit(pio_clock.pio, pio_clock.sm);
+	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock_offset);
+
+	// --- Trace pins (GPIO 36-39) to hi-Z ---
+	for (uint i = 0; i < 4; i++) {
+		gpio_put(GPIO_TRACE_CORE1 + i, false);
+		gpio_set_dir(GPIO_TRACE_CORE1 + i, GPIO_IN);
+	}
 }
 
 static void
 set_power()
 {
-	// NOTE: Start of power-up process
-	POWER_ASSERT;
-
 	// Setup !Reset, !Halt, and the interrupt pins.
 	MC6809.init();
-	printf("Pico2 MC6809E guest state initialised\n");
-
-	sleep_ms(10);
-	printf("Pico2 MC6809E external power on.\n");
-
-	usb_init();
-	printf("Pico2 MC6809E initialised USB\n");
+	MC6809.set_setup_callback([] {
+		system_tick.reset();
+		fast_serial.reset();
+		aux_serial.reset();
+	});
+	printf("Core0 guest powered on and initialised\n");
 
 	clock_pio_init();
 	bus_pio_dma_init();
 	peripheral_clear(true);
-	printf("Pico2 MC6809E emulated RAM and devices initialised\n");
+	printf("Core0 emulated RAM and devices initialised\n");
 
 	multicore_launch_core1(main_core1);
-	// NOTE: End of power-up process
 }
 
 static void
 reset_power()
 {
-	MC6809.stop();
-	printf("Pico2 MC6809E guest stopped\n");
+	// Stop tick timer first (cancels SDK alarm so callback won't fire)
+	system_tick.stop();
+	printf("Core0 tick timer stopped\n");
 
+	// Kill Core 1 before touching any resources it uses
+	core1_initialised = false;
 	multicore_reset_core1();
-	printf("Pico2 MC6809E core1 stopped\n");
+	printf("Core0 core1 stopped\n");
 
+	// Now safe to tear down IRQs, DMA, PIO, and trace pins
 	pio_shutdown();
-	printf("Pico2 MC6809E emulated RAM and devices disabled\n");
+	printf("Core0 PIO/DMA disabled\n");
 
-	POWER_DEASSERT;
-	printf("Pico2 MC6809E external power off\n");
+	// Stop guest (RESET + HALT asserted) then release all pins
+	MC6809.stop();
+	printf("Core0 guest stopped\n");
+
+	MC6809.deinit();
+	printf("Core0 guest pins released\n");
 }
 
 int
@@ -2151,13 +2592,13 @@ main()
 	printf("\n\nPico2 MC6809E bus supervisor %s\n", DEVICE_VERSION);
 	printf("Pico2 MC6809E built on %s %s\n", __DATE__, __TIME__);
 #ifdef DEBUG
-	printf("Pico2 MC6809E build with DEBUG defined\n");
+	printf("Core0 build with DEBUG defined\n");
 #endif
 
 #ifdef MEASURE_FREQS
 	measure_freqs();
 #endif
-	printf("Pico2 MC6809E raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
+	printf("Core0 raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
 	if (!set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
 		printf("unsuccessful! Reverting to %d MHz ... ", SYS_CLK_HZ/1000000);
 		set_sys_clock_hz(SYS_CLK_HZ, true);
@@ -2165,13 +2606,16 @@ main()
 	stdio_init_all();
 	uart_init(CONSOLE, CONSOLE_BAUDRATE);
 	printf("successful!\n");
-	printf("Pico2 MC6809E console baudrate set to %d\n", CONSOLE_BAUDRATE);
+	printf("Core0 console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
 #ifdef NO_ADC_YET
 	adc_init();
 	adc_gpio_init(GPIO_POWER_ADC);
 	adc_set_temp_sensor_enabled(true);
 #endif
+	usb_init();
+	printf("Core0 initialised USB\n");
+
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
@@ -2181,7 +2625,28 @@ main()
 	aon_timer_stop();
 	aon_timer_start_calendar(&tm);
 
-	printf("Pico2 MC6809E ready!\n");
+	printf("Core0 ready!\n");
+
+	// Wait for Core 1's main loop to be running before executing
+	// startup commands — core1_initialised is set before the loop
+	// starts, but devices need a few loop iterations to settle.
+	while (core1_loop_count < 100u) {
+		sleep_ms(1u);
+		usb_poll();
+	}
+
+	// Startup commands — executed once before entering the console loop
+	static const char *startup_commands[] = {
+		"run 0",
+		nullptr
+	};
+	for (const char **cmd = startup_commands; *cmd != nullptr; cmd++) {
+		char cmdbuf[COMMAND_BUFFER_LEN];
+		strncpy(cmdbuf, *cmd, sizeof(cmdbuf) - 1);
+		cmdbuf[sizeof(cmdbuf) - 1] = '\0';
+		printf("> %s\n", cmdbuf);
+		process_command(cmdbuf);
+	}
 
 	poll_console();
 }

@@ -34,6 +34,13 @@ tick_timer::start()
 }
 
 void
+tick_timer::stop()
+{
+	cancel_repeating_timer(&hw_timer);
+	reset();
+}
+
+void
 tick_timer::control(uint8_t val)
 {
 	enabled = (val & 0x01u);

@@ -50,6 +50,21 @@ mc6809_clock_program_init(PIO pio, uint sm, uint offset)
 	// pio_sm_set_enabled(pio, sm, false);
 }
 
+static inline void
+mc6809_clock_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	// Drive E and Q low, then release to hi-Z
+	gpio_put(GPIO_E, false);
+	gpio_put(GPIO_Q, false);
+	gpio_set_dir(GPIO_E, GPIO_IN);
+	gpio_set_dir(GPIO_Q, GPIO_IN);
+	// Return pins to GPIO control (away from PIO)
+	gpio_set_function(GPIO_E, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_Q, GPIO_FUNC_SIO);
+	pio_sm_unclaim(pio, sm);
+}
+
 %}
 
 ; Bus READ cycle. The read_registers[] prefix + A5-0 are sent to the
@@ -113,6 +128,21 @@ mc6809_bus_read_program_init(PIO pio, uint sm, uint offset)
 	// pio_sm_set_enabled(pio, sm, false); // We'll start this when DMA, the IRQ's and the second core get going.
 }
 
+static inline void
+mc6809_bus_read_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	// D7-0 back to hi-Z input
+	pio_sm_set_consecutive_pindirs(pio, sm, GPIO_D_BASE, 8, false);
+	for (uint i = 0; i < 8; i++)
+		gpio_set_function(GPIO_D_BASE + i, GPIO_FUNC_SIO);
+	// Trace pin low then hi-Z
+	gpio_put(GPIO_TRACE_RD, false);
+	gpio_set_dir(GPIO_TRACE_RD, GPIO_IN);
+	gpio_set_function(GPIO_TRACE_RD, GPIO_FUNC_SIO);
+	pio_sm_unclaim(pio, sm);
+}
+
 %}
 
 ; Bus WRITE cycle. The write_registers[] prefix + A5-0 are sent to the
@@ -165,6 +195,17 @@ mc6809_bus_write_program_init(PIO pio, uint sm, uint offset)
 	// pio_sm_set_enabled(pio, sm, false); // We'll start this when DMA, the IRQ's and the second core get going.
 }
 
+static inline void
+mc6809_bus_write_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	// Trace pin low then hi-Z
+	gpio_put(GPIO_TRACE_WR, false);
+	gpio_set_dir(GPIO_TRACE_WR, GPIO_IN);
+	gpio_set_function(GPIO_TRACE_WR, GPIO_FUNC_SIO);
+	pio_sm_unclaim(pio, sm);
+}
+
 %}
 
 ; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and
@@ -193,6 +234,19 @@ task_output_program_init(PIO pio, uint sm, uint offset)
 	// Pre-load task 0: TASK0=1, TASK[4:0]=0 → bit pattern 0b100000
 	pio_sm_put(pio, sm, (1u << 5));
 	// pio_sm_set_enabled(pio, sm, false);  // We'll start this when DMA, the IRQ's and the second core get going.
+}
+
+static inline void
+task_output_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	// Task pins low then hi-Z
+	for (uint i = 0; i < 6; i++) {
+		gpio_put(GPIO_TASK_BASE + i, false);
+		gpio_set_dir(GPIO_TASK_BASE + i, GPIO_IN);
+		gpio_set_function(GPIO_TASK_BASE + i, GPIO_FUNC_SIO);
+	}
+	pio_sm_unclaim(pio, sm);
 }
 
 %}

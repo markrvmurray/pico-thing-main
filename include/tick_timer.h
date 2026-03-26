@@ -30,6 +30,7 @@ public:
 	tick_timer(registers &r, uint16_t ctrl_off, uint16_t stat_off);
 
 	void start();
+	void stop();
 	void control(uint8_t val);
 	void acknowledge();
 	void reset();

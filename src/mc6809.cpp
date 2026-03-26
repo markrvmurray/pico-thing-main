@@ -31,15 +31,16 @@ const char *run_state_string[] = {
 
 mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 {
-	old_bus_state.state = BS_RUNNING_RESET;
-	bus_state.state = BS_RUNNING_RESET;
-	run_state = RS_STOPPED;
+	old_bus_state.state = BS_UNPOWERED;
+	bus_state.state = BS_UNPOWERED;
+	run_state = RS_UNPOWERED;
 	busy_lic_avma.byte = 0x00u;
 	task_stack_ptr = 0u;
 	e_freq = GUEST_CLK_DEFAULT;
 #ifdef DEBUG
 	_count_lic = 0u;
 	_count_rti = 0u;
+	_count_irq_ack = 0u;
 #endif
 }
 
@@ -70,8 +71,19 @@ mc6809::task_get() const
 }
 
 bool
+mc6809::assert_powered() const
+{
+	bool retval = run_state != RS_UNPOWERED;
+	if (!retval)
+		printf("MC6809 not powered\n");;
+	return retval;
+}
+
+bool
 mc6809::assert_stopped() const
 {
+	if (!assert_powered())
+		return false;
 	bool retval = run_state == RS_STOPPED;
 	if (!retval)
 		printf("MC6809 not stopped, currently in %s\n", run_state_string[run_state]);
@@ -82,6 +94,8 @@ void
 mc6809::setup(enum run_state rs)
 {
 	assert(rs == RS_STOPPED);
+	if (setup_callback)
+		setup_callback();
 	run_state = rs;
 	old_bus_state.state = BS_RUNNING_RESET;
 	bus_state.state = BS_RUNNING_RESET;
@@ -91,6 +105,7 @@ mc6809::setup(enum run_state rs)
 #ifdef DEBUG
 	_count_lic = 0u;
 	_count_rti = 0u;
+	_count_irq_ack = 0u;
 	trace_pos = 0u;
 #endif
 }
@@ -98,6 +113,12 @@ mc6809::setup(enum run_state rs)
 void
 mc6809::init()
 {
+	POWER_ASSERT;
+	old_bus_state.bit.UNPOWERED = 0;
+	bus_state.bit.UNPOWERED = 0;
+	// 0.25s should be enough for power to stabilise
+	sleep_ms(250u);
+
 	// Assert reset until the guest is needed
 	gpio_init(GPIO_RESET);
 	gpio_set_dir(GPIO_RESET, GPIO_OUT);
@@ -126,6 +147,35 @@ mc6809::init()
 
 	setup(RS_STOPPED);
 	task_initialise();
+}
+
+void
+mc6809::deinit()
+{
+	// All pins driving the 6809 go low or hi-Z to avoid
+	// backfeeding when external power is removed.
+
+	// RESET: drive low (hold 6809 in reset), then go hi-Z
+	gpio_put(GPIO_RESET, false);
+	gpio_set_dir(GPIO_RESET, GPIO_IN);
+
+	// HALT: drive low, then go hi-Z
+	gpio_put(GPIO_HALT, false);
+	gpio_set_dir(GPIO_HALT, GPIO_IN);
+
+	// NMI/FIRQ/IRQ: already simulated open-collector —
+	// ensure output latch is low, then go hi-Z (input)
+	gpio_put(GPIO_NMI, false);
+	DEASSERT_NMI;
+	gpio_put(GPIO_FIRQ, false);
+	DEASSERT_FIRQ;
+	gpio_put(GPIO_IRQ, false);
+	DEASSERT_IRQ;
+
+	POWER_DEASSERT;
+	old_bus_state.state = BS_UNPOWERED;
+	bus_state.state = BS_UNPOWERED;
+	run_state = RS_UNPOWERED;
 }
 
 void

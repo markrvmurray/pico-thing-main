@@ -729,14 +729,14 @@ TEST_CASE("irq command", "[parser][irq]")
 		CHECK(cmd.tag          == CMD_IRQ);
 		CHECK(cmd.irq.testnum  == 0);
 	}
-	SECTION("irq 5 (maximum)")
+	SECTION("irq 6 (maximum)")
 	{
-		REQUIRE(parse("irq 5", &cmd));
-		CHECK(cmd.irq.testnum == 5);
+		REQUIRE(parse("irq 6", &cmd));
+		CHECK(cmd.irq.testnum == 6);
 	}
-	SECTION("irq 6 (out of range) is rejected")
+	SECTION("irq 7 (out of range) is rejected")
 	{
-		CHECK_FALSE(parse("irq 6", &cmd));
+		CHECK_FALSE(parse("irq 7", &cmd));
 		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
 	}
 }

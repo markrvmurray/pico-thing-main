@@ -136,6 +136,8 @@ static int _t_count;
 %token TOK_RETURN
 %token TOK_IDE
 %token TOK_DRIVEWIRE
+%token TOK_ON
+%token TOK_OFF
 
 /* Loop access types */
 %token TOK_r
@@ -193,7 +195,9 @@ command:
  * Simple no-argument commands
  * ----------------------------------------------------------------------- */
 power_cmd:
-	TOK_POWER   { result->tag = CMD_POWER; }
+	TOK_POWER          { result->tag = CMD_POWER; }
+	| TOK_POWER TOK_ON  { result->tag = CMD_POWER_ON; }
+	| TOK_POWER TOK_OFF { result->tag = CMD_POWER_OFF; }
 	;
 
 verbose_cmd:
@@ -201,7 +205,14 @@ verbose_cmd:
 	;
 
 status_cmd:
-	TOK_STATUS  { result->tag = CMD_STATUS; }
+	  TOK_STATUS {
+		result->tag           = CMD_STATUS;
+		result->status.period = 0;
+	}
+	| TOK_STATUS TOK_NUMBER {
+		result->tag           = CMD_STATUS;
+		result->status.period = (uint32_t)strtoul($2, NULL, 0);
+	}
 	;
 
 reset_cmd:
@@ -559,13 +570,13 @@ task_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * irq <testnum>   (0-5)
+ * irq <testnum>   (0-6)
  * ----------------------------------------------------------------------- */
 irq_cmd:
 	TOK_IRQ TOK_NUMBER {
 		uint32_t v = parse_hex($2);
-		if (v == UINT32_MAX || v > 5u) {
-			printf("Invalid IRQ test ID '%s' (valid: 0-5)\n", $2);
+		if (v == UINT32_MAX || v > 6u) {
+			printf("Invalid IRQ test ID '%s' (valid: 0-6)\n", $2);
 			YYERROR;
 		}
 		result->tag         = CMD_IRQ;

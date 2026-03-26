@@ -121,6 +121,7 @@ AUXARX	RMB	1
 	RMB	1
 TICKC	RMB	1		; Tick timer control
 TICKS	RMB	1		; Tick timer status
+	RMB	6		; Padding to align SHARED at $FFD0
 
 SHARED	RMB	16		; Address of a shared buffer for moving bytes
 

@@ -137,6 +137,8 @@ match_command_keyword(const char *text)
 [Rr][Ee][Tt][Uu][Rr][Nn]            { return TOK_RETURN; }
 [Ii][Dd][Ee]                        { return TOK_IDE; }
 [Dd][Rr][Ii][Vv][Ee][Ww][Ii][Rr][Ee] { return TOK_DRIVEWIRE; }
+[Oo][Nn]                            { return TOK_ON; }
+[Oo][Ff][Ff]                        { return TOK_OFF; }
 
 	/* ---- Loop types (exact, CASE-SENSITIVE per original behaviour) ---- */
 "rw"|"RW"                           { return TOK_RW; }
