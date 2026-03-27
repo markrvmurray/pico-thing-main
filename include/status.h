@@ -35,6 +35,7 @@ struct status_snapshot_t {
 	enum bus_state  bus_state;
 	enum bus_state  old_bus_state;
 	uint8_t         task;
+	uint8_t         nesting_depth;
 	uint16_t        task_stack_ptr;
 	uint8_t         task_history[STATUS_MAX_INT_NEST_DEPTH];
 

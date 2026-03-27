@@ -109,7 +109,7 @@ ATAIDE	RMB	16
 
 	SECTION	PICO2
 
-DEVICE	RMB	3		; Other devices provided by the Pico 2
+DEVICE	RMB	4		; TASK, RTI_SIGNAL, REQUEST, SUBREQUEST
 ACIAC	RMB	0		; These two share an address
 ACIAS	RMB	1
 ACIATX	RMB	0		; These two share an address
@@ -118,7 +118,6 @@ AUXAC	RMB	0		; Auxiliary ACIA control/status
 AUXAS	RMB	1
 AUXATX	RMB	0		; Auxiliary ACIA data
 AUXARX	RMB	1
-	RMB	1
 TICKC	RMB	1		; Tick timer control
 TICKS	RMB	1		; Tick timer status
 	RMB	6		; Padding to align SHARED at $FFD0

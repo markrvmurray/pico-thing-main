@@ -5,8 +5,8 @@
  *
  * ACIA Flow Control Stress Test (6809 side)
  *
- * Runs on the AUXILIARY ACIA ($FFC5/$FFC6, USB CDC port 1).
- * Console ACIA ($FFC3/$FFC4, USB CDC port 0) is used for status output.
+ * Runs on the AUXILIARY ACIA ($FFC6/$FFC7, USB CDC port 1).
+ * Console ACIA ($FFC4/$FFC5, USB CDC port 0) is used for status output.
  *
  * Protocol:
  *   - Waits for 'G' (go) from host on aux ACIA (30s timeout)
@@ -264,17 +264,17 @@ main(void)
 	asm {
 		pshs a,x
 @flush		lda #$03
-		sta $FFC5	master reset: clears SpscQueue
+		sta $FFC6	master reset: clears SpscQueue
 		ldx #2000	wait ~6ms for uart_port_pump to refill
 @wait		leax -1,x
 		bne @wait
-@drn		lda $FFC5	drain staged byte
+@drn		lda $FFC6	drain staged byte
 		bita #$01	RDRF?
 		beq @chk
-		lda $FFC6	discard
+		lda $FFC7	discard
 		bra @drn
 @chk		ldx #500	wait ~1.5ms to see if more data arrives
-@chk2		lda $FFC5
+@chk2		lda $FFC6
 		bita #$01
 		bne @flush	new data! reset and drain again
 		leax -1,x
@@ -289,7 +289,7 @@ main(void)
 
 	printf("\nACIA Flow Control Stress Test\n");
 	printf("============================\n");
-	printf("Aux ACIA ($FFC5/$FFC6), %u x %u byte frames\n\n",
+	printf("Aux ACIA ($FFC6/$FFC7), %u x %u byte frames\n\n",
 		NUM_FRAMES, PAYLOAD_LEN);
 
 	/* Wait for 'G' (go) from host script, ~30s timeout. */

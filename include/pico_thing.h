@@ -158,23 +158,24 @@ union high_bus_pins {
 
 // System registers relative to REGISTER_DEVICES
 #define SYSTEM_TASK		uint16_t(0x00u)
+#define SYSTEM_RTI_SIGNAL	uint16_t(0x01u) // Write-only: guest signals RTI
 
-#define SYSTEM_REQUEST		uint16_t(0x01u) // Write-only
-#define SYSTEM_REQUEST_STATUS	uint16_t(0x01u) // Read-only
-#define SYSTEM_SUBREQUEST	uint16_t(0x02u) // Write-only
-#define SYSTEM_REQUEST_RESPONSE	uint16_t(0x02u) // Read-only
+#define SYSTEM_REQUEST		uint16_t(0x02u) // Write-only
+#define SYSTEM_REQUEST_STATUS	uint16_t(0x02u) // Read-only
+#define SYSTEM_SUBREQUEST	uint16_t(0x03u) // Write-only
+#define SYSTEM_REQUEST_RESPONSE	uint16_t(0x03u) // Read-only
 
 // Emulated UARTs — register offsets relative to REGISTER_DEVICES
 // Primary UART (console)
-#define CONSOLE_CONTROL		uint16_t(0x03u)
-#define CONSOLE_STATUS		uint16_t(0x03u)
-#define CONSOLE_TX_DATA		uint16_t(0x04u)
-#define CONSOLE_RX_DATA		uint16_t(0x04u)
+#define CONSOLE_CONTROL		uint16_t(0x04u)
+#define CONSOLE_STATUS		uint16_t(0x04u)
+#define CONSOLE_TX_DATA		uint16_t(0x05u)
+#define CONSOLE_RX_DATA		uint16_t(0x05u)
 // Auxiliary UART
-#define AUX_CONTROL		uint16_t(0x05u)
-#define AUX_STATUS		uint16_t(0x05u)
-#define AUX_TX_DATA		uint16_t(0x06u)
-#define AUX_RX_DATA		uint16_t(0x06u)
+#define AUX_CONTROL		uint16_t(0x06u)
+#define AUX_STATUS		uint16_t(0x06u)
+#define AUX_TX_DATA		uint16_t(0x07u)
+#define AUX_RX_DATA		uint16_t(0x07u)
 
 // Simple 50 Hz tick timer.
 // $FFC8 write: bit 0 = enable/disable.

@@ -1,233 +1,3 @@
-;
-; Copyright (c) 2025 Mark R V Murray.
-;
-; SPDX-License-Identifier: BSD-2-Clause
-;
-DATRAM	EQU	$FE00	Address of DAT RAM R/W block
-
-DEVICE	EQU	$FFC0	Base address of Pico register block
-SHARED	EQU	$FFD0	Address of a shared buffer for moving bytes
-START	EQU	$FFE0	Start address of code snippet
-VECTORS	EQU	$FFF0	CPU reset and interrupt vectors
-
-CHUNK	EQU	$0130
-
-TASK	EQU	DEVICE+$00
-
-UARTC	equ	$FFC4
-UARTS	equ	$FFC4
-UARTTX	equ	$FFC5
-UARTRX	equ	$FFC5
-
-AUXC	equ	$FFC6
-AUXS	equ	$FFC6
-AUXTX	equ	$FFC7
-AUXRX	equ	$FFC7
-
-* Put these in a dedicated file!
-NUL	equ	$00
-LF	equ	$0A
-CR	equ	$0D
-ESC	equ	$1B
-
-* Initialise the DAT RAM. Essential for anything outside the Pico
-* Do this automatically?
-DATInit	ORG	START
-	CLR	TASK
-	LDX	#DATRAM
-	CLRA
-D@0	STA	,X+
-	INCA
-	BNE	D@0
-	SYNC
-
-* Zero all processor registers
-Zero	ORG	START
-	LDD	#$0000
-	ANDCC	#$00
-	ORCC	I,F
-	TFR	D,X
-	TFR	D,Y
-	TFR	D,U
-	TFR	D,S
-	SYNC
-
-* Fill a block of memory with a constant byte
-Fill	ORG	START
-	LDA	#$AA	This value will be replaced by the Pico
-	LDX	#$BBBB	This starting address will be replaced by the Pico
-F@0	STA	,X+
-	CMPX	#$CCCC	This terminal address will be replaced by the Pico
-	BNE	F@0
-	SYNC
-
-* Used by the Pico2 to copy up to 16 bytes of data to the 6809's
-* main memory.
-	ORG	START
-CopyOut	LDX	#SHARED
-	LDU	#$AAAA	This address will be replaced by the Pico
-	LDB	#$BB	This count will be replaced by the Pico
-l@0	LDA	,X+
-	STA	,U+
-	DECB
-	BNE	l@0
-	SYNC
-
-* Used by the Pico2 to copy up to 16 bytes of data from the 6809's
-* main memory.
-	ORG	START
-CopyIn	LDX	#SHARED
-	LDU	#$AAAA	This address will be replaced by the Pico
-	LDB	#$BB	This count will be replaced by the Pico
-l@0	LDA	,U+
-	STA	,X+
-	DECB
-	BNE	l@0
-	SYNC
-
-* Instant stop. Proves that bus BS_SYNC is detected and acted upon.
-	ORG	START
-Sync	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-
-* Looks good on the oscilloscope if the Pico2's PIO SM and DMA ISR are instrumented.
-	ORG	START
-Loop	LDA	>SHARED
-	BRA	Loop
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-	SYNC
-
-	ORG	START
-StackEx	LDD	#$6677
-	LDX	#$5A5A
-	LDU	#$9889
-	LDS	#START	Stack will be in the $FFDx buffer
-	PSHS	D,X,U
-	SYNC
-
-	ORG	START
-DatEx	CLRA
-d@0	LDX	#DATRAM
-d@1	COM	,X+
-	INCA
-	BNE	d@1
-	BRA	d@0
-
-* Set up the SWI vector to point to the ISR1 address, then check that
-* the stack frame is populated and that the sync is hit.
-	ORG	START
-TstSwi	LDS	#START
-	LDD	#$55AA
-	LDX	#$6677
-	LDU	#$33CC
-	SWI
-ISR1	NOP
-	SYNC
-
-* The test driver will need to prepare the NMI vector, start/observe the run,
-* trigger an !NMI, then check that the stack frame is correct after a BS_IRQ
-* and that the SYNC was hit. Proves that !NMI works
-	ORG	START
-TstNMI	LDS	#START
-	LDX	#$AABB
-	CLRA
-	CLRB
-	LDU	#$CCDD
-	NOP
-t@0	BRA	t@0
-ISR2	SYNC
-
-* The test driver will need to prepare the IRQ vector, start/observe the run,
-* trigger an !IRQ, then check that the stack frame is correct after a BS_IRQ
-* and that the SYNC was hit. Proves that !IRQ works
-	ORG	START
-TstIRQ	LDS	#START
-	LDX	#$ABAB
-	LDU	#$CDCD
-	ANDCC	I
-	NOP
-t@0	BRA	t@0
-ISR3	SYNC
-
-* The test driver will need to prepare the FIRQ vector, start/observe the run,
-* trigger a !FIRQ, then check that the stack frame is correct after a BS_IRQ
-* and that the SYNC was hit. Proves that !FIRQ works
-	ORG	START
-TstFIRQ	LDS	#START
-	ORCC	N,Z,V,C
-	ANDCC	F
-	NOP
-	NOP
-	NOP
-	NOP
-	NOP
-t@0	BRA	t@0
-ISR4	SYNC
-
-* A prepared stack frame needs to be set up. Once the RTI runs, the return
-* address must point to the Cont offset. SWI is used to dump the registers
-* back onto the stack, then we sync.
-	ORG	START
-TstRti	LDS	#START-12
-	NOP
-	RTI
-Cont	SWI
-	NOP
-	SYNC
-RtiSwi	NOP
-	RTI
-	NOP
-	NOP
-	NOP
-t@0	BRA	t@0
-
-* NMI break target: infinite loop. The NMI vector is pointed here
-* by the Pico's 'break' console command. The 6809 pushes its full
-* register set onto the stack and spins. The pico can break the
-* spin by setting the second-last byte to 0.
-	ORG	START
-Break	CLRA
-	LDX	#SHARED
-B@0	LDB	A,S
-	STB	A,X
-	INCA
-	CMPA	#12	all registers on stack after NMI/IRQ/SWI
-	BLT	B@0
-B@1	BRA	B@1
-	RTI
-
-	ORG	CHUNK
-	INCLUDEBIN	download
-
-	ORG	CHUNK
-	INCLUDEBIN	rel_picothing
-
-	ORG	CHUNK
-	INCLUDEBIN	irq_test
-
 ********************************************************************
 * dbgmon - Debug monitor routines for Pico-Thing
 *
@@ -244,8 +14,15 @@ B@1	BRA	B@1
 *   $FC12  IllegalOp  - 6309 illegal opcode trap handler (does not return)
 *
 * All routines preserve all registers unless noted.
+*
+* Edt/Rev  YYYY/MM/DD  Modified by
+* Comment
+* ------------------------------------------------------------------
+*     1    2025       Initial version
 
                     org       $FC00
+
+*                   use       picothing.d
 
 DAT.Task            equ       $FFC0
 ACIA.Ctrl           equ       $FFC4
@@ -261,8 +38,6 @@ JT.PStr             jmp       PrintStr
 JT.PCR              jmp       PrintCR
 JT.PReg             jmp       PrintRegs
 JT.IlOp             jmp       IllegalOp
-
-Version             fcb       1,0,0
 
 ********************************************************************
 * PrintChar - print character in A to ACIA
@@ -341,10 +116,7 @@ PrintCR             pshs      cc,a
 ********************************************************************
 * PrintRegs - dump all registers to ACIA
 *
-* Prints:
-* CC = xx   A = xx   B = xx   DP = xx
-* X = xxxx   Y = xxxx   U = xxxx   S = xxxx
-
+* Prints: CC=xx A=xx B=xx DP=xx X=xxxx Y=xxxx U=xxxx S=xxxx\r\n
 *
 * The caller's registers are captured on entry via pshs.
 * S printed is the value BEFORE the pshs (adjusted).
@@ -367,7 +139,6 @@ PrintRegs           pshs      cc,a,b,dp,x,y,u save all registers
                     bsr       PrintStr
                     lda       3,s       DP
                     bsr       Print2Hex
-                    bsr       PrintCR
                     leax      str.X,pcr
                     bsr       PrintStr
                     lda       4,s       X high
@@ -391,14 +162,14 @@ PrintRegs           pshs      cc,a,b,dp,x,y,u save all registers
                     bsr       PrintCR
                     puls      cc,a,b,dp,x,y,u,pc
 
-str.CC              fcn       "CC = "
-str.A               fcn       "   A = "
-str.B               fcn       "   B = "
-str.DP              fcn       "   DP = "
-str.X               fcn       "X = "
-str.Y               fcn       "   Y = "
-str.U               fcn       "   U = "
-str.S               fcn       "   S = "
+str.CC              fcn       "CC="
+str.A               fcn       "         A="
+str.B               fcn       "         B="
+str.DP              fcn       "         DP="
+str.X               fcn       "         X="
+str.Y               fcn       "         Y="
+str.U               fcn       "         U="
+str.S               fcn       "         S="
 
 ********************************************************************
 * IllegalOp - 6309 illegal opcode / division-by-zero trap handler
@@ -410,8 +181,7 @@ str.S               fcn       "   S = "
 *
 * Prints banner + all stacked registers + task register, then halts.
 *
-IllegalOp           orcc      i,f       mask interrupts
-                    lbsr      PrintCR
+IllegalOp           orcc      #$50      mask interrupts
                     leax      str.ILL,pcr
                     lbsr      PrintStr
 * print stacked PC (most useful info)
@@ -420,7 +190,6 @@ IllegalOp           orcc      i,f       mask interrupts
                     lda       10,s      PC high
                     ldb       11,s      PC low
                     lbsr      Print4Hex
-                    lbsr      PrintCR
 * dump stacked registers
                     leax      str.CC,pcr
                     lbsr      PrintStr
@@ -438,7 +207,6 @@ IllegalOp           orcc      i,f       mask interrupts
                     lbsr      PrintStr
                     lda       3,s       DP
                     lbsr      Print2Hex
-                    lbsr      PrintCR
                     leax      str.X,pcr
                     lbsr      PrintStr
                     lda       4,s       X high
@@ -459,7 +227,6 @@ IllegalOp           orcc      i,f       mask interrupts
                     tfr       s,d
                     addd      #12       adjust for exception frame
                     lbsr      Print4Hex
-                    lbsr      PrintCR
 * print current task register
                     leax      str.TK,pcr
                     lbsr      PrintStr
@@ -469,47 +236,10 @@ IllegalOp           orcc      i,f       mask interrupts
 * halt forever
 ILL.Halt            bra       ILL.Halt
 
-str.ILL             fcn       "*** ILLEGAL OP ***"
-str.PC              fcn       "  PC = "
-str.TK              fcn       "  TK = "
+str.ILL             fcn       "***      ILLEGAL OP"
+str.PC              fcn       "         PC="
+str.TK              fcn       "         TK="
 
                     fill      $FF,$FE00-* pad to end of region
 
-	ORG	$0000
-	FCC	"DAT_INIT"
-	FCB	' '
-	FCC	"ZERO"
-	FCB	' '
-	FCC	"BLOCK_FILL"
-	FCB	' '
-	FCC	"COPY_OUT"
-	FCB	' '
-	FCC	"COPY_IN"
-	FCB	' '
-	FCC	"SYNC"
-	FCB	' '
-	FCC	"LOOP_RW"
-	FCB	' '
-	FCC	"STACK_EX"
-	FCB	' '
-	FCC	"DAT_EX"
-	FCB	' '
-	FCC	"TEST_SWI"
-	FCB	' '
-	FCC	"TEST_NMI"
-	FCB	' '
-	FCC	"TEST_IRQ"
-	FCB	' '
-	FCC	"TEST_FIRQ"
-	FCB	' '
-	FCC	"TEST_RTI"
-	FCB	' '
-	FCC	"BREAK"
-	FCB	' '
-	FCC	"DOWNLOAD"
-	FCB	' '
-	FCC	"NITROS9"
-	FCB	' '
-	FCC	"IRQ_TEST"
-	FCB	' '
-	FCC	"DBGMON"
+                    end

@@ -373,6 +373,8 @@ __time_critical_func(dma_bus_write_irq_handler())
 			reg[SYSTEM_TASK] = new_task;
 			task_pins_update(new_task);
 		}
+		else if (wloc == SYSTEM_RTI_SIGNAL)
+			MC6809.apply_rti();
 		// CONSOLE_CONTROL / AUX_CONTROL: full guest_control() is deferred
 		// to the write_ring so mode changes are sequenced after pending TX
 		// data.  But RTS must take effect immediately — otherwise
@@ -677,6 +679,7 @@ status_gather(status_snapshot_t *s)
 	s->bus_state = MC6809.get_bus_state();
 	s->old_bus_state = MC6809.get_old_bus_state();
 	s->task = MC6809.get_task();
+	s->nesting_depth = MC6809.get_nesting_depth();
 	s->task_stack_ptr = MC6809.get_task_stack_ptr();
 	for (uint16_t i = 0; i < s->task_stack_ptr && i < STATUS_MAX_INT_NEST_DEPTH; i++)
 		s->task_history[i] = MC6809.get_task_history(i);
@@ -785,7 +788,7 @@ status_print(const status_snapshot_t *s)
 	// 2. Bus state, run state
 	printf("Bus State: %-16s  Prev: %-16s\n",
 	       bus_state_string[s->bus_state], bus_state_string[s->old_bus_state]);
-	printf("Run State: %s\n", run_state_string[s->run_state]);
+	printf("Run State: %s  Nesting: %u\n", run_state_string[s->run_state], s->nesting_depth);
 	printf("Task: %u  History:", s->task);
 	if (s->task_stack_ptr == 0)
 		printf(" -");
@@ -878,7 +881,7 @@ status_json(const status_snapshot_t *s)
 	printf("{\"run_state\":\"%s\",\"bus_state\":\"%s\",\"old_bus_state\":\"%s\"",
 	       run_state_string[s->run_state], bus_state_string[s->bus_state],
 	       bus_state_string[s->old_bus_state]);
-	printf(",\"task\":%u,\"task_stack_ptr\":%u", s->task, s->task_stack_ptr);
+	printf(",\"task\":%u,\"nesting_depth\":%u,\"task_stack_ptr\":%u", s->task, s->nesting_depth, s->task_stack_ptr);
 	printf(",\"task_history\":[");
 	for (uint16_t i = 0; i < s->task_stack_ptr; i++) {
 		if (i > 0) printf(",");
