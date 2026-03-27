@@ -36,6 +36,9 @@ mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 	run_state = RS_UNPOWERED;
 	busy_lic_avma.byte = 0x00u;
 	task_stack_ptr = 0u;
+	nesting_depth = 0u;
+	rti_task_countdown = 0u;
+	rti_pending_task = 0u;
 	e_freq = GUEST_CLK_DEFAULT;
 #ifdef DEBUG
 	_count_lic = 0u;
@@ -101,6 +104,9 @@ mc6809::setup(enum run_state rs)
 	bus_state = BUS_RUNNING;
 	busy_lic_avma.byte = 0x00u;
 	task_stack_ptr = 0u;
+	nesting_depth = 0u;
+	rti_task_countdown = 0u;
+	rti_pending_task = 0u;
 	vma = false;
 #ifdef DEBUG
 	_count_lic = 0u;
@@ -279,13 +285,40 @@ mc6809::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 		DEASSERT_IRQ;
 }
 
-// The guest just executed an RTI instruction
+// The PIO RTI detector has spotted an RTI opcode fetch.
+// The RTI hasn't executed yet — set up a countdown to defer the
+// task restore until the RTI instruction completes (15 E-cycles
+// for a full frame, 6 for FIRQ; we use 15 to be safe for both).
 void
 mc6809::apply_rti()
 {
 #ifdef DEBUG
 	count_rti();
 #endif
+	if (nesting_depth > 0u) {
+		nesting_depth--;
+		if (task_stack_ptr > 0u) {
+			rti_pending_task = task_stack[task_stack_ptr.fetch_sub(1u, std::memory_order_relaxed) - 1u];
+			rti_task_countdown = 15u;
+		}
+		if (nesting_depth == 0u && rti_task_countdown == 0u)
+			run_state = RS_RUNNING;
+	}
+}
+
+// Called once per Q-rising from the ISR. When the countdown expires,
+// restore the previous task and update task pins.
+void
+mc6809::tick_rti_countdown()
+{
+	if (rti_task_countdown > 0u && --rti_task_countdown == 0u) {
+		task = rti_pending_task;
+		reg[SYSTEM_TASK] = rti_pending_task;
+		if (task_pin_callback)
+			task_pin_callback(rti_pending_task);
+		if (nesting_depth == 0u)
+			run_state = RS_RUNNING;
+	}
 }
 
 #define USB_BUFFER_SIZE 512

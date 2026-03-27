@@ -100,9 +100,16 @@ private:
 	volatile enum bus_state bus_state;
 	volatile enum run_state run_state;
 	volatile BLA busy_lic_avma{};
+	static constexpr uint8_t MAX_INT_NEST_DEPTH = 16u;
 	volatile uint8_t task;
+	volatile uint8_t nesting_depth = 0;
+	volatile uint8_t rti_task_countdown = 0;	// E-cycle countdown for deferred task restore
+	uint8_t rti_pending_task = 0;			// task to restore when countdown expires
+	volatile uint8_t task_stack[MAX_INT_NEST_DEPTH]{};
 	std::atomic<uint16_t> task_stack_ptr{0u};
 	volatile bool busy, lic, vma;
+	using task_pin_cb_t = void(*)(uint8_t);
+	task_pin_cb_t task_pin_callback = nullptr;
 #ifdef DEBUG
 	static constexpr unsigned trace_size = TRACE_SIZE;
 	volatile uint32_t _count_lic;
@@ -153,7 +160,9 @@ public:
 	void deinit();
 	void set_setup_callback(setup_callback_t cb) { setup_callback = cb; }
 	uint8_t task_change(uint8_t new_task);
+	void set_task_pin_callback(task_pin_cb_t cb) { task_pin_callback = cb; }
 	void apply_rti();
+	void tick_rti_countdown();	// called per Q-rising from ISR
 
 	[[nodiscard]] bool assert_powered() const;
 	[[nodiscard]] bool assert_stopped() const;
@@ -179,7 +188,9 @@ public:
 	[[nodiscard]] enum bus_state get_bus_state() const { return bus_state; }
 	[[nodiscard]] enum bus_state get_old_bus_state() const { return old_bus_state; }
 	[[nodiscard]] uint8_t get_task() const { return task; }
+	[[nodiscard]] uint8_t get_nesting_depth() const { return nesting_depth; }
 	[[nodiscard]] uint16_t get_task_stack_ptr() const { return task_stack_ptr; }
+	[[nodiscard]] uint8_t get_task_history(uint16_t i) const { return (i < MAX_INT_NEST_DEPTH) ? task_stack[i] : 0u; }
 	friend void gpio_clock_eq_irq_handler();
 	friend void dma_bus_read_irq_handler();
 	friend void dma_bus_write_irq_handler();

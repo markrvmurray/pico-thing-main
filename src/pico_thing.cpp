@@ -115,9 +115,7 @@ task_pins_update(uint8_t task)
 	pio_sm_put(task_pio, task_pio_sm, pio_word);
 }
 
-// Keep track of which task was interrupted
-#define MAX_INT_NEST_DEPTH 16u
-static volatile uint8_t task_stack[MAX_INT_NEST_DEPTH];
+// task_stack is now inside mc6809 class (mc6809::task_stack[])
 
 
 
@@ -189,8 +187,10 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			switch (new_bs) {
 			case BUS_IRQ: {
 				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
-				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < MAX_INT_NEST_DEPTH)
-					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
+				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < mc6809::MAX_INT_NEST_DEPTH) {
+					MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
+					MC6809.nesting_depth++;
+				}
 #ifdef DEBUG
 				if (eirq <= INTERRUPT_RESET)
 					MC6809.count_irq_ack(eirq);
@@ -208,6 +208,8 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 				break;
 			}
 		}
+		// Deferred task restore after RTI detection
+		MC6809.tick_rti_countdown();
 		// E-cycle countdown NMI timer
 #if 0
 		if (system_tick.tick())
@@ -677,7 +679,7 @@ status_gather(status_snapshot_t *s)
 	s->task = MC6809.get_task();
 	s->task_stack_ptr = MC6809.get_task_stack_ptr();
 	for (uint16_t i = 0; i < s->task_stack_ptr && i < STATUS_MAX_INT_NEST_DEPTH; i++)
-		s->task_history[i] = task_stack[i];
+		s->task_history[i] = MC6809.get_task_history(i);
 
 	s->power = POWER_IS_ASSERTED;
 	s->reset = RESET_IS_ASSERTED;
@@ -2031,14 +2033,12 @@ __no_inline_not_in_flash_func(main_core1)()
 			// FOR_EACH interrupt_source:
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
-#if 0
 			eirq = system_tick.has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = fast_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = aux_serial.has_interrupt();
 			interrupt_refcount[eirq]++;
-#endif
 			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
 				core1_irq_assert_count++;
 			// Update cached state so the Q-rising ISR can assert/deassert
@@ -2578,6 +2578,7 @@ set_power()
 		fast_serial.reset();
 		aux_serial.reset();
 	});
+	MC6809.set_task_pin_callback(task_pins_update);
 	printf("Core0 guest powered on and initialised\n");
 
 	clock_pio_init();
