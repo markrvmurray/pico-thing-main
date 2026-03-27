@@ -183,6 +183,10 @@ union high_bus_pins {
 #define SYSTEM_TIMER_CONTROL_13	uint16_t(0x08u) // Write-only (enable/disable)
 #define SYSTEM_TIMER_STATUS	uint16_t(0x09u) // Read-only (IRQ flag, cleared on read)
 
+// Vector watchpoint: guest writes non-zero to arm, zero to disarm.
+// When armed, writes to $FFF0-$FFFF are blocked and trigger NMI.
+#define SYSTEM_WATCHPOINT	uint16_t(0x0Au) // Write-only
+
 // System request opcodes
 #define	REQUEST_NULL		uint8_t(0x00u)
 #define REQUEST_TIME		uint8_t('T')

@@ -117,7 +117,10 @@ task_pins_update(uint8_t task)
 
 // task_stack is now inside mc6809 class (mc6809::task_stack[])
 
-
+// Vector watchpoint — when armed, writes to $FFF0-$FFFF are blocked and trigger NMI.
+// The Pico sets the NMI vector to the BREAK snippet before arming.
+static volatile bool watchpoint_armed = false;
+static uint16_t watchpoint_saved_nmi_vector = 0u;
 
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
@@ -390,8 +393,14 @@ __time_critical_func(dma_bus_write_irq_handler())
 			aux_serial.write_received();
 		else if (wloc == SYSTEM_TIMER_CONTROL_13)
 			system_tick.control(wval);
+		else if (wloc == SYSTEM_WATCHPOINT) {
+			// Arm/disarm deferred to write ring handler (needs snippet_code[])
+		}
 		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
-		// CPU is concerned.
+		// CPU is concerned. When watchpoint is armed, vector writes are blocked and trigger NMI.
+		else if (wloc >= REGISTER_VECTORS_OFFSET && watchpoint_armed) {
+			ASSERT_NMI;
+		}
 		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
 			reg[wloc] = wval;
 		// Queue for the for(;;) loop to do full dispatch.
@@ -1468,7 +1477,58 @@ status_done:
 			}
 			printf(" ]  RTI: %lu\n", MC6809.get_rti_count());
 #endif
-			printf("Interrupt chunk test: %s\n", success ? "PASS" : "FAIL");
+			printf("Interrupt test: %s\n", success ? "PASS" : "FAIL");
+
+			// --- Watchpoint test phase ---
+			// Set WP_PHASE=1 so the chunk takes the watchpoint path on restart.
+			// The chunk code is still in RAM — just restart with the same reset vector.
+			printf("Watchpoint test\n");
+			reg[REGISTER_BUFFER_OFFSET + 8] = static_cast<uint8_t>(1u);  // S_WP_PHASE
+			MC6809.start();
+
+			// Wait for WP_ARMED signal (chunk has armed the watchpoint)
+			timeout = 0u;
+			while (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 9]) != 2u) {
+				sleep_us(1);
+				if (++timeout > 1000000u) break;
+			}
+			if (timeout > 1000000u) {
+				printf("  Timeout waiting for watchpoint arm\n");
+				MC6809.stop();
+				break;
+			}
+
+			// The chunk will now write to $FFF0, triggering NMI → BREAK.
+			// BREAK copies 12 bytes of stack frame to SHARED and spins.
+			// Wait for SHARED[0] to become non-zero (BREAK writes CC there).
+			sleep_ms(5u);  // give the trigger + NMI + BREAK time to complete
+
+			MC6809.stop();
+
+			// BREAK snippet copies stack[0..11] to SHARED[0..11].
+			// Stack frame: CC(0) A(1) B(2) DP(3) X(4-5) Y(6-7) U(8-9) PC(10-11)
+			const uint8_t wp_cc = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 0]);
+			const uint8_t wp_a  = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 1]);
+			const uint8_t wp_b  = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 2]);
+			const uint8_t wp_dp = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 3]);
+			const uint16_t wp_x = (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 4]) << 8)
+			                    |  static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 5]);
+			const uint16_t wp_y = (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 6]) << 8)
+			                    |  static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 7]);
+			const uint16_t wp_u = (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 8]) << 8)
+			                    |  static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 9]);
+			const uint16_t wp_pc = (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 10]) << 8)
+			                     |  static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 11]);
+			if (wp_pc != 0u) {
+				printf("  Watchpoint: PASS (caught write at PC=$%04X)\n", wp_pc);
+				printf("  CC=%02X A=%02X B=%02X DP=%02X X=%04X Y=%04X U=%04X PC=%04X\n",
+				       wp_cc, wp_a, wp_b, wp_dp, wp_x, wp_y, wp_u, wp_pc);
+			} else {
+				printf("  Watchpoint: FAIL (no break detected)\n");
+				success = false;
+			}
+
+			printf("Interrupt chunk test: %s\n", success ? "ALL PASS" : "FAIL");
 			break;
 		}
 
@@ -1930,6 +1990,30 @@ poll_console()
 			}
 		}
 		MC6809.uart_task(idx > 0);
+
+		// Check for watchpoint hit — BREAK snippet writes stack to SHARED and spins.
+		// PC at SHARED[10:11]; non-zero means the watchpoint fired.
+		if (watchpoint_armed) {
+			const uint8_t pc_hi = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 10]);
+			const uint8_t pc_lo = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 11]);
+			if (pc_hi != 0u || pc_lo != 0u) {
+				const uint16_t wp_pc = (pc_hi << 8) | pc_lo;
+				printf("\n*** WATCHPOINT HIT ***\n");
+				printf("  CC=%02X A=%02X B=%02X DP=%02X X=%04X Y=%04X U=%04X PC=%04X\n",
+				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 0]),
+				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 1]),
+				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 2]),
+				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 3]),
+				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 4]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 5]),
+				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 6]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 7]),
+				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 8]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 9]),
+				       wp_pc);
+				printf("  Write to vector area at PC=$%04X\n", wp_pc);
+				watchpoint_armed = false;
+				MC6809.stop();
+				prompted = false;
+			}
+		}
 	}
 }
 
@@ -2137,6 +2221,20 @@ __no_inline_not_in_flash_func(main_core1)()
 
 			case SYSTEM_SUBREQUEST:
 				// TODO: MarkM - implement finer-grained sysreqs
+				break;
+
+			case SYSTEM_WATCHPOINT:
+				if (written_byte != 0u && !watchpoint_armed) {
+					// Arm: save NMI vector, install BREAK snippet, set NMI vector
+					watchpoint_saved_nmi_vector = static_cast<uint16_t>(reg[REGISTER_VECTOR_NMI_OFFSET]);
+					snippet_copy(BREAK);
+					reg[REGISTER_VECTOR_NMI_OFFSET] = REGISTER_SNIPPET;
+					watchpoint_armed = true;
+				} else if (written_byte == 0u && watchpoint_armed) {
+					// Disarm: restore original NMI vector
+					reg[REGISTER_VECTOR_NMI_OFFSET] = watchpoint_saved_nmi_vector;
+					watchpoint_armed = false;
+				}
 				break;
 
 			case CONSOLE_CONTROL: { // ACIA command
@@ -2580,6 +2678,7 @@ set_power()
 		system_tick.reset();
 		fast_serial.reset();
 		aux_serial.reset();
+		watchpoint_armed = false;
 	});
 	MC6809.set_task_pin_callback(task_pins_update);
 	printf("Core0 guest powered on and initialised\n");

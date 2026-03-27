@@ -10,6 +10,11 @@
 ; buffer and delivers hardware interrupts (NMI, FIRQ, IRQ)
 ; after the software interrupts (SWI, SWI2, SWI3) complete.
 ;
+; After interrupt tests, the Pico sets S_WP_PHASE=1 and restarts.
+; On restart the chunk sees S_WP_PHASE=1, arms the vector watchpoint,
+; and deliberately writes to the vector area. The BREAK snippet
+; catches the NMI and copies the stack to SHARED.
+;
 ; SHARED block layout:
 ;   +0  READY       (1)  6809 sets to 1 when vectors installed
 ;   +1  SWI_RESULT  (1)  $11 after SWI ISR runs
@@ -19,9 +24,13 @@
 ;   +5  FIRQ_RESULT (1)  $BB after FIRQ ISR runs
 ;   +6  IRQ_RESULT  (1)  $CC after IRQ ISR runs
 ;   +7  DONE        (1)  6809 sets to 1 when entering final loop
+;   +8  WP_PHASE    (1)  Pico sets to 1 before restart for watchpoint test
+;   +9  WP_ARMED    (1)  6809 sets to 2 when watchpoint is armed
 ;
 
 	USE	syslib.inc
+
+WATCHPOINT	EQU	$FFCA	; SYSTEM_WATCHPOINT register
 
 Start	EXPORT
 
@@ -34,15 +43,24 @@ S_NMI		EQU	SHARED+4
 S_FIRQ		EQU	SHARED+5
 S_IRQ		EQU	SHARED+6
 S_DONE		EQU	SHARED+7
+S_WP_PHASE	EQU	SHARED+8
+S_WP_ARMED	EQU	SHARED+9
 
 	SECTION	TEXT
 
 ; ===============================================================
-; Entry point
+; Entry point — check WP_PHASE to decide which test to run
 ; ===============================================================
 
 Start	LDS	#STACK
 	ORCC	#$FF		; mask all interrupts
+
+	; Check if this is a watchpoint test restart
+	LDA	>S_WP_PHASE
+	CMPA	#1
+	BEQ	WP_Test
+
+	; --- Normal interrupt test path ---
 
 	; Clear SHARED block
 	LDX	#SHARED
@@ -98,6 +116,35 @@ Clr@	CLR	,X+
 
 	; Infinite loop — Pico delivers interrupts during this
 Done@	BRA	Done@
+
+; ===============================================================
+; Watchpoint test — entered when Pico sets WP_PHASE=1 and restarts
+; ===============================================================
+
+WP_Test
+	; Arm the watchpoint (Pico installs BREAK snippet + NMI vector)
+	LDA	#1
+	STA	>WATCHPOINT
+
+	; Brief delay for write ring to process the arm
+	LDX	#200
+WDly@	LEAX	-1,X
+	BNE	WDly@
+
+	; Signal watchpoint armed
+	LDA	#2
+	STA	>S_WP_ARMED
+
+	; Deliberately write to vector area — should trigger NMI
+	; The BREAK snippet (installed by watchpoint arm) will
+	; copy the stack frame to SHARED and spin.
+	LDD	#$DEAD
+	STD	>$FFF0		; *** WATCHPOINT TRIGGER ***
+
+	; Should never reach here — NMI takes us to BREAK snippet
+	NOP
+	NOP
+WFail@	BRA	WFail@
 
 ; ===============================================================
 ; Interrupt Service Routines
