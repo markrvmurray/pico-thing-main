@@ -208,6 +208,61 @@ mc6809_bus_write_program_deinit(PIO pio, uint sm)
 
 %}
 
+; RTI opcode detector. Samples LIC at E-fall; on the following
+; E-fall reads D[7:0] and compares with the RTI opcode ($3B).
+; If LIC is 1 on consecutive cycles, each subsequent E-fall is
+; also checked.  Raises IRQ 0 when RTI is detected.
+;
+; JMP pin:  GPIO_LIC (21)
+; IN  pins: (8) D7-0, base = GPIO_D_BASE (9)
+; Wait:     GPIO_E (0) for falling edge
+; Y:        preloaded with RTI opcode ($3B) via TX FIFO at startup
+;
+; Instruction budget: 13 (pio1 has 32 slots, bus_write uses 19)
+.program	rti_detect
+
+	pull	block			; Get RTI opcode from TX FIFO
+	mov	y osr			; Y = $3B (RTI)
+.wrap_target
+wait_lic:
+	wait	1 gpio GPIO_E		; Wait for E high
+	wait	0 gpio GPIO_E		; E falling edge — sample LIC
+	jmp	pin check_data		; LIC=1 → check next E-fall for RTI opcode
+	jmp	wait_lic		; LIC=0, try next cycle
+check_data:
+	wait	1 gpio GPIO_E		; Wait for E high
+	wait	0 gpio GPIO_E		; E falling edge — D[7:0] valid
+	in	pins 8			; Read D[7:0] (left-shift: bits 7-0)
+	mov	x isr			; X = D[7:0]
+	mov	isr null		; Clear ISR for next use
+	jmp	x!=y wait_lic		; Not RTI → back to LIC sampling
+	irq	set 0			; RTI detected — signal the Pico
+.wrap				; back to wait_lic (consecutive LIC caught next cycle)
+
+% c-sdk {
+
+static inline void
+rti_detect_program_init(PIO pio, uint sm, uint offset)
+{
+	pio_sm_config c = rti_detect_program_get_default_config(offset);
+	sm_config_set_in_pins(&c, GPIO_D_BASE);		// D7-0
+	sm_config_set_in_shift(&c, false, false, 32);		// Left shift
+	sm_config_set_jmp_pin(&c, GPIO_LIC);			// LIC for branch
+	pio_sm_init(pio, sm, offset, &c);
+	// Pre-load RTI opcode ($3B) into Y register
+	pio_sm_put(pio, sm, 0x3Bu);
+	// pio_sm_set_enabled(pio, sm, false);
+}
+
+static inline void
+rti_detect_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	pio_sm_unclaim(pio, sm);
+}
+
+%}
+
 ; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and
 ; outputs it to GPIO 40-45 (TASK[4:0] + TASK0).
 ; Runs at full system clock (320 MHz, no divider).

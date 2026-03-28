@@ -40,7 +40,7 @@ mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 #ifdef DEBUG
 	_count_lic = 0u;
 	_count_rti = 0u;
-	_count_irq_ack = 0u;
+	for (auto &c : _count_irq_ack) c = 0u;
 #endif
 }
 
@@ -105,7 +105,7 @@ mc6809::setup(enum run_state rs)
 #ifdef DEBUG
 	_count_lic = 0u;
 	_count_rti = 0u;
-	_count_irq_ack = 0u;
+	for (auto &c : _count_irq_ack) c = 0u;
 	trace_pos = 0u;
 #endif
 }

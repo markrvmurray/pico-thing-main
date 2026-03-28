@@ -92,11 +92,17 @@ static pio_dma piodma_write = {
 	DMA_IRQ_1
 };
 
+// RTI detector PIO — runs on pio1 (needs GPIO 0-21 visibility)
+#define RTI_DETECT_PIO pio1
+static PIO rti_pio;
+static uint rti_pio_sm;
+
 // PIO program offsets (needed for pio_remove_program on shutdown)
 static int pio_clock_offset;
 static int pio_read_offset;
 static int pio_write_offset;
 static int pio_task_offset;
+static int pio_rti_offset;
 
 // PIO-driven task pins (pio2, GPIO base 16, pins 40-45)
 static PIO task_pio;
@@ -142,13 +148,6 @@ static constexpr uint8_t PEND_IRQ  = 1u << 2;
 // 50 Hz tick timer (IRQ) + E-cycle countdown (NMI).
 static tick_timer system_tick(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
-#ifdef DEBUG
-static volatile uint32_t bs_irq_even_address = 0u;
-static volatile uint32_t bs_irq_odd_address = 0u;
-static volatile uint8_t bs_irq_seq = 0u;       // which order: 1=even first, 2=odd first
-static volatile uint8_t bs_irq_first_a = 0u;   // A[5:0] of first BS_IRQ transition
-static volatile uint8_t bs_irq_second_a = 0u;  // A[5:0] of second BS_IRQ transition
-#endif
 static volatile uint32_t core1_qrise_count = 0u;
 static volatile uint32_t core1_irq_assert_count = 0u;
 static volatile uint32_t core1_loop_count = 0u;
@@ -190,26 +189,14 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			MC6809.bus_state.state = new_bus_state.state;
 			MC6809.run_state = run_state_table[MC6809.run_state][MC6809.bus_state.state];
 			if (new_bus_state.state == BS_IRQ) {
-				auto eirq = static_cast<interrupt>(address_lsb >> 1);
+				// A[5:0] during BS_IRQ is the vector address & 0x3F.
+				// Vectors at $FFF0+2*type, so type = (A - 0x30) >> 1.
+				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
 				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < MAX_INT_NEST_DEPTH)
 					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 #ifdef DEBUG
-				// The 6809 asserts BS_IRQ twice per interrupt (high and
-				// low vector byte fetch). Count raw transitions; the
-				// test harness divides by 2 and checks for evenness.
-				if ((address_lsb & 0x3E) != 0x3E) {
-					// Not RESET
-					MC6809.count_irq_ack();
-					// Diagnostic: record A[5:0] in arrival order
-					if (bs_irq_seq == 0u)
-						bs_irq_first_a = bus_pins.bits.A;
-					else if (bs_irq_seq == 1u)
-						bs_irq_second_a = bus_pins.bits.A;
-					bs_irq_seq++;
-					if (bs_irq_seq == 2u)
-						bs_irq_seq = 0u;
-				}
-
+				if (eirq < INTERRUPT_RESET)
+					MC6809.count_irq_ack(eirq);
 #endif
 			}
 		}
@@ -239,13 +226,9 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 	} else {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
-		bus_pins bus_pins{};
-		bus_pins.word = gpio_get_all();
-		// Universal RTI detection: LIC=1 means the 6809 is fetching the
-		// next opcode. If it's a read cycle and D=$3B, that opcode is RTI.
-		// Works for any address — no CS or address check needed.
-		if (MC6809.get_lic() && bus_pins.bits.RW && bus_pins.bits.D == 0x3Bu)
-			MC6809.apply_rti();
+		// RTI detection is now handled by the rti_detect PIO program
+		// which samples D[7:0] at E-fall (when data bus is valid for
+		// both register-space and RAM reads).
 		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
 		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
 		// we do NOT capture them here.
@@ -253,6 +236,15 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, false); // scope timing
 #endif
+}
+
+// ISR for the RTI opcode detector PIO program.
+// Fires when the PIO detects LIC=1 followed by D[7:0]=$3B at E-fall.
+void __isr
+__time_critical_func(pio_rti_irq_handler())
+{
+	pio_interrupt_clear(rti_pio, 0);
+	MC6809.apply_rti();
 }
 
 // ISR for the R/!W bus read loop and DMA chain
@@ -1261,11 +1253,6 @@ status_done:
 #ifdef DEBUG
 		MC6809.clear_rti_count();
 		MC6809.clear_irq_ack_count();
-		bs_irq_even_address = 0u;
-		bs_irq_odd_address = 0u;
-		bs_irq_seq = 0u;
-		bs_irq_first_a = 0u;
-		bs_irq_second_a = 0u;
 #endif
 
 		if (hexnum == 0) {
@@ -1455,8 +1442,16 @@ status_done:
 				       c.name, ok ? "PASS" : "FAIL", c.expected, got);
 			}
 #ifdef DEBUG
-			printf("  IRQ ack: raw %lu, RTI: %lu\n",
-			       MC6809.get_irq_ack_count(), MC6809.get_rti_count());
+			static const char *irq_names[] = {
+				"ILL", "SWI3", "SWI2", "FIRQ", "IRQ", "SWI", "NMI", "RESET", "NONE"
+			};
+			printf("  IRQ ack: %lu [", MC6809.get_irq_ack_total());
+			for (int i = 0; i < NUM_INTERRUPTS; i++) {
+				uint32_t c = MC6809.get_irq_ack_count(static_cast<interrupt>(i));
+				if (c > 0u)
+					printf(" %s=%lu", irq_names[i], c);
+			}
+			printf(" ]  RTI: %lu\n", MC6809.get_rti_count());
 #endif
 			printf("Interrupt chunk test: %s\n", success ? "PASS" : "FAIL");
 			break;
@@ -1479,20 +1474,22 @@ status_done:
 			printf("%s: Timeout counter: %u  Test result: %s\n",
 			       test_name, timeout, success ? "PASS" : "FAIL");
 #ifdef DEBUG
-			// The 6809 asserts BS_IRQ twice per interrupt (2 vector bytes).
-			// Raw count should be 2x expected and always even.
-			const uint32_t irq_ack_raw = MC6809.get_irq_ack_count();
-			const bool irq_ack_even = (irq_ack_raw % 2u == 0u);
-			const uint32_t irq_ack_count = irq_ack_raw / 2u;
-			const bool irq_ack_ok = irq_ack_even && (irq_ack_count == expected_irq_ack_count);
+			static const char *irq_names[] = {
+				"ILL", "SWI3", "SWI2", "FIRQ", "IRQ", "SWI", "NMI", "RESET", "NONE"
+			};
+			const uint32_t irq_ack_total = MC6809.get_irq_ack_total();
+			const bool irq_ack_ok = (irq_ack_total == expected_irq_ack_count);
 			if (!irq_ack_ok)
 				success = false;
-			printf("%s: IRQ acknowledge: %s (expected %lu, got %lu, raw %lu %s)\n",
+			printf("%s: IRQ ack: %s (expected %lu, got %lu) [",
 			       test_name, irq_ack_ok ? "PASS" : "FAIL",
-			       expected_irq_ack_count, irq_ack_count,
-			       irq_ack_raw, irq_ack_even ? "even" : "ODD");
-			printf("%s: BS_IRQ diagnostic: 1st=0x%02X 2nd=0x%02X count=%u\n",
-			       test_name, bs_irq_first_a, bs_irq_second_a, bs_irq_seq);
+			       expected_irq_ack_count, irq_ack_total);
+			for (int i = 0; i < NUM_INTERRUPTS; i++) {
+				uint32_t c = MC6809.get_irq_ack_count(static_cast<interrupt>(i));
+				if (c > 0u)
+					printf(" %s=%lu", irq_names[i], c);
+			}
+			printf(" ]\n");
 			const uint32_t rti_caught = MC6809.get_rti_count();
 			const bool rti_ok = (rti_caught == expected_rti_count);
 			if (!rti_ok)
@@ -1978,6 +1975,13 @@ __no_inline_not_in_flash_func(main_core1)()
 	pio_sm_set_enabled(task_pio, task_pio_sm, true);
 	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_pio), task_pio_sm);
 
+	pio_sm_set_enabled(rti_pio, rti_pio_sm, true);
+	pio_set_irq0_source_enabled(rti_pio, pis_interrupt0, true);
+	irq_set_exclusive_handler(PIO1_IRQ_0, pio_rti_irq_handler);
+	irq_set_priority(PIO1_IRQ_0, 1);
+	irq_set_enabled(PIO1_IRQ_0, true);
+	printf("Core1 RTI detect pio%d/sm%d started\n", PIO_NUM(rti_pio), rti_pio_sm);
+
 	sysreq_initialise();
 
 	// Start the 50 Hz tick timer (hardware alarm, runs independently of E clock).
@@ -2452,6 +2456,17 @@ bus_pio_dma_init()
 	task_pio_sm = pio_claim_unused_sm(task_pio, true);
 	task_output_program_init(task_pio, task_pio_sm, pio_task_offset);
 	printf("Core0 task output pio%u sm%u configured\n", PIO_NUM(task_pio), task_pio_sm);
+
+	// SM: RTI opcode detector (pio1, needs GPIO 0-21 visibility)
+	rti_pio = RTI_DETECT_PIO;
+	pio_rti_offset = pio_add_program(rti_pio, &rti_detect_program);
+	if (pio_rti_offset < 0) {
+		printf("Core0 insufficient space for rti_detect program\n");
+		panic("Unable to proceed");
+	}
+	rti_pio_sm = pio_claim_unused_sm(rti_pio, true);
+	rti_detect_program_init(rti_pio, rti_pio_sm, pio_rti_offset);
+	printf("Core0 RTI detect pio%u sm%u configured\n", PIO_NUM(rti_pio), rti_pio_sm);
 }
 
 #define MEASURE_FREQS
@@ -2502,6 +2517,15 @@ pio_shutdown()
 	dma_channel_set_irq1_enabled(piodma_write.data_channel, false);
 	irq_set_enabled(piodma_write.irq, false);
 	irq_remove_handler(piodma_write.irq, dma_bus_write_irq_handler);
+
+	// RTI detect IRQ (pio1)
+	pio_set_irq0_source_enabled(rti_pio, pis_interrupt0, false);
+	irq_set_enabled(PIO1_IRQ_0, false);
+	irq_remove_handler(PIO1_IRQ_0, pio_rti_irq_handler);
+
+	// --- RTI detect (pio1) ---
+	rti_detect_program_deinit(rti_pio, rti_pio_sm);
+	pio_remove_program(rti_pio, &rti_detect_program, pio_rti_offset);
 
 	// --- Task output (pio2) ---
 	task_output_program_deinit(task_pio, task_pio_sm);
