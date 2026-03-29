@@ -34,7 +34,7 @@ all: $(ASSIST09_TARGETS) \
      hello.srec hello.raw disk_test.srec disk_test.raw \
      diskload.srec diskload.raw dat_torture.srec dat_torture.raw \
      stress_acia.srec stress_acia.raw \
-     irq_test.s19
+     irq_test.s19 irq_test.raw
 
 # -----------------------------------------------------------------------
 # Libraries (IO_OBJ is io.obj or io_noirq.obj depending on IO= setting)

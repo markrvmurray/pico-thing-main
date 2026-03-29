@@ -1374,9 +1374,11 @@ status_done:
 			// The chunk sets up its own vectors, runs SWI/SWI2/SWI3,
 			// then signals DONE. Pico delivers NMI, FIRQ, IRQ and checks results.
 			printf("Interrupt chunk test\n");
-			printf("(Requires irq_test.s19 pasted at console)\n");
 
-			// Reset vector already set by S9 record
+			// Load embedded irq_test chunk and set reset vector
+			if (!copy(OUTWARDS, chunk_len[IRQ_TEST], CHUNK_ADDRESS, chunk_code[IRQ_TEST]))
+				break;
+			reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
 #ifdef DEBUG
 			MC6809.clear_rti_count();
 			MC6809.clear_irq_ack_count();

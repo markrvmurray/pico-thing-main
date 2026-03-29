@@ -225,6 +225,9 @@ B@1	BRA	B@1
 	ORG	CHUNK
 	INCLUDEBIN	rel_picothing
 
+	ORG	CHUNK
+	INCLUDEBIN	irq_test
+
 ********************************************************************
 * dbgmon - Debug monitor routines for Pico-Thing
 *
@@ -506,5 +509,7 @@ str.TK              fcn       "  TK = "
 	FCC	"DOWNLOAD"
 	FCB	' '
 	FCC	"NITROS9"
+	FCB	' '
+	FCC	"IRQ_TEST"
 	FCB	' '
 	FCC	"DBGMON"

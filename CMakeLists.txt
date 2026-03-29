@@ -76,6 +76,7 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/api.bin
 	DEPENDS ${CMAKE_CURRENT_LIST_DIR}/extra/api.asm
 		${CMAKE_CURRENT_LIST_DIR}/extra/download
 		${CMAKE_CURRENT_LIST_DIR}/extra/rel_picothing
+		${CMAKE_CURRENT_LIST_DIR}/extra/irq_test
 	COMMAND lwasm --format=decb
 			--list=${CMAKE_CURRENT_BINARY_DIR}/api.lst
 			--output=${CMAKE_CURRENT_BINARY_DIR}/api.bin
