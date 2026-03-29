@@ -120,14 +120,6 @@ task_pins_update(uint8_t task)
 static volatile uint8_t task_stack[MAX_INT_NEST_DEPTH];
 
 
-//	BS_RUNNING,    BS_IRQ,         BS_SYNC,   BS_HALT,   BS_RUNNING_RESET ....
-static const run_state run_state_table[RUN_STATE_COUNT][BUS_STATE_COUNT] = {
-	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_STARTED
-	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_INTERRUPTED
-	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_HALTED
-	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_SYNCED
-	{RS_STARTED, RS_INTERRUPTED, RS_SYNCED, RS_HALTED, RS_STOPPED, RS_STOPPED, RS_STOPPED, RS_STOPPED}, // RS_STOPPED
-};
 
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
@@ -178,26 +170,42 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// by Q-falling the 6809 has already updated them for the next cycle). Unpack
 		// immediately so that vma is valid before the DMA read ISR fires (~20 cycles later).
 		MC6809.set_busy_lic_avma(static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA));
-		ba_bs_u new_bus_state = { .byte = static_cast<uint8_t>(bus_pins.bits.BS_BA) };
 		uint8_t address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
-		new_bus_state.bit.RESET = RESET_IS_ASSERTED;
+		const auto new_bs = static_cast<enum bus_state>(bus_pins.bits.BS_BA & 0x03u);
+		const bool reset_now = RESET_IS_ASSERTED;
 #ifdef DEBUG
 		MC6809.count_lic();
 #endif
-		if (MC6809.bus_state.state != new_bus_state.state) {
-			MC6809.old_bus_state.state = MC6809.bus_state.state;
-			MC6809.bus_state.state = new_bus_state.state;
-			MC6809.run_state = run_state_table[MC6809.run_state][MC6809.bus_state.state];
-			if (new_bus_state.state == BS_IRQ) {
-				// A[5:0] during BS_IRQ is the vector address & 0x3F.
-				// Vectors at $FFF0+2*type, so type = (A - 0x30) >> 1.
+		if (reset_now) {
+			if (MC6809.run_state != RS_RESET) {
+				MC6809.run_state = RS_RESET;
+				MC6809.task_stack_ptr = 0;
+			}
+		} else if (MC6809.run_state == RS_RESET) {
+			MC6809.run_state = RS_RUNNING;
+		} else if (new_bs != MC6809.bus_state) {
+			MC6809.old_bus_state = MC6809.bus_state;
+			MC6809.bus_state = new_bs;
+			switch (new_bs) {
+			case BUS_IRQ: {
 				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
 				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < MAX_INT_NEST_DEPTH)
 					task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 #ifdef DEBUG
-				if (eirq < INTERRUPT_RESET)
+				if (eirq <= INTERRUPT_RESET)
 					MC6809.count_irq_ack(eirq);
 #endif
+				MC6809.run_state = RS_IN_IRQ;
+				break;
+			}
+			case BUS_SYNC:  MC6809.run_state = RS_SYNCED; break;
+			case BUS_HALT:  MC6809.run_state = RS_HALTED; break;
+			case BUS_RUNNING:
+				if (MC6809.run_state != RS_IN_IRQ)
+					MC6809.run_state = RS_RUNNING;
+				break;
+			default:
+				break;
 			}
 		}
 		// E-cycle countdown NMI timer
@@ -276,7 +284,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 #endif
 	//if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
-	if (!MC6809.bus_state.bit.RESET && MC6809.get_vma()) {
+	if (MC6809.run_state >= RS_RUNNING && MC6809.get_vma()) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
 		const uint8_t loc = read_addr & registers::register_mask;
 		if (loc == CONSOLE_RX_DATA) {
@@ -308,7 +316,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 		if (trace_pos < trace_size - 1) {
 			trace[trace_pos][0] = loc;
 			trace[trace_pos][1] = *reinterpret_cast<volatile std::uint8_t *>(read_addr);
-			trace[trace_pos][2] = TRACE_READ | (MC6809.get_busy_lic_avma() << 8) | (MC6809.bus_state.byte << 4) | MC6809.run_state;
+			trace[trace_pos][2] = TRACE_READ | (MC6809.get_busy_lic_avma() << 8) | (MC6809.bus_state << 4) | MC6809.run_state;
 			trace[trace_pos][3] = 0u;
 			trace_pos++;
 		}
@@ -352,7 +360,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 #endif
 	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
-	if (!MC6809.bus_state.bit.RESET) {
+	if (MC6809.run_state >= RS_RUNNING) {
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
 		const uint8_t wloc = written_addr & registers::register_mask;
 		const uint8_t wval = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
@@ -399,7 +407,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 		if (trace_pos < trace_size - 1) {
 			trace[trace_pos][0] = wloc;
 			trace[trace_pos][1] = wval;
-			trace[trace_pos][2] = TRACE_WRITE | (MC6809.busy_lic_avma.byte << 8) | (MC6809.bus_state.byte << 4) | MC6809.run_state;
+			trace[trace_pos][2] = TRACE_WRITE | (MC6809.get_busy_lic_avma() << 8) | (MC6809.bus_state << 4) | MC6809.run_state;
 			trace[trace_pos][3] = 0u;
 			trace_pos++;
 		}
@@ -684,7 +692,7 @@ status_gather(status_snapshot_t *s)
 	s->rti_count = MC6809.get_rti_count();
 	s->last_lic = last_LIC;
 	s->lic_stalled = false;
-	if (MC6809.is_started()) {
+	if (MC6809.is_running()) {
 		if (last_LIC != s->lic_count)
 			last_LIC = s->lic_count;
 		else
@@ -774,7 +782,7 @@ status_print(const status_snapshot_t *s)
 
 	// 2. Bus state, run state
 	printf("Bus State: %-16s  Prev: %-16s\n",
-	       ba_bs_string[s->bus_state], ba_bs_string[s->old_bus_state]);
+	       bus_state_string[s->bus_state], bus_state_string[s->old_bus_state]);
 	printf("Run State: %s\n", run_state_string[s->run_state]);
 	printf("Task: %u  History:", s->task);
 	if (s->task_stack_ptr == 0)
@@ -866,8 +874,8 @@ void
 status_json(const status_snapshot_t *s)
 {
 	printf("{\"run_state\":\"%s\",\"bus_state\":\"%s\",\"old_bus_state\":\"%s\"",
-	       run_state_string[s->run_state], ba_bs_string[s->bus_state],
-	       ba_bs_string[s->old_bus_state]);
+	       run_state_string[s->run_state], bus_state_string[s->bus_state],
+	       bus_state_string[s->old_bus_state]);
 	printf(",\"task\":%u,\"task_stack_ptr\":%u", s->task, s->task_stack_ptr);
 	printf(",\"task_history\":[");
 	for (uint16_t i = 0; i < s->task_stack_ptr; i++) {
@@ -1521,7 +1529,7 @@ status_done:
 				       bla.bit.AVMA ? "AVMA" : "    ",
 				       bla.bit.LIC  ? "LIC " : "    ",
 				       bla.bit.BUSY ? "BUSY" : "    ",
-				       ba_bs_string[(trace[i][2] >> 4) & 0x0F],
+				       bus_state_string[(trace[i][2] >> 4) & 0x0F],
 				       run_state_string[trace[i][2] & 0x0F],
 				       trace[i][3]);
 			}

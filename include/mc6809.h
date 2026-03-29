@@ -49,48 +49,33 @@
 #define enum_list(e) e,
 #define enum_list_strings(s) #s,
 
+// Pure 2-bit pin observation of BA/BS
 #define foreach_busstate(busstate) \
-busstate(BS_RUNNING)       \
-busstate(BS_IRQ)           \
-busstate(BS_SYNC)          \
-busstate(BS_HALT)          \
-busstate(BS_RUNNING_RESET) \
-busstate(BS_IRQ_RESET)     \
-busstate(BS_SYNC_RESET)    \
-busstate(BS_HALT_RESET)    \
-busstate(BS_UNPOWERED)
+busstate(BUS_RUNNING)      \
+busstate(BUS_IRQ)          \
+busstate(BUS_SYNC)         \
+busstate(BUS_HALT)
 
-enum ba_bs {
+enum bus_state : uint8_t {
 	foreach_busstate(enum_list)
 	BUS_STATE_COUNT
 };
 
-union ba_bs_u {
-	uint8_t byte;
-	struct {
-		uint8_t BS: 1;
-		uint8_t BA: 1;
-		uint8_t RESET: 1;
-		uint8_t UNPOWERED: 1;
-		uint8_t : 4;
-	} bit;
-	enum ba_bs state;
-};
-
+// System-level state machine with memory
 #define foreach_runstate(runstate) \
-runstate(RS_STARTED) \
-runstate(RS_INTERRUPTED) \
-runstate(RS_HALTED) \
-runstate(RS_SYNCED) \
-runstate(RS_STOPPED) \
-runstate(RS_UNPOWERED)
+runstate(RS_UNPOWERED) \
+runstate(RS_RESET)     \
+runstate(RS_RUNNING)   \
+runstate(RS_IN_IRQ)    \
+runstate(RS_SYNCED)    \
+runstate(RS_HALTED)
 
-enum run_state {
+enum run_state : uint8_t {
 	foreach_runstate(enum_list)
 	RUN_STATE_COUNT
 };
 
-extern const char *ba_bs_string[];
+extern const char *bus_state_string[];
 extern const char *run_state_string[];
 
 union BLA {
@@ -111,8 +96,8 @@ union BLA {
 
 class mc6809 {
 private:
-	volatile ba_bs_u old_bus_state{};
-	volatile ba_bs_u bus_state{};
+	volatile enum bus_state old_bus_state;
+	volatile enum bus_state bus_state;
 	volatile enum run_state run_state;
 	volatile BLA busy_lic_avma{};
 	volatile uint8_t task;
@@ -155,7 +140,7 @@ public:
 #ifdef DEBUG
 	void clear_lic_count() { _count_lic = 0u; }
 	[[nodiscard]] uint32_t get_lic_count() const { return _count_lic; }
-	void count_lic() { if (lic && bus_state.state == BS_RUNNING) _count_lic++; }
+	void count_lic() { if (lic && bus_state == BUS_RUNNING) _count_lic++; }
 	void clear_rti_count() { _count_rti = 0u; }
 	[[nodiscard]] uint32_t get_rti_count() const { return _count_rti; }
 	void count_rti() { _count_rti++; }
@@ -183,16 +168,16 @@ public:
 	void preserve_state();
 	void restore_state();
 	void set_e_frequency(float target_mhz, const pio_dma &pio_clock);
-	[[nodiscard]] bool is_started() const { return run_state == RS_STARTED; };
-	[[nodiscard]] bool is_interrupted() const { return run_state == RS_INTERRUPTED; };
+	[[nodiscard]] bool is_running() const { return run_state == RS_RUNNING || run_state == RS_IN_IRQ; };
+	[[nodiscard]] bool is_in_irq() const { return run_state == RS_IN_IRQ; };
 	[[nodiscard]] bool is_synced() const { return run_state == RS_SYNCED; };
 	[[nodiscard]] bool is_halted() const { return run_state == RS_HALTED; };
-	[[nodiscard]] bool is_stopped() const { return run_state == RS_STOPPED; }
+	[[nodiscard]] bool is_stopped() const { return run_state == RS_RESET; }
 	[[nodiscard]] bool is_unpowered() const { return run_state == RS_UNPOWERED; }
 	[[nodiscard]] float get_e_frequency() const;
 	[[nodiscard]] enum run_state get_run_state() const { return run_state; }
-	[[nodiscard]] enum ba_bs get_bus_state() const { return bus_state.state; }
-	[[nodiscard]] enum ba_bs get_old_bus_state() const { return old_bus_state.state; }
+	[[nodiscard]] enum bus_state get_bus_state() const { return bus_state; }
+	[[nodiscard]] enum bus_state get_old_bus_state() const { return old_bus_state; }
 	[[nodiscard]] uint8_t get_task() const { return task; }
 	[[nodiscard]] uint16_t get_task_stack_ptr() const { return task_stack_ptr; }
 	friend void gpio_clock_eq_irq_handler();

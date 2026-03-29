@@ -21,7 +21,7 @@
 #include "mc6809.h"
 #include "mc6850.h"
 
-const char *ba_bs_string[] = {
+const char *bus_state_string[] = {
 	foreach_busstate(enum_list_strings)
 };
 
@@ -31,8 +31,8 @@ const char *run_state_string[] = {
 
 mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 {
-	old_bus_state.state = BS_UNPOWERED;
-	bus_state.state = BS_UNPOWERED;
+	old_bus_state = BUS_RUNNING;
+	bus_state = BUS_RUNNING;
 	run_state = RS_UNPOWERED;
 	busy_lic_avma.byte = 0x00u;
 	task_stack_ptr = 0u;
@@ -84,7 +84,7 @@ mc6809::assert_stopped() const
 {
 	if (!assert_powered())
 		return false;
-	bool retval = run_state == RS_STOPPED;
+	bool retval = run_state == RS_RESET;
 	if (!retval)
 		printf("MC6809 not stopped, currently in %s\n", run_state_string[run_state]);
 	return retval;
@@ -93,12 +93,12 @@ mc6809::assert_stopped() const
 void
 mc6809::setup(enum run_state rs)
 {
-	assert(rs == RS_STOPPED);
+	assert(rs == RS_RESET);
 	if (setup_callback)
 		setup_callback();
 	run_state = rs;
-	old_bus_state.state = BS_RUNNING_RESET;
-	bus_state.state = BS_RUNNING_RESET;
+	old_bus_state = BUS_RUNNING;
+	bus_state = BUS_RUNNING;
 	busy_lic_avma.byte = 0x00u;
 	task_stack_ptr = 0u;
 	vma = false;
@@ -114,8 +114,6 @@ void
 mc6809::init()
 {
 	POWER_ASSERT;
-	old_bus_state.bit.UNPOWERED = 0;
-	bus_state.bit.UNPOWERED = 0;
 	// 0.25s should be enough for power to stabilise
 	sleep_ms(250u);
 
@@ -145,7 +143,7 @@ mc6809::init()
 	gpio_set_drive_strength(GPIO_IRQ, GPIO_DRIVE_STRENGTH_8MA);
 	DEASSERT_IRQ;
 
-	setup(RS_STOPPED);
+	setup(RS_RESET);
 	task_initialise();
 }
 
@@ -173,8 +171,8 @@ mc6809::deinit()
 	DEASSERT_IRQ;
 
 	POWER_DEASSERT;
-	old_bus_state.state = BS_UNPOWERED;
-	bus_state.state = BS_UNPOWERED;
+	old_bus_state = BUS_RUNNING;
+	bus_state = BUS_RUNNING;
 	run_state = RS_UNPOWERED;
 }
 
@@ -183,13 +181,13 @@ mc6809::start()
 {
 	if (!assert_stopped())
 		return;
-	setup(RS_STOPPED);
+	setup(RS_RESET);
 	if (verbose)
 		printf("Starting MC6809 from %04X at E = %.1f MHz\n\n", static_cast<uint16_t>(reg[REGISTER_VECTOR_RESET_OFFSET]), e_freq);
 	RESET_DEASSERT;
 	if (verbose) {
 		sleep_ms(10u);
-		printf("Started MC6809 bus state = %u = %s\n", bus_state.state, ba_bs_string[bus_state.state]);
+		printf("Started MC6809 bus state = %u = %s\n", bus_state, bus_state_string[bus_state]);
 		printf("Started MC6809 run state = %u = %s\n", run_state, run_state_string[run_state]);
 	}
 }
@@ -206,7 +204,7 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 		return false;
 	if (verbose)
 		printf("Starting MC6809 from %04X at E = %.1f MHz and timeout = %u us\n\n", static_cast<uint16_t>(reg[REGISTER_VECTOR_RESET_OFFSET]), e_freq, timeout_us);
-	setup(RS_STOPPED);
+	setup(RS_RESET);
 #ifdef DEBUG
 	uint32_t lic_start = _count_lic;
 	uint32_t rti_start = _count_rti;
@@ -281,7 +279,7 @@ mc6809::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 		DEASSERT_IRQ;
 }
 
-// The guest just executed an RTI instruction from the snippet block
+// The guest just executed an RTI instruction
 void
 mc6809::apply_rti()
 {
@@ -337,12 +335,12 @@ uart_port_pump(mc6850 &serial, uint8_t cdc_port, uart_port_state &st, bool suppr
 void
 mc6809::uart_task(bool suppress_cdc_read)
 {
-	if (MC6809.run_state == RS_STARTED || MC6809.run_state == RS_SYNCED) {
+	if (MC6809.run_state >= RS_RUNNING) {
 		uart_port_pump(fast_serial, 0, port_state[0], suppress_cdc_read);
 		uart_port_pump(aux_serial, 1, port_state[1], false);
 		usb_cdc_flush_n(0);
 		usb_cdc_flush_n(1);
-	} else if (MC6809.run_state == RS_STOPPED) {
+	} else if (MC6809.run_state == RS_RESET) {
 		port_state[0] = {};
 		port_state[1] = {};
 	}
