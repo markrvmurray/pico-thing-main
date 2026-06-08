@@ -412,8 +412,10 @@ __time_critical_func(dma_bus_write_irq_handler())
 				MC6809.trace_stop();
 		}
 		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
-		// CPU is concerned. When watchpoint is armed, vector writes are blocked and trigger NMI.
-		else if (wloc >= REGISTER_VECTORS_OFFSET && watchpoint_armed) {
+		// CPU is concerned. When watchpoint is armed, writes to snippet space ($FFE0-$FFEF) and
+		// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
+		// and the vectors it guards.
+		else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET) {
 			ASSERT_NMI;
 		}
 		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
