@@ -149,6 +149,7 @@ static volatile uint32_t core1_read_irq_count = 0u;
 static volatile uint8_t core1_last_write_loc = 0u;
 static volatile uint8_t core1_last_read_loc = 0u;
 static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
+static volatile bool trace_e_irq_on = false;	// Core 1: is the E-fall trace IRQ currently enabled?
 
 // Stack watermark for Core 1 — paint stack with 0xDEADBEEF, then scan
 // from the bottom to find the high-water mark.
@@ -190,6 +191,8 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			switch (new_bs) {
 			case BUS_IRQ: {
 				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
+				if (eirq <= INTERRUPT_RESET)
+					MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
 				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < mc6809::MAX_INT_NEST_DEPTH) {
 					MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 					MC6809.nesting_depth++;
@@ -235,8 +238,16 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			if (pend & PEND_FIRQ) ASSERT_FIRQ; else DEASSERT_FIRQ;
 			if (pend & PEND_IRQ)  ASSERT_IRQ;  else DEASSERT_IRQ;
 		}
-//	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
-	} else {
+		// Reconcile the E-falling trace interrupt with the software trace
+		// state.  Core 1 owns the bank0 GPIO IRQ, so console/guest arming only
+		// sets trace_enabled; we enable/disable the actual E-fall interrupt from
+		// this core.  Enabling at Q-rising means this same cycle's E-fall (which
+		// comes later in the cycle) is captured.
+		if (MC6809.trace_is_active() != trace_e_irq_on) {
+			trace_e_irq_on = MC6809.trace_is_active();
+			gpio_set_irq_enabled(GPIO_E, GPIO_IRQ_EDGE_FALL, trace_e_irq_on);
+		}
+	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
 		// RTI detection is now handled by the rti_detect PIO program
@@ -245,6 +256,12 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
 		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
 		// we do NOT capture them here.
+	}
+	// --- Bus trace: sample every pin at E-falling, the point where address,
+	// data, R/W and status are all settled.  One word per E cycle. ---
+	if (trace_e_irq_on && (gpio_get_irq_event_mask(GPIO_E) & GPIO_IRQ_EDGE_FALL)) {
+		gpio_acknowledge_irq(GPIO_E, GPIO_IRQ_EDGE_FALL);
+		MC6809.trace_capture(gpio_get_all());
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_EQ_IRQ, false); // scope timing
@@ -317,15 +334,6 @@ __time_critical_func(dma_bus_read_irq_handler())
 			read_location = loc;
 			read_irq_received = true;
 		}
-#ifdef DEBUG_NOT_NOW
-		if (trace_pos < trace_size - 1) {
-			trace[trace_pos][0] = loc;
-			trace[trace_pos][1] = *reinterpret_cast<volatile std::uint8_t *>(read_addr);
-			trace[trace_pos][2] = TRACE_READ | (MC6809.get_busy_lic_avma() << 8) | (MC6809.bus_state << 4) | MC6809.run_state;
-			trace[trace_pos][3] = 0u;
-			trace_pos++;
-		}
-#endif
 	}
 	//}
 #ifdef DEBUG
@@ -396,6 +404,13 @@ __time_critical_func(dma_bus_write_irq_handler())
 		else if (wloc == SYSTEM_WATCHPOINT) {
 			// Arm/disarm deferred to write ring handler (needs snippet_code[])
 		}
+		else if (wloc == SYSTEM_TRACE) {
+			// USim TraceCtl convention: non-zero arms a one-shot bus trace, zero stops.
+			if (wval)
+				MC6809.trace_arm();
+			else
+				MC6809.trace_stop();
+		}
 		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
 		// CPU is concerned. When watchpoint is armed, vector writes are blocked and trigger NMI.
 		else if (wloc >= REGISTER_VECTORS_OFFSET && watchpoint_armed) {
@@ -416,15 +431,6 @@ __time_critical_func(dma_bus_write_irq_handler())
 		write_ring[h].location = wloc;
 		write_ring[h].value = wval;
 		write_ring_head = next_h;
-#ifdef DEBUG_NOT_NOW
-		if (trace_pos < trace_size - 1) {
-			trace[trace_pos][0] = wloc;
-			trace[trace_pos][1] = wval;
-			trace[trace_pos][2] = TRACE_WRITE | (MC6809.get_busy_lic_avma() << 8) | (MC6809.bus_state << 4) | MC6809.run_state;
-			trace[trace_pos][3] = 0u;
-			trace_pos++;
-		}
-#endif
 	}
 	// }
 #ifdef DEBUG
@@ -1578,32 +1584,64 @@ status_done:
 	}
 
 	case CMD_TRACE:
-	case CMD_TRACE_LEN:
-		if (!MC6809.assert_powered())
+	case CMD_TRACE_LEN: {
+		// Decode the one-word-per-E-cycle capture via the bus_pins union.
+		// A5-A0 is the low 6 bits of the bus address; for any $FFC0-page
+		// access that is the full register offset.  Every pin is sampled at
+		// E-falling, so address, data, R/W and status are all settled.
+		const uint32_t have = MC6809.trace_count();
+		if (have == 0u) {
+			printf("trace: empty — arm with 'trace on', 'trace <irq>', "
+			       "or a guest poke of $%04X\n\n", REGISTER_BASE + SYSTEM_TRACE);
 			break;
-#ifdef DEBUG_NOT_NOW
-	{
-		uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, trace_pos) : trace_pos;
-		if (len > 0)
-			for (uint32_t i = 0; i < len; i++) {
-				BLA bla{}; bla.byte = static_cast<uint8_t>(trace[i][2] >> 8);
-				printf("%04lX %s %02lX %s %s %s %12s %12s %04lX\n",
-				       trace[i][0] + 0xFFC0u,
-				       (trace[i][2] & TRACE_WRITE) ? "W" : " ",
-				       trace[i][1],
-				       bla.bit.AVMA ? "AVMA" : "    ",
-				       bla.bit.LIC  ? "LIC " : "    ",
-				       bla.bit.BUSY ? "BUSY" : "    ",
-				       bus_state_string[(trace[i][2] >> 4) & 0x0F],
-				       run_state_string[trace[i][2] & 0x0F],
-				       trace[i][3]);
-			}
+		}
+		const uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, have) : have;
+		printf("    #  EQ R/W  A  D  CS  bus-state    B L V  H N F I\n");
+		for (uint32_t i = 0; i < len; i++) {
+			bus_pins bp{}; bp.word = MC6809.trace_word(i);
+			BLA bla{}; bla.byte = static_cast<uint8_t>(bp.bits.BUSY_LIC_AVMA);
+			printf("%5lu  %c%c  %c  %02X %02X  %c   %-11s  %c %c %c  %c %c %c %c\n",
+			       static_cast<unsigned long>(i),
+			       bp.bits.E ? 'E' : '.',
+			       bp.bits.Q ? 'Q' : '.',
+			       bp.bits.RW ? 'R' : 'W',
+			       static_cast<unsigned>(bp.bits.A),
+			       static_cast<unsigned>(bp.bits.D),
+			       bp.bits.CS ? '.' : '*',		// !CS: '*' = asserted (low)
+			       bus_state_string[bp.bits.BS_BA & 0x03u],
+			       bla.bit.BUSY ? 'B' : '.',
+			       bla.bit.LIC  ? 'L' : '.',
+			       bla.bit.AVMA ? 'V' : '.',
+			       bp.bits.HALT ? '.' : 'H',	// active-low outputs: letter = asserted
+			       bp.bits.NMI  ? '.' : 'N',
+			       bp.bits.FIRQ ? '.' : 'F',
+			       bp.bits.IRQ  ? '.' : 'I');
+		}
+		printf("%lu of %lu cycles%s\n\n",
+		       static_cast<unsigned long>(len), static_cast<unsigned long>(have),
+		       MC6809.trace_is_full() ? " (buffer full)" : "");
 		break;
 	}
-#else
-		printf("To enable trace, build with DEBUG defined\n\n");
+
+	case CMD_TRACE_ARM:
+		MC6809.trace_arm();
+		printf("trace armed: %u-cycle one-shot, capturing from now\n\n", TRACE_SIZE);
 		break;
-#endif
+
+	case CMD_TRACE_OFF:
+		MC6809.trace_clear();
+		printf("trace stopped and cleared\n\n");
+		break;
+
+	case CMD_TRACE_IRQ: {
+		static const char *const inames[NUM_INTERRUPTS] = {
+			"ILLEGAL", "SWI3", "SWI2", "FIRQ", "IRQ", "SWI", "NMI", "RESET", "NONE"
+		};
+		const interrupt it = static_cast<interrupt>(cmd.trace.intr);
+		MC6809.trace_set_irq_trigger(it);
+		printf("trace will arm (one-shot) when the %s vector is taken\n\n", inames[it]);
+		break;
+	}
 
 	case CMD_RUN_LIST:
 		for (uint16_t i = DAT_INIT; i < SNIPPET_LEN; i++)
@@ -2614,8 +2652,10 @@ pio_shutdown()
 {
 	// --- Disable IRQs first (handlers reference DMA/PIO resources) ---
 
-	// GPIO Q edge IRQ (bus observer)
+	// GPIO Q edge IRQ (bus observer) + E-fall trace IRQ
 	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+	gpio_set_irq_enabled(GPIO_E, GPIO_IRQ_EDGE_FALL, false);
+	trace_e_irq_on = false;
 	irq_set_enabled(pio_clock.irq, false);
 	gpio_remove_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
 

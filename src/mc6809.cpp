@@ -112,8 +112,13 @@ mc6809::setup(enum run_state rs)
 	_count_lic = 0u;
 	_count_rti = 0u;
 	for (auto &c : _count_irq_ack) c = 0u;
-	trace_pos = 0u;
 #endif
+	// If a one-shot trace is armed for this run, restart its fill cleanly.
+	// An interrupt-triggered config (trace_irq_trigger) persists across restarts.
+	if (trace_enabled) {
+		trace_pos = 0u;
+		trace_full = false;
+	}
 }
 
 void

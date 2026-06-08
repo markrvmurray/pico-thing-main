@@ -53,6 +53,9 @@ typedef enum cmd_tag {
 
 	CMD_TRACE,
 	CMD_TRACE_LEN,
+	CMD_TRACE_ARM,
+	CMD_TRACE_OFF,
+	CMD_TRACE_IRQ,
 
 	CMD_RUN_LIST,
 	CMD_RUN,
@@ -142,9 +145,10 @@ typedef struct parsed_cmd {
 			uint8_t testnum;
 		} irq;
 
-		/* CMD_TRACE_LEN */
+		/* CMD_TRACE_LEN / CMD_TRACE_IRQ */
 		struct {
-			uint32_t length;
+			uint32_t length;	/* CMD_TRACE_LEN: dump count */
+			uint8_t  intr;		/* CMD_TRACE_IRQ: enum interrupt value */
 		} trace;
 
 		/* CMD_RUN, CMD_RUN_NOWAIT */

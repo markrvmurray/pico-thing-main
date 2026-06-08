@@ -187,6 +187,10 @@ union high_bus_pins {
 // When armed, writes to $FFF0-$FFFF are blocked and trigger NMI.
 #define SYSTEM_WATCHPOINT	uint16_t(0x0Au) // Write-only
 
+// Bus trace control (USim TraceCtl convention): guest writes non-zero to arm a
+// one-shot capture, zero to stop. One immediate store per poke.
+#define SYSTEM_TRACE		uint16_t(0x0Bu) // Write-only
+
 // System request opcodes
 #define	REQUEST_NULL		uint8_t(0x00u)
 #define REQUEST_TIME		uint8_t('T')

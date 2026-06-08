@@ -34,6 +34,7 @@
  * visible for the yyerror forward declaration below.
  */
 #include "command_parser.h"
+#include "interrupt.h"   /* enum interrupt — for the trace IRQ trigger */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,20 @@ parse_dec(const char *s)
 	if (*end != '\0')
 		return LONG_MIN;
 	return v;
+}
+
+/* Map an interrupt mnemonic to its enum interrupt value, or -1 if unknown.
+ * Only the non-keyword mnemonics arrive here as TOK_WORD; "irq" comes via
+ * TOK_IRQ in the grammar. */
+static int
+parse_intname(const char *s)
+{
+	if (!strcasecmp(s, "swi"))  return INTERRUPT_SWI;
+	if (!strcasecmp(s, "swi2")) return INTERRUPT_SWI2;
+	if (!strcasecmp(s, "swi3")) return INTERRUPT_SWI3;
+	if (!strcasecmp(s, "nmi"))  return INTERRUPT_NMI;
+	if (!strcasecmp(s, "firq")) return INTERRUPT_FIRQ;
+	return -1;
 }
 
 /* -----------------------------------------------------------------------
@@ -599,6 +614,26 @@ trace_cmd:
 		}
 		result->tag          = CMD_TRACE_LEN;
 		result->trace.length = v;
+	}
+	| TOK_TRACE TOK_ON {
+		result->tag = CMD_TRACE_ARM;
+	}
+	| TOK_TRACE TOK_OFF {
+		result->tag = CMD_TRACE_OFF;
+	}
+	| TOK_TRACE TOK_IRQ {
+		result->tag        = CMD_TRACE_IRQ;
+		result->trace.intr = (uint8_t)INTERRUPT_IRQ;
+	}
+	| TOK_TRACE TOK_WORD {
+		int code = parse_intname($2);
+		if (code < 0) {
+			printf("Unknown trace interrupt '%s' "
+			       "(use swi, swi2, swi3, nmi, firq, irq)\n", $2);
+			YYERROR;
+		}
+		result->tag        = CMD_TRACE_IRQ;
+		result->trace.intr = (uint8_t)code;
 	}
 	;
 

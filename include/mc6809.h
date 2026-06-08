@@ -88,11 +88,9 @@ union BLA {
 	uint8_t byte;
 };
 
-#ifdef DEBUG
-#define TRACE_SIZE 1024u
-#define TRACE_READ 0x00000000u
-#define TRACE_WRITE 0x10000000u
-#endif
+// Bus trace: one raw gpio_get_all() word captured per E cycle at Q-rising.
+// One-shot fill of trace_size words; decoded on demand via the bus_pins union.
+#define TRACE_SIZE 4096u
 
 class mc6809 {
 private:
@@ -111,13 +109,17 @@ private:
 	using task_pin_cb_t = void(*)(uint8_t);
 	task_pin_cb_t task_pin_callback = nullptr;
 #ifdef DEBUG
-	static constexpr unsigned trace_size = TRACE_SIZE;
 	volatile uint32_t _count_lic;
 	volatile uint32_t _count_rti;
 	volatile uint32_t _count_irq_ack[NUM_INTERRUPTS];
-	volatile unsigned trace_pos = 0u;
-	volatile uint32_t trace[trace_size][4u];
 #endif
+	// Bus trace (always compiled; gated at runtime by trace_enabled).
+	static constexpr unsigned trace_size = TRACE_SIZE;
+	volatile uint32_t trace[trace_size];
+	volatile uint32_t trace_pos = 0u;	// words captured so far (also the write index)
+	volatile bool trace_enabled = false;	// capture in progress
+	volatile bool trace_full = false;	// one-shot fill completed
+	uint8_t trace_irq_trigger = 0u;		// bitmask of (1<<interrupt) vectors that arm capture
 	float e_freq;
 	using setup_callback_t = void(*)();
 	setup_callback_t setup_callback = nullptr;
@@ -144,6 +146,35 @@ public:
 	[[nodiscard]] bool get_busy() const { return busy; }
 	[[nodiscard]] bool get_lic() const { return lic; }
 	[[nodiscard]] bool get_vma() const { return vma; }
+	// --- Bus trace control (one-shot capture of one GPIO word per E cycle) ---
+	void trace_arm() { trace_pos = 0u; trace_full = false; trace_enabled = true; }
+	void trace_stop() { trace_enabled = false; }
+	void trace_clear() { trace_enabled = false; trace_full = false; trace_pos = 0u; trace_irq_trigger = 0u; }
+	void trace_set_irq_trigger(interrupt i) { trace_irq_trigger |= static_cast<uint8_t>(1u << i); }
+	[[nodiscard]] bool trace_is_full() const { return trace_full; }
+	[[nodiscard]] bool trace_is_active() const { return trace_enabled; }
+	[[nodiscard]] uint32_t trace_count() const { return trace_pos; }
+	[[nodiscard]] uint32_t trace_word(uint32_t i) const { return trace[i]; }
+	// Capture hook: called at E-falling from the EQ ISR, when address, data,
+	// R/W and status are all settled. One-shot — stops when the buffer fills.
+	void trace_capture(uint32_t gpio_word)
+	{
+		// Only capture cycles of a running CPU — skip the reset-held idle bus
+		// so an armed one-shot isn't consumed before the guest actually runs.
+		if (!trace_enabled || run_state < RS_RUNNING)
+			return;
+		trace[trace_pos++] = gpio_word;
+		if (trace_pos >= trace_size) {
+			trace_enabled = false;
+			trace_full = true;
+		}
+	}
+	// Named-interrupt trigger: called from the EQ ISR when a vector is taken.
+	void trace_irq_event(interrupt i)
+	{
+		if ((trace_irq_trigger & (1u << i)) && !trace_enabled && !trace_full)
+			trace_arm();
+	}
 #ifdef DEBUG
 	void clear_lic_count() { _count_lic = 0u; }
 	[[nodiscard]] uint32_t get_lic_count() const { return _count_lic; }

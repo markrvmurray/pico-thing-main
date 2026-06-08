@@ -20,6 +20,7 @@
 
 extern "C" {
 #include "command_parser.h"
+#include "interrupt.h"
 }
 
 /* Helper: copy the string literal into a mutable buffer (cmd_parse takes
@@ -759,6 +760,41 @@ TEST_CASE("trace command", "[parser][trace]")
 		REQUIRE(parse("trace 100", &cmd));
 		CHECK(cmd.tag           == CMD_TRACE_LEN);
 		CHECK(cmd.trace.length  == 0x100);
+	}
+	SECTION("trace on arms capture")
+	{
+		REQUIRE(parse("trace on", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_ARM);
+	}
+	SECTION("trace off stops capture")
+	{
+		REQUIRE(parse("trace off", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_OFF);
+	}
+	SECTION("trace irq sets the IRQ vector trigger")
+	{
+		REQUIRE(parse("trace irq", &cmd));
+		CHECK(cmd.tag        == CMD_TRACE_IRQ);
+		CHECK(cmd.trace.intr == INTERRUPT_IRQ);
+	}
+	SECTION("trace <name> maps named vectors to interrupt enum")
+	{
+		REQUIRE(parse("trace swi", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_IRQ);
+		CHECK(cmd.trace.intr == INTERRUPT_SWI);
+
+		REQUIRE(parse("trace swi3", &cmd));
+		CHECK(cmd.trace.intr == INTERRUPT_SWI3);
+
+		REQUIRE(parse("trace nmi", &cmd));
+		CHECK(cmd.trace.intr == INTERRUPT_NMI);
+
+		REQUIRE(parse("trace firq", &cmd));
+		CHECK(cmd.trace.intr == INTERRUPT_FIRQ);
+	}
+	SECTION("trace with unknown interrupt name is rejected")
+	{
+		CHECK_FALSE(parse("trace bogus", &cmd));
 	}
 }
 
