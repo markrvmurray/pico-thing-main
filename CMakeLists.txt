@@ -72,11 +72,27 @@ target_include_directories(pico-thing
 
 pico_generate_pio_header(pico-thing ${CMAKE_CURRENT_LIST_DIR}/src/pico_thing.pio)
 
+# Binary blobs embedded into the snippet area by extra/api.asm via INCLUDEBIN.
+# The chunk blobs (dl.raw, irq_test.raw) are products of the separate chunk
+# build (cd chunk && make); extra/rel_picothing is maintained by hand. This
+# build does NOT generate any of them — if one is missing, fail loudly here
+# rather than emitting a cryptic assembler or "no rule to make target" error.
+set(API_EMBED_BLOBS
+	${CMAKE_CURRENT_LIST_DIR}/chunk/dl.raw
+	${CMAKE_CURRENT_LIST_DIR}/extra/rel_picothing
+	${CMAKE_CURRENT_LIST_DIR}/chunk/irq_test.raw
+)
+foreach(blob ${API_EMBED_BLOBS})
+	if(NOT EXISTS ${blob})
+		message(FATAL_ERROR
+			"Required embedded blob is missing:\n  ${blob}\n"
+			"This build does not generate it. Build the chunk blobs with "
+			"'cd chunk && make'; extra/rel_picothing must be supplied by hand.")
+	endif()
+endforeach()
+
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/api.bin
-	DEPENDS ${CMAKE_CURRENT_LIST_DIR}/extra/api.asm
-		${CMAKE_CURRENT_LIST_DIR}/extra/download
-		${CMAKE_CURRENT_LIST_DIR}/extra/rel_picothing
-		${CMAKE_CURRENT_LIST_DIR}/extra/irq_test
+	DEPENDS ${CMAKE_CURRENT_LIST_DIR}/extra/api.asm ${API_EMBED_BLOBS}
 	COMMAND lwasm --format=decb
 			--list=${CMAKE_CURRENT_BINARY_DIR}/api.lst
 			--output=${CMAKE_CURRENT_BINARY_DIR}/api.bin

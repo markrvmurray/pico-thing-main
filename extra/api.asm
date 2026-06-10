@@ -220,13 +220,13 @@ B@1	BRA	B@1
 	RTI
 
 	ORG	CHUNK
-	INCLUDEBIN	download
+	INCLUDEBIN	../chunk/dl.raw
 
 	ORG	CHUNK
 	INCLUDEBIN	rel_picothing
 
 	ORG	CHUNK
-	INCLUDEBIN	irq_test
+	INCLUDEBIN	../chunk/irq_test.raw
 
 ********************************************************************
 * dbgmon - Debug monitor routines for Pico-Thing
