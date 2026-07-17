@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-serial_test.py -- USB CDC echo stress-tester for pico-mc6809.
+serial_test.py -- USB CDC echo stress-tester for pico-thing-main.
 
 Sends bytes (0x00–0xFF cycling) to the target running uart_echo.asm,
 reads them back, and verifies the sequence. Reports throughput and a

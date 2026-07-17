@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Flex lexer for the pico-mc6809 interactive command parser.
+ * Flex lexer for the pico-thing-main interactive command parser.
  *
  * Design notes:
  *   - All symbols prefixed with cmd_yy to avoid collisions.

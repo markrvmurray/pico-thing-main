@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Bison LALR(1) grammar for the pico-mc6809 interactive command parser.
+ * Bison LALR(1) grammar for the pico-thing-main interactive command parser.
  *
  * Design notes:
  *   - All symbols prefixed with cmd_yy via %define api.prefix.
