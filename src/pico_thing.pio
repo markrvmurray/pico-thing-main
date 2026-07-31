@@ -22,8 +22,7 @@
 .define	public	GPIO_TRACE_RD	27	; Debugging
 .define	public	GPIO_TRACE_WR	28	; Debugging
 
-.define public	GPIO_PIX_BASE	32	; Communication with the second Pico
-.define public	GPIO_TASK_BASE	40	; TASK[4:0] + TASK0
+.define public	GPIO_TASK_BASE	32	; TASK[4:0] + TASK0
 
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.

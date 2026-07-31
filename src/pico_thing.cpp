@@ -151,6 +151,11 @@ static volatile uint8_t core1_last_read_loc = 0u;
 static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 static volatile bool trace_e_irq_on = false;	// Core 1: is the E-fall trace IRQ currently enabled?
 
+// Set when a DAT fault is latched, cleared when the resulting NMI takes its
+// vector.  Distinguishes a fault NMI from the timer and watchpoint NMIs, which
+// must not force a task switch.
+static volatile bool dat_fault_nmi_pending = false;
+
 // Stack watermark for Core 1 — paint stack with 0xDEADBEEF, then scan
 // from the bottom to find the high-water mark.
 extern "C" uint32_t __StackOneBottom;	// linker symbol
@@ -160,7 +165,7 @@ void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
 {
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_EQ_IRQ, true); // scope timing
+	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
 	core1_isr_count++;
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
@@ -196,6 +201,22 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < mc6809::MAX_INT_NEST_DEPTH) {
 					MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 					MC6809.nesting_depth++;
+				}
+				// A DAT fault vectors through NMI, and its handler has to
+				// reach the DAT RAM to reclaim the dead process's pages —
+				// which the GAL only enables for task 0.  (The faulting
+				// instruction is gone: the 6809 takes NMI at an instruction
+				// boundary, so the access has already completed on garbage
+				// and cannot be retried.)  Switch here rather than when the
+				// fault was latched, so the rest of that instruction and the
+				// CPU's register push both happen under the faulting task's
+				// own mapping, and the faulting task is on the task stack
+				// before the handler runs.
+				if (eirq == INTERRUPT_NMI && dat_fault_nmi_pending) {
+					dat_fault_nmi_pending = false;
+					const uint8_t supervisor = MC6809.task_change(0u);
+					reg[SYSTEM_TASK] = supervisor;
+					task_pins_update(supervisor);
 				}
 #ifdef DEBUG
 				if (eirq <= INTERRUPT_RESET)
@@ -256,6 +277,45 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
 		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
 		// we do NOT capture them here.
+
+		// DAT fault: the decode logic drives GPIO_FAULT high when the guest
+		// reads or writes a block of RAM the DAT does not map.  Sampled as a
+		// level here rather than on its own bank0 edge interrupt — one SIO
+		// read per E cycle is cheaper than the extra interrupt dispatch.
+		//
+		// Q-FALLING, deliberately.  The Fault line is a registered output of
+		// the DAT GAL clocked on Q-rising, so sampling at Q-rising would read
+		// it at the instant it changes; the 6809 in turn guarantees A0-A15,
+		// R/!W, BA and BS are stable from before Q rises until ~20 ns after E
+		// falls.  Q-falling therefore sits in the middle of a window where the
+		// registered signal and the live bus pins are both settled and both
+		// describe the same cycle.
+		//
+		// The fault pin, the task pins, A13-A15 and the NMIBlock readback all
+		// share the high input register, so one read covers them.
+		high_bus_pins high_pins{};
+		high_pins.word = sio_hw->gpio_hi_in;
+		// First fault wins.  Latching also asserts NMIBlock, which masks the
+		// NMI for every subsequent fault, so a storm cannot overwrite the
+		// record of the one that started it.  The NMI for THIS fault has
+		// already been captured by the GAL at Q-rising, so it still reaches
+		// the guest.  The handler re-arms by writing zero to SYSTEM_DAT_FAULT.
+		if (high_pins.bits.FAULT && !high_pins.bits.NMI_BLOCK) {
+			gpio_put(GPIO_NMI_BLOCK, true);
+			// Tell the BUS_IRQ case that the NMI now on its way is a fault,
+			// so it can drop the guest into task 0 for the handler.
+			dat_fault_nmi_pending = true;
+			// Nothing else writes bits 2-6, and NMIBlock was clear on the way
+			// in, so the whole byte can be stored rather than merged.
+			reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(
+				DAT_FAULT_FAULT | DAT_FAULT_NMI_BLOCK
+				| (gpio_get(GPIO_RW) ? DAT_FAULT_RW : 0u));
+			// The task pins are read back rather than taken from MC6809.task,
+			// so this is what the DAT hardware itself saw.
+			reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(
+				(high_pins.bits.TASK << DAT_FAULT_LOC_TASK_SHIFT)
+				| high_pins.bits.A_HI);
+		}
 	}
 	// --- Bus trace: sample every pin at E-falling, the point where address,
 	// data, R/W and status are all settled.  One word per E cycle. ---
@@ -264,7 +324,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		MC6809.trace_capture(gpio_get_all());
 	}
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_EQ_IRQ, false); // scope timing
+	gpio_put(GPIO_TRACE_C, false); // scope timing
 #endif
 }
 
@@ -302,7 +362,7 @@ void __isr
 __time_critical_func(dma_bus_read_irq_handler())
 {
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_READ_IRQ, true); // scope timing
+	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
 	//if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
@@ -330,6 +390,15 @@ __time_critical_func(dma_bus_read_irq_handler())
 		} else if (loc == SYSTEM_TIMER_STATUS) {
 			// Reading the timer status register acknowledges the IRQ.
 			system_tick.acknowledge();
+		} else if (loc == SYSTEM_DAT_FAULT) {
+			// Reading the fault register clears the fault and the R/!W
+			// latched with it — the DMA has already handed the pre-clear byte
+			// to the PIO, so the guest sees the fault and the clear lands
+			// before its next read.  NMIBlock (bit 7) is live state and
+			// persists.  SYSTEM_DAT_FAULT_LOC is left alone: it only means
+			// anything while a fault is latched, and the next fault
+			// overwrites it, so the guest can read the two in either order.
+			reg[SYSTEM_DAT_FAULT] &= uint8_t(~DAT_FAULT_LATCHED);
 		} else {
 			read_location = loc;
 			read_irq_received = true;
@@ -337,7 +406,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 	}
 	//}
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_READ_IRQ, false); // scope timing
+	gpio_put(GPIO_TRACE_C, false); // scope timing
 #endif
 }
 
@@ -369,7 +438,7 @@ void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_WRITE_IRQ, true); // scope timing
+	gpio_put(GPIO_TRACE_D, true); // scope timing
 #endif
 	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
@@ -411,6 +480,20 @@ __time_critical_func(dma_bus_write_irq_handler())
 			else
 				MC6809.trace_stop();
 		}
+		else if (wloc == SYSTEM_DAT_FAULT) {
+			// Bit 7 (NMIBlock) drives the hardware fault-NMI mask pin, and the
+			// guest reads its state back from the same bit.  This has to happen
+			// here rather than in the write ring, so that a guest masking faults
+			// is protected before its next instruction can fault.  Bits 0 and
+			// 1 (Fault and R/!W) are owned by the Q-rising sampler and are
+			// read-only, so writes leave them alone.
+			const bool block = (wval & DAT_FAULT_NMI_BLOCK) != 0u;
+			gpio_put(GPIO_NMI_BLOCK, block);
+			if (block)
+				reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
+			else
+				reg[SYSTEM_DAT_FAULT] &= uint8_t(~DAT_FAULT_NMI_BLOCK);
+		}
 		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
 		// CPU is concerned. When watchpoint is armed, writes to snippet space ($FFE0-$FFEF) and
 		// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
@@ -436,7 +519,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 	}
 	// }
 #ifdef DEBUG
-	gpio_put(GPIO_TRACE_WRITE_IRQ, false); // scope timing
+	gpio_put(GPIO_TRACE_D, false); // scope timing
 #endif
 }
 
@@ -2069,8 +2152,8 @@ __no_inline_not_in_flash_func(main_core1)()
 {
 	printf("Core1 process starting\n");
 
-	init_pins_range(GPIO_TRACE_CORE1, 4); // trace pins - isr set
-	gpio_set_dir_out_masked64(0b1111LLu << GPIO_TRACE_CORE1);
+	init_pins_range(GPIO_TRACE_C, 2); // trace pins - isr set
+	gpio_set_dir_out_masked64(0b11LLu << GPIO_TRACE_C);
 
 	fast_serial.reset();
 	aux_serial.reset();
@@ -2479,6 +2562,23 @@ bus_pio_dma_init()
 	init_pins_range(GPIO_BUSY, 3); // BUSY, LIC, AVMA
 	gpio_set_dir_in_masked(0b111u << GPIO_BUSY);
 
+	// DAT fault input, active high. Sampled as a level by the Q-rising ISR
+	// rather than raising an interrupt of its own.
+	gpio_init(GPIO_FAULT);
+	gpio_set_dir(GPIO_FAULT, GPIO_IN);
+	gpio_set_pulls(GPIO_FAULT, false, true); // idle low until the decode logic drives it
+
+	// A13-A15 inputs, latched with a fault into SYSTEM_DAT_FAULT_LOC to report
+	// the page within the task that faulted.
+	init_pins_range(GPIO_A_HI_BASE, 3);
+	gpio_set_dir_in_masked64(0b111LLu << GPIO_A_HI_BASE);
+
+	// Fault NMI mask output, active high, driven from SYSTEM_DAT_FAULT bit 7.
+	// Starts low (faults reach the guest) to match the cleared register.
+	gpio_init(GPIO_NMI_BLOCK);
+	gpio_put(GPIO_NMI_BLOCK, false);
+	gpio_set_dir(GPIO_NMI_BLOCK, GPIO_OUT);
+
 	// DMA for the main MC6809 bus read loop
 	if (dma_channel_is_claimed(piodma_read.address_channel)) {
 		printf("Core0 DMA channel %d for bus_read address is already claimed\n",
@@ -2705,10 +2805,14 @@ pio_shutdown()
 	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock_offset);
 
 	// --- Trace pins (GPIO 36-39) to hi-Z ---
-	for (uint i = 0; i < 4; i++) {
-		gpio_put(GPIO_TRACE_CORE1 + i, false);
-		gpio_set_dir(GPIO_TRACE_CORE1 + i, GPIO_IN);
+	for (uint i = 0; i < 2; i++) {
+		gpio_put(GPIO_TRACE_C + i, false);
+		gpio_set_dir(GPIO_TRACE_C + i, GPIO_IN);
 	}
+
+	// --- Fault NMI mask to hi-Z, so it does not drive unpowered logic ---
+	gpio_put(GPIO_NMI_BLOCK, false);
+	gpio_set_dir(GPIO_NMI_BLOCK, GPIO_IN);
 }
 
 static void

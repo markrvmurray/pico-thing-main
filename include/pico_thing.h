@@ -50,21 +50,21 @@ enum {
 	GPIO_UART_TX = 30, // [Y] [o]  RP2xxx UART Tx
 	GPIO_UART_RX = 31, // [Y] [i]  RP2xxx UART Rx
 
-	// Fast communication with the video Pico
-	// GPIO_PIX_BASE = 32, // [ ] Four pins for fast communication
+	// Slow - guest instruction-level timing
+	// GPIO_TASK_BASE = 32,
+	// GPIO_TASK_0 = 37,
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
-	GPIO_TRACE_CORE1 = 36,     // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_EQ_IRQ = 37,    // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_READ_IRQ = 38,  // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_WRITE_IRQ = 39, // [Y] [o]  Temporary debugging output pins for the scope
-
-	// Slow - guest instruction-level timing
-	GPIO_TASK_BASE = 40,
-	GPIO_TASK_0 = 45,
+	GPIO_TRACE_C = 38,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_D = 39,         // [Y] [o]  Temporary debugging output pins for the scope
 
 	// Slow - set at a leisurely pace at human-user speeds
-	GPIO_POWER = 46, // [Y] [o]  External power enable
+	GPIO_POWER = 40,           // [Y] [o]  External power enable
+
+	// Medium - per-instruction timing
+	GPIO_FAULT = 41,           // [ ] [i]  Attempt to read or write unassigned memory
+	GPIO_NMI_BLOCK = 42,       // [ ] [o]  Prevent DAT Fault NMI
+	GPIO_A_HI_BASE = 43,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
 
 	// Used by the PSRAM !CS on the PGA2350. Bummer.
 	// GPIO_POWER_ADC = 47, // [Y] [i]  ADC connected to the 5v line, divided by 2
@@ -102,19 +102,19 @@ union bus_pins {
 	uint32_t word;
 };
 
+// GPIO 32 upwards, as read from the SIO high input register.
 union high_bus_pins {
 	struct {
-		uint16_t PIX : 4;
-		uint16_t TRACE_CORE1 : 1;
-		uint16_t TRACE_EQ : 1;
-		uint16_t TRACE_RD : 1;
-		uint16_t TRACE_RW : 1;
-		uint16_t TASK : 5;
-		uint16_t TASK0 : 1;
-		uint16_t POWER : 1;
-		uint16_t POWER_ADC : 1;
+		uint32_t TASK : 5;	// 32-36
+		uint32_t TASK0 : 1;	// 37
+		uint32_t TRACE_C : 1;	// 38
+		uint32_t TRACE_D : 1;	// 39
+		uint32_t POWER : 1;	// 40
+		uint32_t FAULT : 1;	// 41
+		uint32_t NMI_BLOCK : 1;	// 42
+		uint32_t A_HI : 3;	// 43-45, A13-A15
 	} bits;
-	uint16_t hword;
+	uint32_t word;
 };
 
 // Chunks are like snippets, except they are too big for snippet space, so they go into RAM
@@ -190,6 +190,54 @@ union high_bus_pins {
 // Bus trace control (USim TraceCtl convention): guest writes non-zero to arm a
 // one-shot capture, zero to stop. One immediate store per poke.
 #define SYSTEM_TRACE		uint16_t(0x0Bu) // Write-only
+
+// DAT RAM fault - attempt to read or write a block of unassigned DAT-addressed RAM
+// This register will identify a fault as the source of an NMI, and can be used to mask
+// fault NMIs in the hardware.
+// Bit 0 - Fault (read - clears, write - no effect)
+// Bit 1 - R/!W of the faulting access (read-only, write - no effect)
+// Bit 7 - NMIBlock (read - returns set/clear status, write set/clear status)
+//
+// First fault wins: latching a fault also asserts NMIBlock, and while NMIBlock
+// is set no further fault touches either register.  A storm of faults
+// therefore leaves the record of the one that started it, rather than the last
+// one.  The guest re-arms by writing zero here, which is also the only way to
+// clear NMIBlock.
+//
+// The resulting NMI takes its vector with the guest switched to task 0, so the
+// handler can reach the DAT RAM.  The faulting instruction cannot be retried —
+// the 6809 takes NMI at an instruction boundary and the access has already
+// completed on garbage — so a fault is fatal to the process that caused it and
+// these registers are post-mortem evidence, not inputs to a repair.  The
+// faulting task is on the task stack by then, and apply_rti() restores it
+// unconditionally ~15 E-cycles after any RTI; an OS that terminates the
+// process has to sequence its task switch around that.
+#define SYSTEM_DAT_FAULT	uint16_t(0x0Cu) // Read/Write ($FFCC)
+
+// Where the fault happened, latched with it: the task that was selected and
+// the 8kB page inside it, laid out as the DAT RAM index of the unmapped block.
+// Bits 0-2 - A15-A13 of the faulting access, the page within the task
+// Bits 3-7 - TASK[4:0] as driven on the task pins
+//
+// The page is always 0-6.  Block 7 is the fixed page: the GAL translates only
+// $0000-$DFFF (MMU_dat), so a block 7 access cannot assert the fault line, and
+// a page of 7 here is therefore impossible in correct operation.  If one is
+// ever observed it means the fault flag and the address pins have come from
+// different bus cycles — see the sampling note in the Q-falling ISR.
+#define SYSTEM_DAT_FAULT_LOC	uint16_t(0x0Du) // Read ($FFCD)
+
+// SYSTEM_DAT_FAULT bits
+#define DAT_FAULT_FAULT		uint8_t(1u << 0) // set when GPIO_FAULT is sampled high
+#define DAT_FAULT_RW		uint8_t(1u << 1) // R/!W latched with the fault, read-only
+#define DAT_FAULT_NMI_BLOCK	uint8_t(1u << 7) // mirrors the GPIO_NMI_BLOCK output pin
+
+// Everything the fault sampler latches into SYSTEM_DAT_FAULT, and the read clears.
+#define DAT_FAULT_LATCHED	uint8_t(DAT_FAULT_FAULT | DAT_FAULT_RW)
+
+// SYSTEM_DAT_FAULT_LOC fields
+#define DAT_FAULT_LOC_PAGE_MASK	 uint8_t(0x07u) // A15-A13, already in bus order
+#define DAT_FAULT_LOC_TASK_SHIFT uint8_t(3)
+#define DAT_FAULT_LOC_TASK_MASK	 uint8_t(TASK_PINS_MASK << DAT_FAULT_LOC_TASK_SHIFT)
 
 // System request opcodes
 #define	REQUEST_NULL		uint8_t(0x00u)
