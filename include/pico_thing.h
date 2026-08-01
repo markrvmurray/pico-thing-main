@@ -69,8 +69,12 @@ enum {
 	GPIO_TASK_0 = 37,          // [Y] [o]  TASK0, set when the task number is zero
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
+	// NOTE: version 1 has these on 37-39, but 37 is TASK0/Root here, so
+	// TRACE_E has been put on 46 (unconnected on the v2 schematic) to keep
+	// the three available on both revisions.  Provisional - see the pin map.
 	GPIO_TRACE_C = 38,         // [Y] [o]  Temporary debugging output pins for the scope
 	GPIO_TRACE_D = 39,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_E = 46,         // [ ] [o]  Temporary debugging output pins for the scope
 
 	// Slow - set at a leisurely pace at human-user speeds
 	GPIO_POWER = 40,           // [Y] [o]  External power enable
@@ -87,11 +91,11 @@ enum {
 	GPIO_FAULT = 32,           // [ ] [i]  Attempt to read or write unassigned memory
 	GPIO_NMI_BLOCK = 33,       // [ ] [o]  Prevent DAT Fault NMI
 	GPIO_A_HI_BASE = 34,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
-	// GPIO 37 is free
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
-	GPIO_TRACE_C = 38,         // [Y] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_D = 39,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_C = 37,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_D = 38,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_E = 39,         // [Y] [o]  Temporary debugging output pins for the scope
 
 	// Slow - guest instruction-level timing
 	GPIO_TASK_BASE = 40,       // [Y] [o]  TASK[4:0], five pins
@@ -149,13 +153,14 @@ union high_bus_pins {
 		uint32_t FAULT : 1;	// 41
 		uint32_t NMI_BLOCK : 1;	// 42
 		uint32_t A_HI : 3;	// 43-45, A13-A15
+		uint32_t TRACE_E : 1;	// 46
 #else
 		uint32_t FAULT : 1;	// 32
 		uint32_t NMI_BLOCK : 1;	// 33
 		uint32_t A_HI : 3;	// 34-36, A13-A15
-		uint32_t UNUSED : 1;	// 37
-		uint32_t TRACE_C : 1;	// 38
-		uint32_t TRACE_D : 1;	// 39
+		uint32_t TRACE_C : 1;	// 37
+		uint32_t TRACE_D : 1;	// 38
+		uint32_t TRACE_E : 1;	// 39
 		uint32_t TASK : 5;	// 40-44
 		uint32_t TASK0 : 1;	// 45
 		uint32_t POWER : 1;	// 46

@@ -13,6 +13,8 @@ VECTORS	EQU	$FFF0	CPU reset and interrupt vectors
 CHUNK	EQU	$0130
 
 TASK	EQU	DEVICE+$00
+TRACE	EQU	DEVICE+$0B	Bus trace control: non-zero arms a one-shot
+DATFLT	EQU	DEVICE+$0C	DAT fault status; bit 7 is NMIBlock
 
 UARTC	equ	$FFC4
 UARTS	equ	$FFC4
@@ -218,6 +220,20 @@ B@0	LDB	A,S
 	BLT	B@0
 B@1	BRA	B@1
 	RTI
+
+* NMIBlock write-to-effect latency. Arms the one-shot bus trace, then
+* sets and immediately clears NMIBlock. The DAT GAL samples NMIBlock at
+* Q-rising and the trace samples at E-falling, the last sample of the
+* cycle, so the pin change is in time if it appears in the write's own
+* trace row and late if it first appears in a later one. Measures both
+* edges: the set that masks faults, and the clear that re-arms them.
+	ORG	START
+NmiBlk	LDA	#$01
+	STA	TRACE	arm the one-shot trace
+	LDA	#$80
+	STA	DATFLT	set NMIBlock - the write under test
+	CLR	DATFLT	clear it again - the re-arm path
+	SYNC
 
 	ORG	CHUNK
 	INCLUDEBIN	../chunk/dl.raw
@@ -505,6 +521,8 @@ str.TK              fcn       "  TK = "
 	FCC	"TEST_RTI"
 	FCB	' '
 	FCC	"BREAK"
+	FCB	' '
+	FCC	"NMI_BLOCK_LAT"
 	FCB	' '
 	FCC	"DOWNLOAD"
 	FCB	' '

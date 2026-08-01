@@ -115,10 +115,8 @@ mc6809::setup(enum run_state rs)
 #endif
 	// If a one-shot trace is armed for this run, restart its fill cleanly.
 	// An interrupt-triggered config (trace_irq_trigger) persists across restarts.
-	if (trace_enabled) {
-		trace_pos = 0u;
-		trace_full = false;
-	}
+	if (trace_armed)
+		trace_arm();
 }
 
 void

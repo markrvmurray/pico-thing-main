@@ -149,7 +149,98 @@ static volatile uint32_t core1_read_irq_count = 0u;
 static volatile uint8_t core1_last_write_loc = 0u;
 static volatile uint8_t core1_last_read_loc = 0u;
 static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
-static volatile bool trace_e_irq_on = false;	// Core 1: is the E-fall trace IRQ currently enabled?
+
+// Bus trace capture hardware.  Two PIO state machines sample the bus once per
+// E cycle and two DMA channels write straight into MC6809's buffers, so the
+// CPU does no per-cycle work at all.  The low half needs a GPIO-base-0 PIO
+// (it must see E on GPIO 0 and the whole bus) and the high half needs the
+// base-16 one, so they hand off with the RP2350 cross-block IRQ.  PREV/NEXT
+// wrap across the three blocks, so pio0's "prev" is pio2 — which matters,
+// because pio1 is full to the word (bus_write 19 + rti_detect 13 = 32) and
+// pio0 is the only base-0 block with room.
+#define TRACE_LO_PIO pio0
+#define TRACE_HI_PIO pio2
+static uint trace_lo_sm = 0u, trace_hi_sm = 0u;
+static int trace_lo_offset = -1, trace_hi_offset = -1;
+static constexpr uint TRACE_LO_DMA = 2u;
+static constexpr uint TRACE_HI_DMA = 3u;
+// Set when the capture should wait for its trigger pin rather than start now.
+static volatile bool trace_hw_triggered = false;
+// Set when a capture is armed but the guest is not running yet.
+static volatile bool trace_pending_start = false;
+static void trace_hw_start();
+
+// Samples captured so far.  The DMA transfer count is the authority: it counts
+// down from trace_size, so this is exact and free.
+static uint32_t
+trace_hw_count()
+{
+	if (trace_lo_offset < 0)
+		return 0u;
+	const uint32_t left = dma_channel_hw_addr(TRACE_LO_DMA)->transfer_count;
+	return (left > TRACE_SIZE) ? 0u : (TRACE_SIZE - left);
+}
+
+static void
+trace_hw_stop()
+{
+	if (trace_lo_offset < 0)
+		return;
+	dma_channel_abort(TRACE_LO_DMA);
+	dma_channel_abort(TRACE_HI_DMA);
+	pio_sm_set_enabled(TRACE_LO_PIO, trace_lo_sm, false);
+	pio_sm_set_enabled(TRACE_HI_PIO, trace_hi_sm, false);
+}
+
+static void
+trace_hw_arm()
+{
+	if (trace_lo_offset < 0)
+		return;
+	trace_hw_stop();
+	// Drain both FIFOs.  The state machines keep sampling after a completed
+	// DMA stops draining them, so without this the next capture would open
+	// with the tail of the previous one.
+	pio_sm_clear_fifos(TRACE_LO_PIO, trace_lo_sm);
+	pio_sm_clear_fifos(TRACE_HI_PIO, trace_hi_sm);
+	pio_sm_restart(TRACE_LO_PIO, trace_lo_sm);
+	pio_sm_restart(TRACE_HI_PIO, trace_hi_sm);
+	pio_interrupt_clear(TRACE_HI_PIO, 0);
+	// .wrap never revisits the trigger, so the PC has to be put back by hand.
+	if (trace_hw_triggered)
+		bus_capture_lo_program_rearm(TRACE_LO_PIO, trace_lo_sm,
+					     static_cast<uint>(trace_lo_offset));
+	else
+		bus_capture_lo_program_trigger_now(TRACE_LO_PIO, trace_lo_sm,
+						   static_cast<uint>(trace_lo_offset));
+	dma_channel_set_write_addr(TRACE_LO_DMA, MC6809.trace_base(), false);
+	dma_channel_set_write_addr(TRACE_HI_DMA, MC6809.trace_hi_base(), false);
+	dma_channel_set_trans_count(TRACE_LO_DMA, TRACE_SIZE, false);
+	dma_channel_set_trans_count(TRACE_HI_DMA, TRACE_SIZE, false);
+	dma_channel_start(TRACE_LO_DMA);
+	dma_channel_start(TRACE_HI_DMA);
+	// Hold the state machines off until the guest is actually running.  They
+	// free-run once enabled, so arming against a reset-held bus would spend
+	// the whole one-shot on idle cycles before the guest fetched anything —
+	// the same trap the old software capture guarded against with a
+	// run_state test.  trace_hw_start() is called from the reset-to-running
+	// transition in the EQ ISR.
+	if (MC6809.get_run_state() >= RS_RUNNING)
+		trace_hw_start();
+	else
+		trace_pending_start = true;
+}
+
+// Enable both halves.  They go within a few clocks of each other, far inside
+// one E cycle, so they latch onto the same first edge; after that the high
+// half is driven by the low half's IRQ and cannot drift.
+static void
+trace_hw_start()
+{
+	trace_pending_start = false;
+	pio_sm_set_enabled(TRACE_HI_PIO, trace_hi_sm, true);
+	pio_sm_set_enabled(TRACE_LO_PIO, trace_lo_sm, true);
+}
 
 // Set when a DAT fault is latched, cleared when the resulting NMI takes its
 // vector.  Distinguishes a fault NMI from the timer and watchpoint NMIs, which
@@ -190,6 +281,11 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			}
 		} else if (MC6809.run_state == RS_RESET) {
 			MC6809.run_state = RS_RUNNING;
+			// The guest has started fetching.  Release a trace that was
+			// armed while the bus was still held in reset, so its one-shot
+			// is spent on real cycles rather than idle ones.
+			if (trace_pending_start)
+				trace_hw_start();
 		} else if (new_bs != MC6809.bus_state) {
 			MC6809.old_bus_state = MC6809.bus_state;
 			MC6809.bus_state = new_bs;
@@ -259,16 +355,13 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			if (pend & PEND_FIRQ) ASSERT_FIRQ; else DEASSERT_FIRQ;
 			if (pend & PEND_IRQ)  ASSERT_IRQ;  else DEASSERT_IRQ;
 		}
-		// Reconcile the E-falling trace interrupt with the software trace
-		// state.  Core 1 owns the bank0 GPIO IRQ, so console/guest arming only
-		// sets trace_enabled; we enable/disable the actual E-fall interrupt from
-		// this core.  Enabling at Q-rising means this same cycle's E-fall (which
-		// comes later in the cycle) is captured.
-		if (MC6809.trace_is_active() != trace_e_irq_on) {
-			trace_e_irq_on = MC6809.trace_is_active();
-			gpio_set_irq_enabled(GPIO_E, GPIO_IRQ_EDGE_FALL, trace_e_irq_on);
-		}
-	} else if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
+	}
+	// NOT "else if".  A delayed entry can find both Q edges pending, and an
+	// else-if would run only the rising branch — skipping the falling one and
+	// leaving its flag unacknowledged.  That silently drops a trace sample and,
+	// worse, a fault sample.  Handling both in one pass costs nothing when only
+	// one is pending.
+	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
 		// RTI detection is now handled by the rti_detect PIO program
@@ -277,6 +370,12 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
 		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
 		// we do NOT capture them here.
+
+		// The fault sampler needs the high GPIO bank.  The bus trace no longer
+		// reads anything here — two PIO state machines capture it straight into
+		// memory via DMA, so tracing now costs the ISR nothing at all.
+		high_bus_pins high_pins{};
+		high_pins.word = sio_hw->gpio_hi_in;
 
 		// DAT fault: the decode logic drives GPIO_FAULT high when the guest
 		// reads or writes a block of RAM the DAT does not map.  Sampled as a
@@ -292,9 +391,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// describe the same cycle.
 		//
 		// The fault pin, the task pins, A13-A15 and the NMIBlock readback all
-		// share the high input register, so one read covers them.
-		high_bus_pins high_pins{};
-		high_pins.word = sio_hw->gpio_hi_in;
+		// share the high input register, and it was read above for the trace.
 		// First fault wins.  Latching also asserts NMIBlock, which masks the
 		// NMI for every subsequent fault, so a storm cannot overwrite the
 		// record of the one that started it.  The NMI for THIS fault has
@@ -316,12 +413,6 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 				(high_pins.bits.TASK << DAT_FAULT_LOC_TASK_SHIFT)
 				| high_pins.bits.A_HI);
 		}
-	}
-	// --- Bus trace: sample every pin at E-falling, the point where address,
-	// data, R/W and status are all settled.  One word per E cycle. ---
-	if (trace_e_irq_on && (gpio_get_irq_event_mask(GPIO_E) & GPIO_IRQ_EDGE_FALL)) {
-		gpio_acknowledge_irq(GPIO_E, GPIO_IRQ_EDGE_FALL);
-		MC6809.trace_capture(gpio_get_all());
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, false); // scope timing
@@ -1480,6 +1571,74 @@ status_done:
 			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
 			MC6809.stop();
 			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
+		} else if (hexnum == 7) {
+			// NMIBlock write-to-effect latency.  The snippet arms the trace
+			// and then sets and clears NMIBlock; we read back how many E
+			// cycles passed before the pin followed each write.
+			printf("NMIBlock latency test\n");
+			snippet_copy(NMI_BLOCK_LAT);
+			MC6809.start();
+			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
+			MC6809.stop();
+
+			const uint32_t have = MC6809.trace_count();
+			if (have == 0u) {
+				printf("  no cycles captured — was a trace already armed?\n\n");
+				break;
+			}
+			// Resolution warning: the trace samples once per E cycle, at
+			// E-falling, but the guest's write data is not captured until
+			// about that same point — so the pin cannot possibly have moved
+			// by the write cycle's own sample, and one cycle is the floor,
+			// not a failure.  The GAL's deadline is Q-rising of the NEXT
+			// cycle, a quarter cycle after E-fall, which this sampling rate
+			// cannot resolve.  So report the count and say what it does and
+			// does not settle.
+			unsigned found = 0u;
+			unsigned prev_block = 0u;
+			for (uint32_t i = 0; i < have && found < 2u; i++) {
+				bus_pins bp{}; bp.word = MC6809.trace_word(i);
+				high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(i);
+				if (bp.bits.CS || bp.bits.RW ||
+				    bp.bits.A != (SYSTEM_DAT_FAULT & registers::register_mask)) {
+					prev_block = hp.bits.NMI_BLOCK;
+					continue;
+				}
+				uint32_t j = i;
+				while (j < have) {
+					high_bus_pins hn{}; hn.word = MC6809.trace_hi_word(j);
+					if (hn.bits.NMI_BLOCK != prev_block)
+						break;
+					j++;
+				}
+				found++;
+				if (j >= have)
+					printf("  %-5s at cycle %lu: pin never followed within the capture\n",
+					       prev_block ? "clear" : "set",
+					       static_cast<unsigned long>(i));
+				else
+					printf("  %-5s at cycle %lu: pin followed within %lu E cycle%s%s\n",
+					       prev_block ? "clear" : "set",
+					       static_cast<unsigned long>(i),
+					       static_cast<unsigned long>(j - i),
+					       (j - i) == 1u ? "" : "s",
+					       (j - i) <= 1u
+					         ? " (the floor at this sampling rate)"
+					         : " — LATE, at least one cycle beyond the GAL's deadline");
+				prev_block = !prev_block;
+			}
+			if (found < 2u)
+				printf("  only %u of 2 writes to $%04X found in %lu cycles\n",
+				       found, REGISTER_BASE + SYSTEM_DAT_FAULT,
+				       static_cast<unsigned long>(have));
+			printf("  one cycle means the pin moved somewhere between E-fall of\n"
+			       "  the write and E-fall of the next cycle. The GAL's deadline\n"
+			       "  is Q-rise, a quarter cycle into that window, so whether it\n"
+			       "  was met needs a scope on NMIBlock against Q.\n\n");
+			// Consume the one-shot: with the CPU about to be stopped it can
+			// never fill, and an armed trace keeps the E-fall interrupt alive.
+			MC6809.trace_stop();
+			break;
 		} else {
 		irq_chunk_test:
 			// Chunk-based interrupt test (irq 6)
@@ -1681,11 +1840,13 @@ status_done:
 			break;
 		}
 		const uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, have) : have;
-		printf("    #  EQ R/W  A  D  CS  bus-state    B L V  H N F I\n");
+		printf("    #  EQ R/W  A  D  CS  bus-state    B L V  H N F I  TSK Pg  FM\n");
 		for (uint32_t i = 0; i < len; i++) {
 			bus_pins bp{}; bp.word = MC6809.trace_word(i);
+			high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(i);
 			BLA bla{}; bla.byte = static_cast<uint8_t>(bp.bits.BUSY_LIC_AVMA);
-			printf("%5lu  %c%c  %c  %02X %02X  %c   %-11s  %c %c %c  %c %c %c %c\n",
+			printf("%5lu  %c%c  %c  %02X %02X  %c   %-11s  %c %c %c  %c %c %c %c  "
+			       "%2u%c  %u  %c%c\n",
 			       static_cast<unsigned long>(i),
 			       bp.bits.E ? 'E' : '.',
 			       bp.bits.Q ? 'Q' : '.',
@@ -1700,7 +1861,12 @@ status_done:
 			       bp.bits.HALT ? '.' : 'H',	// active-low outputs: letter = asserted
 			       bp.bits.NMI  ? '.' : 'N',
 			       bp.bits.FIRQ ? '.' : 'F',
-			       bp.bits.IRQ  ? '.' : 'I');
+			       bp.bits.IRQ  ? '.' : 'I',
+			       static_cast<unsigned>(hp.bits.TASK),
+			       hp.bits.TASK0 ? '0' : ' ',	// Root: task-zero flag to the DAT
+			       static_cast<unsigned>(hp.bits.A_HI),	// A15-A13, the DAT page
+			       hp.bits.FAULT ? 'F' : '.',
+			       hp.bits.NMI_BLOCK ? 'M' : '.');
 		}
 		printf("%lu of %lu cycles%s\n\n",
 		       static_cast<unsigned long>(len), static_cast<unsigned long>(have),
@@ -2152,8 +2318,15 @@ __no_inline_not_in_flash_func(main_core1)()
 {
 	printf("Core1 process starting\n");
 
-	init_pins_range(GPIO_TRACE_C, 2); // trace pins - isr set
-	gpio_set_dir_out_masked64(0b11LLu << GPIO_TRACE_C);
+	// Trace pins - ISR set.  Named individually rather than as a run: they
+	// are consecutive on version 1 (37-39) but not on version 2, where 37 is
+	// TASK0 and TRACE_E has been pushed up to 46.
+	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D, GPIO_TRACE_E };
+	for (const uint8_t p : trace_pins) {
+		gpio_init(p);
+		gpio_put(p, false);
+		gpio_set_dir(p, GPIO_OUT);
+	}
 
 	fast_serial.reset();
 	aux_serial.reset();
@@ -2718,6 +2891,48 @@ bus_pio_dma_init()
 	rti_pio_sm = pio_claim_unused_sm(rti_pio, true);
 	rti_detect_program_init(rti_pio, rti_pio_sm, pio_rti_offset);
 	printf("Core0 RTI detect pio%u sm%u configured\n", PIO_NUM(rti_pio), rti_pio_sm);
+
+	// SM pair: bus trace capture.  pio0 -> pio2 via "irq prev", which wraps
+	// across the three blocks.  pio1 would be the tidier neighbour but has
+	// no instruction memory left.
+	trace_lo_offset = pio_add_program(TRACE_LO_PIO, &bus_capture_lo_program);
+	trace_hi_offset = pio_add_program(TRACE_HI_PIO, &bus_capture_hi_program);
+	if (trace_lo_offset < 0 || trace_hi_offset < 0) {
+		printf("Core0 insufficient space for bus_capture programs\n");
+		panic("Unable to proceed");
+	}
+	trace_lo_sm = pio_claim_unused_sm(TRACE_LO_PIO, true);
+	trace_hi_sm = pio_claim_unused_sm(TRACE_HI_PIO, true);
+	// Default trigger pin is !NMI; any pin 0-31 will do, since only the low
+	// half ever sees it.  The high half follows via the IRQ handshake.
+	bus_capture_lo_program_init(TRACE_LO_PIO, trace_lo_sm,
+				    static_cast<uint>(trace_lo_offset), GPIO_NMI);
+	bus_capture_hi_program_init(TRACE_HI_PIO, trace_hi_sm,
+				    static_cast<uint>(trace_hi_offset));
+
+	dma_channel_claim(TRACE_LO_DMA);
+	dma_channel_claim(TRACE_HI_DMA);
+	dma_channel_config tlo = dma_channel_get_default_config(TRACE_LO_DMA);
+	channel_config_set_transfer_data_size(&tlo, DMA_SIZE_32);
+	channel_config_set_read_increment(&tlo, false);
+	channel_config_set_write_increment(&tlo, true);
+	channel_config_set_dreq(&tlo, pio_get_dreq(TRACE_LO_PIO, trace_lo_sm, false));
+	dma_channel_configure(TRACE_LO_DMA, &tlo, MC6809.trace_base(),
+			      &TRACE_LO_PIO->rxf[trace_lo_sm], TRACE_SIZE, false);
+	// 16 bits: the high bank is only GPIO 32-47, so a half-word read of the
+	// FIFO takes the whole sample and halves the buffer.
+	dma_channel_config thi = dma_channel_get_default_config(TRACE_HI_DMA);
+	channel_config_set_transfer_data_size(&thi, DMA_SIZE_16);
+	channel_config_set_read_increment(&thi, false);
+	channel_config_set_write_increment(&thi, true);
+	channel_config_set_dreq(&thi, pio_get_dreq(TRACE_HI_PIO, trace_hi_sm, false));
+	dma_channel_configure(TRACE_HI_DMA, &thi, MC6809.trace_hi_base(),
+			      &TRACE_HI_PIO->rxf[trace_hi_sm], TRACE_SIZE, false);
+
+	MC6809.set_trace_callbacks(trace_hw_arm, trace_hw_stop, trace_hw_count);
+	printf("Core0 bus trace pio%u sm%u + pio%u sm%u, DMA %u/%u\n",
+	       PIO_NUM(TRACE_LO_PIO), trace_lo_sm, PIO_NUM(TRACE_HI_PIO), trace_hi_sm,
+	       TRACE_LO_DMA, TRACE_HI_DMA);
 }
 
 #define MEASURE_FREQS
@@ -2756,8 +2971,6 @@ pio_shutdown()
 
 	// GPIO Q edge IRQ (bus observer) + E-fall trace IRQ
 	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-	gpio_set_irq_enabled(GPIO_E, GPIO_IRQ_EDGE_FALL, false);
-	trace_e_irq_on = false;
 	irq_set_enabled(pio_clock.irq, false);
 	gpio_remove_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
 
@@ -2804,10 +3017,11 @@ pio_shutdown()
 	mc6809_clock_program_deinit(pio_clock.pio, pio_clock.sm);
 	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock_offset);
 
-	// --- Trace pins (GPIO 36-39) to hi-Z ---
-	for (uint i = 0; i < 2; i++) {
-		gpio_put(GPIO_TRACE_C + i, false);
-		gpio_set_dir(GPIO_TRACE_C + i, GPIO_IN);
+	// --- Trace pins to hi-Z (not a consecutive run on version 2) ---
+	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D, GPIO_TRACE_E };
+	for (const uint8_t p : trace_pins) {
+		gpio_put(p, false);
+		gpio_set_dir(p, GPIO_IN);
 	}
 
 	// --- Fault NMI mask to hi-Z, so it does not drive unpowered logic ---

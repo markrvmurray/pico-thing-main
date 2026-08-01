@@ -308,3 +308,88 @@ task_output_program_deinit(PIO pio, uint sm)
 }
 
 %}
+
+; ---------------------------------------------------------------------------
+; Bus capture (low half) — one 32-bit sample of GPIO 0-31 per E cycle.
+;
+; Taken by the PIO a couple of clocks after E falls, i.e. within ~6ns.  That
+; is the one point where the whole cycle is coherent: the 6809 holds address,
+; R/!W, BA and BS until ~20ns past E-fall, while write data and Pico-served
+; read data are only valid approaching it.  No ISR can hit that window —
+; interrupt entry alone is 40-50ns — which is why this moved into the PIO.
+;
+; The first instruction is the trigger: it spins while the JMP_PIN input is
+; high, so capture begins when that pin goes low (the interrupt lines, !CS and
+; !HALT are all active low).  Arming in software instead just execs a jump
+; past it.  .wrap_target sits after the trigger, so it is consumed once and
+; capture then free-runs until the DMA transfer count runs out.
+;
+; Each sample also pokes IRQ 0 in the PREVIOUS PIO block, where the high half
+; is waiting.  PREV/NEXT wrap across the three blocks, so from pio0 that is
+; pio2 — which is what lets the low half live on pio0, the only base-0 block
+; with instruction memory to spare.  It also keeps the two halves in lockstep:
+; every high sample is caused by a low one, so the arrays cannot drift apart.
+.program bus_capture_lo
+trigger:
+	jmp	pin trigger		; spin while the trigger pin is high
+.wrap_target
+	wait	1 gpio GPIO_E		; resynchronise
+	wait	0 gpio GPIO_E		; E falling
+	in	pins 32			; autopush -> RX FIFO -> DMA
+	irq	prev set 0		; wake the high half (wraps pio0 -> pio2)
+.wrap
+
+; Bus capture (high half) — GPIO 32-47, 16 bits per E cycle.
+;
+; This runs on a PIO whose GPIO base is 16, so it can see the task pins, the
+; DAT fault signals and A13-A15 — but NOT E, which is GPIO 0 and outside that
+; window.  Hence the IRQ handshake rather than a second edge wait.  The extra
+; couple of clocks of lag do not matter: everything in the high word is stable
+; for the whole cycle, unlike the data bus.
+.program bus_capture_hi
+.wrap_target
+	wait	1 irq 0			; set by the low half; satisfied wait clears it
+	in	pins 16			; autopush -> RX FIFO -> DMA
+.wrap
+
+% c-sdk {
+
+// Low half.  Runs on a GPIO-base-0 PIO so it can see E and the whole bus.
+// trigger_pin is polled by the JMP_PIN input; capture starts when it goes low.
+static inline void
+bus_capture_lo_program_init(PIO pio, uint sm, uint offset, uint trigger_pin)
+{
+	pio_sm_config c = bus_capture_lo_program_get_default_config(offset);
+	sm_config_set_in_pins(&c, 0);			// sample GPIO 0-31
+	sm_config_set_in_shift(&c, false, true, 32);	// shift left, autopush at 32
+	sm_config_set_jmp_pin(&c, trigger_pin);
+	sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);	// 8 deep, more slack for DMA
+	pio_sm_init(pio, sm, offset, &c);
+}
+
+// High half.  Runs on the GPIO-base-16 PIO, driven by the low half's IRQ.
+static inline void
+bus_capture_hi_program_init(PIO pio, uint sm, uint offset)
+{
+	pio_sm_config c = bus_capture_hi_program_get_default_config(offset);
+	sm_config_set_in_pins(&c, 32);			// sample GPIO 32-47
+	sm_config_set_in_shift(&c, false, true, 16);	// shift left, autopush at 16
+	sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+	pio_sm_init(pio, sm, offset, &c);
+}
+
+// Park an armed SM back on its trigger instruction.
+static inline void
+bus_capture_lo_program_rearm(PIO pio, uint sm, uint offset)
+{
+	pio_sm_exec(pio, sm, pio_encode_jmp(offset));
+}
+
+// Skip the trigger and start capturing immediately (software arming).
+static inline void
+bus_capture_lo_program_trigger_now(PIO pio, uint sm, uint offset)
+{
+	pio_sm_exec(pio, sm, pio_encode_jmp(offset + 1u));
+}
+
+%}

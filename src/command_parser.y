@@ -585,13 +585,13 @@ task_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * irq <testnum>   (0-6)
+ * irq <testnum>   (0-7)
  * ----------------------------------------------------------------------- */
 irq_cmd:
 	TOK_IRQ TOK_NUMBER {
 		uint32_t v = parse_hex($2);
-		if (v == UINT32_MAX || v > 6u) {
-			printf("Invalid IRQ test ID '%s' (valid: 0-6)\n", $2);
+		if (v == UINT32_MAX || v > 7u) {
+			printf("Invalid IRQ test ID '%s' (valid: 0-7)\n", $2);
 			YYERROR;
 		}
 		result->tag         = CMD_IRQ;
