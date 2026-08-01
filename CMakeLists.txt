@@ -166,10 +166,24 @@ target_sources(pico-thing
 		${BISON_CmdParser_OUTPUTS}
 )
 
+# Board revision selects the GPIO map.  Both revisions carry the same signals:
+# version 1 puts TASK[4:0], TASK0 and the power enable on GPIO 40-46 with the
+# DAT fault signals on 32-36, version 2 puts the task pins on 32-37 and the
+# fault signals on 41-45.  Flashing the wrong one drives outputs into outputs,
+# so the default is the older board.
+set(PICO_THING_BOARD_VERSION 1 CACHE STRING "Pico-Thing board revision (1 or 2)")
+set_property(CACHE PICO_THING_BOARD_VERSION PROPERTY STRINGS 1 2)
+if(NOT PICO_THING_BOARD_VERSION MATCHES "^[12]$")
+	message(FATAL_ERROR
+		"PICO_THING_BOARD_VERSION must be 1 or 2, not '${PICO_THING_BOARD_VERSION}'")
+endif()
+message(STATUS "Pico-Thing board version ${PICO_THING_BOARD_VERSION}")
+
 # Core 1 stack is 0x800 (2 KiB) by default — too small for three nested
 # ISR levels (DMA prio-0 → GPIO prio-1 → thread) with FPU lazy stacking.
 target_compile_definitions(pico-thing PRIVATE
 	PICO_CORE1_STACK_SIZE=0x1000
+	PICO_THING_BOARD_VERSION=${PICO_THING_BOARD_VERSION}
 )
 
 target_link_libraries(pico-thing

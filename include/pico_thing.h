@@ -15,6 +15,19 @@ extern volatile bool verbose;
 
 #include "hardware/pio.h"
 
+// Board revision. Both revisions carry the same signals, on different pins:
+// version 1 puts the task pins and the power enable at the bottom of the GPIO
+// range and the DAT fault signals above them, version 2 the other way round.
+// Set from CMake with -DPICO_THING_BOARD_VERSION=2; anything that includes
+// this header without the build system (the unit tests) gets version 1.
+#ifndef PICO_THING_BOARD_VERSION
+#define PICO_THING_BOARD_VERSION 1
+#endif
+
+#if PICO_THING_BOARD_VERSION != 1 && PICO_THING_BOARD_VERSION != 2
+#error "PICO_THING_BOARD_VERSION must be 1 or 2"
+#endif
+
 // === Pin map ===
 enum {
 	// Fast/timing-critical - GPIO Bank0, done by PIO
@@ -50,9 +63,10 @@ enum {
 	GPIO_UART_TX = 30, // [Y] [o]  RP2xxx UART Tx
 	GPIO_UART_RX = 31, // [Y] [i]  RP2xxx UART Rx
 
+#if PICO_THING_BOARD_VERSION >= 2
 	// Slow - guest instruction-level timing
-	// GPIO_TASK_BASE = 32,
-	// GPIO_TASK_0 = 37,
+	GPIO_TASK_BASE = 32,       // [Y] [o]  TASK[4:0], five pins
+	GPIO_TASK_0 = 37,          // [Y] [o]  TASK0, set when the task number is zero
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
 	GPIO_TRACE_C = 38,         // [Y] [o]  Temporary debugging output pins for the scope
@@ -65,6 +79,27 @@ enum {
 	GPIO_FAULT = 41,           // [ ] [i]  Attempt to read or write unassigned memory
 	GPIO_NMI_BLOCK = 42,       // [ ] [o]  Prevent DAT Fault NMI
 	GPIO_A_HI_BASE = 43,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
+#else
+	// Version 1: the task pins and the power enable sit at the bottom of the
+	// range, so the DAT fault signals go in the free run above them.
+
+	// Medium - per-instruction timing
+	GPIO_FAULT = 32,           // [ ] [i]  Attempt to read or write unassigned memory
+	GPIO_NMI_BLOCK = 33,       // [ ] [o]  Prevent DAT Fault NMI
+	GPIO_A_HI_BASE = 34,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
+	// GPIO 37 is free
+
+	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
+	GPIO_TRACE_C = 38,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_D = 39,         // [Y] [o]  Temporary debugging output pins for the scope
+
+	// Slow - guest instruction-level timing
+	GPIO_TASK_BASE = 40,       // [Y] [o]  TASK[4:0], five pins
+	GPIO_TASK_0 = 45,          // [Y] [o]  TASK0, set when the task number is zero
+
+	// Slow - set at a leisurely pace at human-user speeds
+	GPIO_POWER = 46,           // [Y] [o]  External power enable
+#endif
 
 	// Used by the PSRAM !CS on the PGA2350. Bummer.
 	// GPIO_POWER_ADC = 47, // [Y] [i]  ADC connected to the 5v line, divided by 2
@@ -105,6 +140,7 @@ union bus_pins {
 // GPIO 32 upwards, as read from the SIO high input register.
 union high_bus_pins {
 	struct {
+#if PICO_THING_BOARD_VERSION >= 2
 		uint32_t TASK : 5;	// 32-36
 		uint32_t TASK0 : 1;	// 37
 		uint32_t TRACE_C : 1;	// 38
@@ -113,6 +149,17 @@ union high_bus_pins {
 		uint32_t FAULT : 1;	// 41
 		uint32_t NMI_BLOCK : 1;	// 42
 		uint32_t A_HI : 3;	// 43-45, A13-A15
+#else
+		uint32_t FAULT : 1;	// 32
+		uint32_t NMI_BLOCK : 1;	// 33
+		uint32_t A_HI : 3;	// 34-36, A13-A15
+		uint32_t UNUSED : 1;	// 37
+		uint32_t TRACE_C : 1;	// 38
+		uint32_t TRACE_D : 1;	// 39
+		uint32_t TASK : 5;	// 40-44
+		uint32_t TASK0 : 1;	// 45
+		uint32_t POWER : 1;	// 46
+#endif
 	} bits;
 	uint32_t word;
 };

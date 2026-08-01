@@ -9,6 +9,11 @@
 % c-sdk {
 
 #include "mc6809.h"
+// GPIO_TASK_BASE moves with the board revision, and pioasm has no
+// conditionals, so it comes from the pin map rather than a .define here.
+// The task program sets its pin base at runtime, so nothing in the
+// instruction stream depends on it.
+#include "pico_thing.h"
 
 %}
 
@@ -21,8 +26,6 @@
 .define	public	GPIO_CS		17	; !CS_PICO
 .define	public	GPIO_TRACE_RD	27	; Debugging
 .define	public	GPIO_TRACE_WR	28	; Debugging
-
-.define public	GPIO_TASK_BASE	32	; TASK[4:0] + TASK0
 
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.
@@ -262,15 +265,16 @@ rti_detect_program_deinit(PIO pio, uint sm)
 
 %}
 
-; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and
-; outputs it to GPIO 40-45 (TASK[4:0] + TASK0).
+; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and outputs it to
+; the six consecutive pins at GPIO_TASK_BASE (TASK[4:0] + TASK0), which is
+; 40-45 on a version 1 board and 32-37 on version 2.
 ; Runs at full system clock (320 MHz, no divider).
 ; Bit layout: [5]=TASK0 (active-high when task==0), [4:0]=task number.
 .program	task_output
 
 .wrap_target
 	pull	block		; Stall until new task value arrives
-	out	pins 6		; Output bits[5:0] to GPIO 40-45
+	out	pins 6		; Output bits[5:0] to the task pins
 .wrap
 
 % c-sdk {
