@@ -16,7 +16,9 @@ CMOC_LIBDIR := $(patsubst %/bin/cmoc,%/share/cmoc/lib,$(shell which cmoc))
 CMOC_LIBS   := -lcmoc-crt-void -lcmoc-std-void \
                $(CMOC_LIBDIR)/float-ctor.mc6839_o -lcmoc-float-mc6839
 # Common cmoc compilation flags.
-CMOC_FLAGS  := --void-target --org=0x0130 --initial-s=0xf000 --mc6839
+# --initial-s matches STACK in syslib.inc: the bottom of the DAT-mapped range,
+# not the fixed window, which has no RAM behind it until the kluge board.
+CMOC_FLAGS  := --void-target --org=0x0130 --initial-s=0xe000 --mc6839
 
 # Common .inc dependencies for assembly sources that USE them.
 INCS := ascii.inc uart.inc syslib.inc

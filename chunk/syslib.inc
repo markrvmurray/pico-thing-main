@@ -37,4 +37,12 @@ RESET	EXTERN
 INITIRQ	EXTERN
 INITFIRQ	EXTERN
 
-STACK	EQU	$F000
+* Stack starts at the bottom of the DAT-mapped range, so the first push lands
+* at $DFFF and it climbs from there.  With the DAT initialised to the identity
+* list, blocks 0-6 are pages 0-6, so $0000-$DFFF is 56K of flat RAM and the
+* stack is nowhere near even the largest chunk.
+*
+* It was at $F000, which is inside the fixed window ($E000-$FDFF).  That window
+* has no chip select until the kluge board takes the RAM decode over from the
+* 74HCT139, so every push went nowhere and every pull returned $FF.
+STACK	EQU	$E000
