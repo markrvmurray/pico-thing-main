@@ -83,6 +83,7 @@ static int
 match_command_keyword(const char *text)
 {
 	static const struct { const char *name; const char *alias; int tok; } kw[] = {
+		{ "help",    "h",  TOK_HELP    },
 		{ "power",   "pw", TOK_POWER   },
 		{ "verbose", "vb", TOK_VERBOSE },
 		{ "examine", "ex", TOK_EXAMINE },
@@ -136,7 +137,7 @@ match_command_keyword(const char *text)
 [Rr][Ee][Ss][Tt][Aa][Rr][Tt]        { return TOK_RESTART; }
 [Rr][Ee][Tt][Uu][Rr][Nn]            { return TOK_RETURN; }
 [Ii][Dd][Ee]                        { return TOK_IDE; }
-[Dd][Rr][Ii][Vv][Ee][Ww][Ii][Rr][Ee] { return TOK_DRIVEWIRE; }
+[Dd][Rr][Ii][Vv][Ee][Ww][Ii][Rr][Ee]|[Dd][Ww] { return TOK_DRIVEWIRE; }
 [Oo][Nn]                            { return TOK_ON; }
 [Oo][Ff][Ff]                        { return TOK_OFF; }
 

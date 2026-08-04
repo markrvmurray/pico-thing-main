@@ -21,6 +21,7 @@ typedef enum cmd_tag {
 	CMD_POWER_ON,
 	CMD_POWER_OFF,
 	CMD_VERBOSE,
+	CMD_HELP,
 	CMD_STATUS,
 	CMD_RESET,
 

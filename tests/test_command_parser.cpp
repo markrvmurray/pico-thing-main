@@ -52,6 +52,16 @@ TEST_CASE("Simple no-argument commands", "[parser]")
 		REQUIRE(parse("verbose", &cmd));
 		CHECK(cmd.tag == CMD_VERBOSE);
 	}
+	SECTION("help")
+	{
+		REQUIRE(parse("help", &cmd));
+		CHECK(cmd.tag == CMD_HELP);
+	}
+	SECTION("help abbreviation")
+	{
+		REQUIRE(parse("h", &cmd));
+		CHECK(cmd.tag == CMD_HELP);
+	}
 	SECTION("status")
 	{
 		REQUIRE(parse("status", &cmd));
@@ -1043,6 +1053,32 @@ TEST_CASE("Unknown or empty input produces syntax error", "[parser][error]")
 	{
 		CHECK_FALSE(parse("foobar", &cmd));
 		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+	SECTION("nitros9 defaults to IDE")
+	{
+		REQUIRE(parse("nitros9", &cmd));
+		CHECK(cmd.tag == CMD_NITROS9);
+		CHECK(cmd.nitros9.boot_device == 0);
+	}
+	SECTION("nitros9 ide")
+	{
+		REQUIRE(parse("nitros9 ide", &cmd));
+		CHECK(cmd.nitros9.boot_device == 0);
+	}
+	SECTION("nitros9 drivewire")
+	{
+		REQUIRE(parse("nitros9 drivewire", &cmd));
+		CHECK(cmd.nitros9.boot_device == 1);
+	}
+	SECTION("nitros9 dw is a synonym for drivewire")
+	{
+		REQUIRE(parse("nitros9 dw", &cmd));
+		CHECK(cmd.nitros9.boot_device == 1);
+	}
+	SECTION("ni dw uses both abbreviations")
+	{
+		REQUIRE(parse("ni DW", &cmd));
+		CHECK(cmd.nitros9.boot_device == 1);
 	}
 	SECTION("empty input")
 	{

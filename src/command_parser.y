@@ -121,6 +121,7 @@ static int _t_count;
  * ----------------------------------------------------------------------- */
 
 /* Command keywords */
+%token TOK_HELP
 %token TOK_POWER
 %token TOK_VERBOSE
 %token TOK_EXAMINE
@@ -181,7 +182,8 @@ start:
   ;
 
 command:
-	  power_cmd
+	  help_cmd
+	| power_cmd
 	| verbose_cmd
 	| status_cmd
 	| reset_cmd
@@ -209,6 +211,12 @@ command:
 /* -----------------------------------------------------------------------
  * Simple no-argument commands
  * ----------------------------------------------------------------------- */
+help_cmd:
+	  TOK_HELP {
+		result->tag = CMD_HELP;
+	}
+	;
+
 power_cmd:
 	TOK_POWER          { result->tag = CMD_POWER; }
 	| TOK_POWER TOK_ON  { result->tag = CMD_POWER_ON; }
@@ -749,7 +757,7 @@ srecord_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * nitros9 [ ide | drivewire ]
+ * nitros9 [ ide | drivewire (dw) ]
  * ----------------------------------------------------------------------- */
 nitros9_cmd:
 	  TOK_NITROS9 {

@@ -1175,6 +1175,52 @@ process_command(char *buf)
 		printf("Verbose mode %s\n", verbose ? "on" : "off");
 		break;
 
+	case CMD_HELP:
+		// Keep this in step with the grammar in command_parser.y and the
+		// keyword table in command_lexer.l.  Every command has a two-letter
+		// alias except "go"; keywords and hex are case-insensitive.
+		printf(
+		"\nAll numbers are hex unless stated.  Two-letter aliases in brackets.\n"
+		"\n--- CPU ---\n"
+		"  run [n] [!]        (ru)  run snippet n; ! leaves the CPU running\n"
+		"  go [addr]                start the CPU, optionally at addr\n"
+		"  stop [halt|restart](sp)  stop, or halt, or stop-and-restart\n"
+		"  reset              (rs)  pulse !RESET\n"
+		"  freq <MHz>         (fq)  set the E clock, %.1f to %.1f\n"
+		"  task [n]           (ta)  show or set the task register\n"
+		"  power [on|off]     (pw)  external power enable\n"
+		"\n--- Memory ---\n"
+		"  examine <s> <e>    (ex)  dump guest memory from s to e\n"
+		"  examine dat        (ex)  dump the DAT RAM at $FE00\n"
+		"  modify <a> <b>...  (mo)  write bytes b... from address a\n"
+		"  fill <s> <e> [v]   (fi)  fill s..e with v (default 00)\n"
+		"  fill all [v]       (fi)  fill $0000-$FDFF\n"
+		"  vector [n]         (vc)  show or set the CPU vectors\n"
+		"  snippet [n]        (sn)  list snippets, or copy n to $FFE0\n"
+		"\n--- Debug ---\n"
+		"  trace on|off       (tr)  arm or disarm the %u-cycle one-shot\n"
+		"  trace [len]        (tr)  dump the capture, len rows (hex)\n"
+		"  trace <vector>     (tr)  arm on swi|swi2|swi3|nmi|firq|irq\n"
+		"  break [addr|r]     (br)  breakpoint; r resumes\n"
+		"  irq <0-7>          (ir)  interrupt tests; 7 is NMIBlock latency\n"
+		"  loop <type> <addr> (lo)  hammer addr for scope work.  The type is\n"
+		"                           CASE-SENSITIVE: lower case is a byte access,\n"
+		"                           upper case a word:\n"
+		"                             r   LDA (read byte)    R   LDD (read word)\n"
+		"                             w   STA (write byte)   W   STD (write word)\n"
+		"                             rw  NEG (read-modify-write; RW also works)\n"
+		"  status [period]    (st)  system status, repeating every period ms\n"
+		"  verbose            (vb)  toggle verbose output\n"
+		"\n--- Host ---\n"
+		"  time [y m d h m s] (ti)  show or set the clock\n"
+		"  usb [args]         (ub)  USB console control\n"
+		"  nitros9 [ide|drivewire]  (ni)  boot NitrOS-9; drivewire is also dw\n"
+		"  help               (h)   this text\n"
+		"\nAn S-record pasted at the prompt is loaded directly.\n\n",
+		static_cast<double>(GUEST_CLK_MIN), static_cast<double>(GUEST_CLK_MAX),
+		TRACE_SIZE);
+		break;
+
 	case CMD_STATUS: {
 		status_snapshot_t snap;
 		status_gather(&snap);
