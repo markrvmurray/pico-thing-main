@@ -113,8 +113,11 @@ private:
 #ifdef DEBUG
 	volatile uint32_t _count_lic;
 	volatile uint32_t _count_rti;
-	volatile uint32_t _count_irq_ack[NUM_INTERRUPTS];
 #endif
+	// Interrupt acknowledge (vector fetch) counts.  Not DEBUG-only: the
+	// interrupt tests hold each request asserted until its count moves, so
+	// this has to be maintained in every build.
+	volatile uint32_t _count_irq_ack[NUM_INTERRUPTS];
 	// Bus trace.  Filled by DMA from two PIO state machines, not by the CPU —
 	// see the bus_capture programs.  This class owns the buffers and the
 	// trigger mask; the PIO and DMA plumbing lives in pico_thing.cpp and is
@@ -187,11 +190,11 @@ public:
 	void clear_rti_count() { _count_rti = 0u; }
 	[[nodiscard]] uint32_t get_rti_count() const { return _count_rti; }
 	void count_rti() { _count_rti++; }
+#endif
 	void clear_irq_ack_count() { for (auto &c : _count_irq_ack) c = 0u; }
 	[[nodiscard]] uint32_t get_irq_ack_count(interrupt i) const { return _count_irq_ack[i]; }
 	[[nodiscard]] uint32_t get_irq_ack_total() const { uint32_t t = 0; for (int i = 0; i < NUM_INTERRUPTS; i++) if (i != INTERRUPT_RESET) t += _count_irq_ack[i]; return t; }
 	void count_irq_ack(interrupt i) { _count_irq_ack[i]++; }
-#endif
 	void init();
 	void deinit();
 	void set_setup_callback(setup_callback_t cb) { setup_callback = cb; }

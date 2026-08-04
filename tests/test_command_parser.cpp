@@ -735,9 +735,14 @@ TEST_CASE("irq command", "[parser][irq]")
 		REQUIRE(parse("irq 6", &cmd));
 		CHECK(cmd.irq.testnum == 6);
 	}
-	SECTION("irq 7 (out of range) is rejected")
+	SECTION("irq 7 is the NMIBlock latency test")
 	{
-		CHECK_FALSE(parse("irq 7", &cmd));
+		REQUIRE(parse("irq 7", &cmd));
+		CHECK(cmd.irq.testnum == 7);
+	}
+	SECTION("irq 8 (out of range) is rejected")
+	{
+		CHECK_FALSE(parse("irq 8", &cmd));
 		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
 	}
 }

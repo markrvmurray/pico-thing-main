@@ -43,8 +43,8 @@ mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 #ifdef DEBUG
 	_count_lic = 0u;
 	_count_rti = 0u;
-	for (auto &c : _count_irq_ack) c = 0u;
 #endif
+	for (auto &c : _count_irq_ack) c = 0u;
 }
 
 // Done once at start of run
@@ -111,8 +111,8 @@ mc6809::setup(enum run_state rs)
 #ifdef DEBUG
 	_count_lic = 0u;
 	_count_rti = 0u;
-	for (auto &c : _count_irq_ack) c = 0u;
 #endif
+	for (auto &c : _count_irq_ack) c = 0u;
 	// If a one-shot trace is armed for this run, restart its fill cleanly.
 	// An interrupt-triggered config (trace_irq_trigger) persists across restarts.
 	if (trace_armed)

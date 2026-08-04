@@ -121,6 +121,12 @@ task_pins_update(uint8_t task)
 // The Pico sets the NMI vector to the BREAK snippet before arming.
 static volatile bool watchpoint_armed = false;
 static uint16_t watchpoint_saved_nmi_vector = 0u;
+// Set by the write ISR on a watchpoint hit, consumed by the Q-rising EQ handler.
+// The ISR must not touch GPIO_NMI itself: the EQ handler drives that pin from
+// pending_interrupts on every Q-rising, so a direct ASSERT_NMI is released one
+// cycle later — long before the 6809 samples it, and the interrupt is lost.
+// A separate flag also avoids racing the read-modify-write on pending_interrupts.
+static volatile bool watchpoint_nmi_pending = false;
 
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
@@ -242,6 +248,14 @@ trace_hw_start()
 	pio_sm_set_enabled(TRACE_LO_PIO, trace_lo_sm, true);
 }
 
+// Set to zero ONLY for bring-up, and ONLY while !NMI is physically
+// disconnected: it suspends the automatic NMIBlock assertion so the sampler
+// neither raises the mask nor gates on it, which makes a fault repeatable on a
+// scope.  With !NMI wired, a single bad pointer would then NMI-storm the guest
+// with nothing to stop it, and SYSTEM_DAT_FAULT would hold the latest fault
+// rather than the first.
+#define DAT_FAULT_AUTO_BLOCK 1
+
 // Set when a DAT fault is latched, cleared when the resulting NMI takes its
 // vector.  Distinguishes a fault NMI from the timer and watchpoint NMIs, which
 // must not force a task switch.
@@ -314,10 +328,10 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 					reg[SYSTEM_TASK] = supervisor;
 					task_pins_update(supervisor);
 				}
-#ifdef DEBUG
+				// Not DEBUG-only: the interrupt tests deassert on this
+				// count, so it has to be maintained in every build.
 				if (eirq <= INTERRUPT_RESET)
 					MC6809.count_irq_ack(eirq);
-#endif
 				MC6809.run_state = RS_IN_IRQ;
 				break;
 			}
@@ -347,9 +361,10 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// windows short.
 		{
 			const uint8_t pend = pending_interrupts;
-			if (pend & PEND_NMI) {
+			if ((pend & PEND_NMI) || watchpoint_nmi_pending) {
 				ASSERT_NMI;
 				pending_interrupts = pend & ~PEND_NMI;
+				watchpoint_nmi_pending = false;
 			} else
 				DEASSERT_NMI;
 			if (pend & PEND_FIRQ) ASSERT_FIRQ; else DEASSERT_FIRQ;
@@ -397,15 +412,21 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// record of the one that started it.  The NMI for THIS fault has
 		// already been captured by the GAL at Q-rising, so it still reaches
 		// the guest.  The handler re-arms by writing zero to SYSTEM_DAT_FAULT.
-		if (high_pins.bits.FAULT && !high_pins.bits.NMI_BLOCK) {
-			gpio_put(GPIO_NMI_BLOCK, true);
+		//
+		// DAT_FAULT_AUTO_BLOCK == 0 suspends all of that for bring-up: see
+		// the note by the definition.
+		if (high_pins.bits.FAULT
+		    && (!DAT_FAULT_AUTO_BLOCK || !high_pins.bits.NMI_BLOCK)) {
+			if (DAT_FAULT_AUTO_BLOCK)
+				gpio_put(GPIO_NMI_BLOCK, true);
 			// Tell the BUS_IRQ case that the NMI now on its way is a fault,
 			// so it can drop the guest into task 0 for the handler.
 			dat_fault_nmi_pending = true;
 			// Nothing else writes bits 2-6, and NMIBlock was clear on the way
 			// in, so the whole byte can be stored rather than merged.
 			reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(
-				DAT_FAULT_FAULT | DAT_FAULT_NMI_BLOCK
+				DAT_FAULT_FAULT
+				| (DAT_FAULT_AUTO_BLOCK ? DAT_FAULT_NMI_BLOCK : 0u)
 				| (gpio_get(GPIO_RW) ? DAT_FAULT_RW : 0u));
 			// The task pins are read back rather than taken from MC6809.task,
 			// so this is what the DAT hardware itself saw.
@@ -590,7 +611,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 		// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
 		// and the vectors it guards.
 		else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET) {
-			ASSERT_NMI;
+			watchpoint_nmi_pending = true;
 		}
 		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
 			reg[wloc] = wval;
@@ -1653,8 +1674,8 @@ status_done:
 			reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
 #ifdef DEBUG
 			MC6809.clear_rti_count();
-			MC6809.clear_irq_ack_count();
 #endif
+			MC6809.clear_irq_ack_count();
 			MC6809.start();
 
 			// Wait for READY signal (chunk has installed vectors)
@@ -1679,22 +1700,41 @@ status_done:
 				break;
 			}
 
-			// Deliver hardware interrupts — assert briefly, deassert,
-			// then delay to let the 6809 process the ISR and RTI.
-			console_set_interrupt(INTERRUPT_NMI);
-			sleep_us(5u);
-			console_set_interrupt(INTERRUPT_NONE);
-			sleep_ms(2u);
-
-			console_set_interrupt(INTERRUPT_FIRQ);
-			sleep_us(5u);
-			console_set_interrupt(INTERRUPT_NONE);
-			sleep_ms(2u);
-
-			console_set_interrupt(INTERRUPT_IRQ);
-			sleep_us(5u);
-			console_set_interrupt(INTERRUPT_NONE);
-			sleep_ms(2u);
+			// Deliver hardware interrupts.  Hold each line until the 6809
+			// fetches the matching vector, then release it, the way a real
+			// device holds its request until acknowledged.
+			//
+			// A fixed assertion window races.  Five microseconds is about
+			// five bus cycles at 1 MHz, and in that time the request has to
+			// reach Core 1's poll of console_has_interrupt(), become a
+			// pending bit, be driven onto the pin at the next Q-rising and
+			// then survive to the processor's sampling point.  A short pulse
+			// can expire unseen, which showed up as FIRQ or IRQ
+			// intermittently reporting 0x00 while the rest of the run passed.
+			//
+			// Releasing at the vector fetch rather than after the handler
+			// cannot cause a second entry: the 6809 masks I on IRQ entry and
+			// both F and I on FIRQ entry, so nothing can be taken again until
+			// the RTI that follows the release.
+			static const struct { interrupt intr; const char *name; } deliver[] = {
+				{INTERRUPT_NMI,  "NMI"},
+				{INTERRUPT_FIRQ, "FIRQ"},
+				{INTERRUPT_IRQ,  "IRQ"},
+			};
+			for (const auto &d : deliver) {
+				const uint32_t acked = MC6809.get_irq_ack_count(d.intr);
+				console_set_interrupt(d.intr);
+				uint32_t waited = 0u;
+				while (MC6809.get_irq_ack_count(d.intr) == acked) {
+					sleep_us(1);
+					if (++waited > 100000u) {
+						printf("  %s: timeout waiting for vector fetch\n", d.name);
+						break;
+					}
+				}
+				console_set_interrupt(INTERRUPT_NONE);
+				sleep_ms(2u);	// let the handler run to its RTI
+			}
 
 			MC6809.stop();
 
@@ -3039,6 +3079,7 @@ set_power()
 		fast_serial.reset();
 		aux_serial.reset();
 		watchpoint_armed = false;
+		watchpoint_nmi_pending = false;
 	});
 	MC6809.set_task_pin_callback(task_pins_update);
 	printf("Core0 guest powered on and initialised\n");
