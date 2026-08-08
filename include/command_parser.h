@@ -148,6 +148,7 @@ typedef struct parsed_cmd {
 
 		/* CMD_TRACE_LEN / CMD_TRACE_IRQ */
 		struct {
+			uint32_t start;		/* CMD_TRACE_LEN: first row to dump */
 			uint32_t length;	/* CMD_TRACE_LEN: dump count */
 			uint8_t  intr;		/* CMD_TRACE_IRQ: enum interrupt value */
 		} trace;

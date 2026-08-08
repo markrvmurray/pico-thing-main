@@ -612,7 +612,8 @@ irq_cmd:
  * ----------------------------------------------------------------------- */
 trace_cmd:
 	  TOK_TRACE {
-		result->tag = CMD_TRACE;
+		result->tag         = CMD_TRACE;
+		result->trace.start = 0u;
 	}
 	| TOK_TRACE TOK_NUMBER {
 		uint32_t v = parse_hex($2);
@@ -621,6 +622,22 @@ trace_cmd:
 			YYERROR;
 		}
 		result->tag          = CMD_TRACE_LEN;
+		result->trace.start  = 0u;
+		result->trace.length = v;
+	}
+	| TOK_TRACE TOK_NUMBER TOK_NUMBER {
+		uint32_t s = parse_hex($2);
+		uint32_t v = parse_hex($3);
+		if (s == UINT32_MAX) {
+			printf("Invalid trace start row '%s'\n", $2);
+			YYERROR;
+		}
+		if (v == UINT32_MAX) {
+			printf("Invalid trace length '%s'\n", $3);
+			YYERROR;
+		}
+		result->tag          = CMD_TRACE_LEN;
+		result->trace.start  = s;
 		result->trace.length = v;
 	}
 	| TOK_TRACE TOK_ON {

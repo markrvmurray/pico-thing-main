@@ -1080,6 +1080,26 @@ TEST_CASE("Unknown or empty input produces syntax error", "[parser][error]")
 		REQUIRE(parse("ni DW", &cmd));
 		CHECK(cmd.nitros9.boot_device == 1);
 	}
+	SECTION("trace with length only starts at row 0")
+	{
+		REQUIRE(parse("trace 40", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_LEN);
+		CHECK(cmd.trace.start == 0x00);
+		CHECK(cmd.trace.length == 0x40);
+	}
+	SECTION("trace start and length")
+	{
+		REQUIRE(parse("trace 600 40", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_LEN);
+		CHECK(cmd.trace.start == 0x600);
+		CHECK(cmd.trace.length == 0x40);
+	}
+	SECTION("bare trace starts at row 0")
+	{
+		REQUIRE(parse("trace", &cmd));
+		CHECK(cmd.tag == CMD_TRACE);
+		CHECK(cmd.trace.start == 0x00);
+	}
 	SECTION("empty input")
 	{
 		CHECK_FALSE(parse("", &cmd));

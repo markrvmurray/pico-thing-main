@@ -1199,7 +1199,9 @@ process_command(char *buf)
 		"  snippet [n]        (sn)  list snippets, or copy n to $FFE0\n"
 		"\n--- Debug ---\n"
 		"  trace on|off       (tr)  arm or disarm the %u-cycle one-shot\n"
-		"  trace [len]        (tr)  dump the capture, len rows (hex)\n"
+		"  trace [start] [len] (tr)  dump the capture; rows are hex, and the\n"
+		"                           start defaults to 0.  Row numbers stay\n"
+		"                           absolute, so offset dumps line up\n"
 		"  trace <vector>     (tr)  arm on swi|swi2|swi3|nmi|firq|irq\n"
 		"  break [addr|r]     (br)  breakpoint; r resumes\n"
 		"  irq <0-7>          (ir)  interrupt tests; 7 is NMIBlock latency\n"
@@ -1925,9 +1927,14 @@ status_done:
 			       "or a guest poke of $%04X\n\n", REGISTER_BASE + SYSTEM_TRACE);
 			break;
 		}
-		const uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, have) : have;
+		// Row numbers stay absolute, so an offset dump still lines up with a
+		// full one — the point of the offset is to reach deep into a capture
+		// without pushing thousands of rows through the console.
+		const uint32_t start = MIN(cmd.trace.start, have);
+		const uint32_t avail = have - start;
+		const uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, avail) : avail;
 		printf("    #  EQ R/W  A  D  CS  bus-state    B L V  H N F I  TSK Pg  FM\n");
-		for (uint32_t i = 0; i < len; i++) {
+		for (uint32_t i = start; i < start + len; i++) {
 			bus_pins bp{}; bp.word = MC6809.trace_word(i);
 			high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(i);
 			BLA bla{}; bla.byte = static_cast<uint8_t>(bp.bits.BUSY_LIC_AVMA);
