@@ -15,7 +15,11 @@ picoprobe guide you can start debugging but, first you need to create an openocd
 #### Debugging
 ![openocd](docs/debug.png)
 OpenOCD plugin, only accepts one single file. This means we can't add separate files for `board` and `interface` like what you see in the pico documentation.
-The solution to this is to create a custom file and then source all required files. `openocd_pico.cfg` file serves as our config.
+The solution to this is to create a custom file and then source all required files. `pico.cfg` serves as our config.
+
+If more than one debug probe is attached, `probe_main.cfg` pins the session to the probe wired to the main Pico by
+serial number, then sources `pico.cfg`. It resolves that with `find`, so it needs OpenOCD's search path to include the
+project root (`-s .`); as a CLion board-config, point at `pico.cfg` directly instead.
 
 This repository contains the svd file. You can use this file to see the current value of registers:
 ![svd](docs/svd.png)
