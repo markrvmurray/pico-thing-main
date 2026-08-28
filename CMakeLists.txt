@@ -207,7 +207,7 @@ target_link_libraries(pico-thing
 	pico_multicore
 	pico_aon_timer
 	pico_unique_id
-	# hardware_adc
+	hardware_adc
 	hardware_dma
 	hardware_irq
 	hardware_pio

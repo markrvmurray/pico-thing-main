@@ -19,7 +19,7 @@
 #include "pico/multicore.h"
 
 #include "hardware/clocks.h"
-//#include "hardware/adc.h"
+#include "hardware/adc.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
@@ -884,6 +884,22 @@ console_has_interrupt()
 	return console_interrupt;
 }
 
+// Raw ADC counts to engineering units.  Shared by the human-readable and the
+// JSON status output so the constants cannot drift apart.
+static inline float
+adc_bus_volts(const uint16_t raw)
+{
+	// The divider halves the 5v line, so the pin sees Vbus/2 - scale the
+	// pin voltage back up rather than down
+	return raw*3.3f*2/4096;
+}
+
+static inline float
+adc_die_celsius(const uint16_t raw)
+{
+	return 27.0f - ((raw*3.3f/4096) - 0.706f)/0.001721f;
+}
+
 void
 status_gather(status_snapshot_t *s)
 {
@@ -897,6 +913,17 @@ status_gather(status_snapshot_t *s)
 		s->task_history[i] = MC6809.get_task_history(i);
 
 	s->power = POWER_IS_ASSERTED;
+#if PICO_THING_BOARD_VERSION >= 2
+	// The 5v line is divided by two onto GPIO 46, which only carries an
+	// ADC input on version 2 - version 1 has the power enable there.
+	adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
+	s->voltage = adc_read();
+#else
+	s->voltage = 0u;           // no bus voltage divider on version 1
+#endif
+	// The die temperature sensor is internal, on the channel above the pins
+	adc_select_input(NUM_ADC_CHANNELS - 1);
+	s->temperature = adc_read();
 	s->reset = RESET_IS_ASSERTED;
 	s->halt = HALT_IS_ASSERTED;
 	s->nmi = NMI_IS_ASSERTED;
@@ -991,6 +1018,10 @@ status_print(const status_snapshot_t *s)
 	       s->power ? "HIGH" : "low",
 	       !s->reset ? "high" : "LOW",
 	       !s->halt ? "high" : "LOW");
+#if PICO_THING_BOARD_VERSION >= 2
+	printf("BUS VOLTAGE: %.2f\n", adc_bus_volts(s->voltage));
+#endif
+	printf("PICO TEMPERATURE: %.1f\n", adc_die_celsius(s->temperature));
 	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
 	       s->nmi ? "OUTPUT LOW" : "hi-z",
 	       s->firq ? "OUTPUT LOW" : "hi-z",
@@ -1104,6 +1135,16 @@ status_json(const status_snapshot_t *s)
 	       s->power ? "true" : "false", s->reset ? "true" : "false",
 	       s->halt ? "true" : "false", s->nmi ? "true" : "false",
 	       s->firq ? "true" : "false", s->irq ? "true" : "false");
+	// Raw counts as well as volts/celsius: the conversions are approximate,
+	// the counts are what was actually measured.  Version 1 has no bus
+	// divider, so its voltage is null rather than a misleading zero.
+#if PICO_THING_BOARD_VERSION >= 2
+	printf(",\"voltage\":%.2f,\"voltage_raw\":%u", adc_bus_volts(s->voltage), s->voltage);
+#else
+	printf(",\"voltage\":null,\"voltage_raw\":null");
+#endif
+	printf(",\"temperature\":%.1f,\"temperature_raw\":%u",
+	       adc_die_celsius(s->temperature), s->temperature);
 #ifdef DEBUG
 	printf(",\"lic_count\":%lu,\"rti_count\":%lu,\"lic_stalled\":%s",
 	       s->lic_count, s->rti_count, s->lic_stalled ? "true" : "false");
@@ -3198,11 +3239,11 @@ main()
 	printf("successful!\n");
 	printf("Core0 console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
-#ifdef NO_ADC_YET
 	adc_init();
-	adc_gpio_init(GPIO_POWER_ADC);
-	adc_set_temp_sensor_enabled(true);
+#if PICO_THING_BOARD_VERSION >= 2
+	adc_gpio_init(GPIO_POWER_ADC);   // 5v divider, version 2 only
 #endif
+	adc_set_temp_sensor_enabled(true);
 	usb_init();
 	printf("Core0 initialised USB\n");
 

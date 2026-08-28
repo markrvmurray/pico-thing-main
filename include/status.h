@@ -41,6 +41,7 @@ struct status_snapshot_t {
 
 	// GPIO pins
 	bool power, reset, halt, nmi, firq, irq;
+	uint16_t voltage, temperature;   // raw counts; voltage is 0 on version 1
 
 #ifdef DEBUG
 	uint32_t lic_count;
