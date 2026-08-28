@@ -193,9 +193,9 @@ typedef struct parsed_cmd {
 /*
  * Parse one command line into *out.
  * Returns false (and prints a message) on syntax error.
- * The input buffer may be modified by the lexer.
+ * The lexer scans its own copy, so the input is left alone.
  */
-bool cmd_parse(char *input, parsed_cmd_t *out);
+bool cmd_parse(const char *input, parsed_cmd_t *out);
 
 #ifdef __cplusplus
 }

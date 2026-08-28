@@ -23,15 +23,12 @@ extern "C" {
 #include "interrupt.h"
 }
 
-/* Helper: copy the string literal into a mutable buffer (cmd_parse takes
- * char *, not const char *) and call cmd_parse. */
+/* Helper: parse one command line.  cmd_parse() takes a const char *, so the
+ * literal can go straight in. */
 static bool
 parse(const char *input_str, parsed_cmd_t *out)
 {
-	char buf[512];
-	std::strncpy(buf, input_str, sizeof(buf) - 1);
-	buf[sizeof(buf) - 1] = '\0';
-	return cmd_parse(buf, out);
+	return cmd_parse(input_str, out);
 }
 
 // ============================================================

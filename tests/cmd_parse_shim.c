@@ -24,7 +24,7 @@ extern int             cmd_yyparse(parsed_cmd_t *result);
 extern void            cmd_yy_reset_str_pool(void);
 
 bool
-cmd_parse(char *input, parsed_cmd_t *out)
+cmd_parse(const char *input, parsed_cmd_t *out)
 {
 	out->tag = CMD_NONE;
 	cmd_yy_reset_str_pool();

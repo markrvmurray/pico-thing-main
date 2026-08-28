@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -235,8 +236,8 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 	if (verbose) {
 		printf("MC6809 run took %u iterations\n", i);
 #ifdef DEBUG
-		printf("%lu LICs were counted\n", _count_lic - lic_start);
-		printf("%lu RTIs were counted\n", _count_rti - rti_start);
+		printf("%" PRIu32 " LICs were counted\n", _count_lic - lic_start);
+		printf("%" PRIu32 " RTIs were counted\n", _count_rti - rti_start);
 #endif
 		if (i == 1000u*timeout_ms)
 			printf("Timeout was reached\n");

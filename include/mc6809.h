@@ -216,10 +216,10 @@ public:
 	void preserve_state();
 	void restore_state();
 	void set_e_frequency(float target_mhz, const pio_dma &pio_clock);
-	[[nodiscard]] bool is_running() const { return run_state == RS_RUNNING || run_state == RS_IN_IRQ; };
-	[[nodiscard]] bool is_in_irq() const { return run_state == RS_IN_IRQ; };
-	[[nodiscard]] bool is_synced() const { return run_state == RS_SYNCED; };
-	[[nodiscard]] bool is_halted() const { return run_state == RS_HALTED; };
+	[[nodiscard]] bool is_running() const { return run_state == RS_RUNNING || run_state == RS_IN_IRQ; }
+	[[nodiscard]] bool is_in_irq() const { return run_state == RS_IN_IRQ; }
+	[[nodiscard]] bool is_synced() const { return run_state == RS_SYNCED; }
+	[[nodiscard]] bool is_halted() const { return run_state == RS_HALTED; }
 	[[nodiscard]] bool is_stopped() const { return run_state == RS_RESET; }
 	[[nodiscard]] bool is_unpowered() const { return run_state == RS_UNPOWERED; }
 	[[nodiscard]] float get_e_frequency() const;

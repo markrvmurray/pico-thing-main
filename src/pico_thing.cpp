@@ -4,13 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <sys/stat.h>
+//#include <sys/stat.h>
 
 #include <cctype>
+#include <cinttypes>
 #include <cstdio>
-#include <cstring>
-#include <cstdlib>
-#include <ctime>
+//#include <cstring>
+//#include <cstdlib>
+//#include <ctime>
 //#include <cstdint>
 
 #include "pico/aon_timer.h"
@@ -49,7 +50,7 @@ extern void            cmd_yy_reset_str_pool(void);
 }
 
 // PIO program headers will be generated from the .pio file
-#include <cstdint>
+//#include <cstdint>
 
 #include "pico_thing.pio.h"
 
@@ -145,7 +146,11 @@ static constexpr uint8_t PEND_FIRQ = 1u << 1;
 static constexpr uint8_t PEND_IRQ  = 1u << 2;
 
 // 50 Hz tick timer (IRQ) + E-cycle countdown (NMI).
-static tick_timer system_tick(reg, SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
+// Constructed from getInstance() rather than reg: reg is a namespace-scope
+// reference in another translation unit, and the order the two are initialised
+// in is unspecified.  The function-local static behind getInstance() is built
+// on first use, so there is nothing to get wrong.
+static tick_timer system_tick(registers::getInstance(), SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
 static volatile uint32_t core1_qrise_count = 0u;
 static volatile uint32_t core1_irq_assert_count = 0u;
@@ -263,8 +268,8 @@ static volatile bool dat_fault_nmi_pending = false;
 
 // Stack watermark for Core 1 — paint stack with 0xDEADBEEF, then scan
 // from the bottom to find the high-water mark.
-extern "C" uint32_t __StackOneBottom;	// linker symbol
-extern "C" uint32_t __StackOneTop;	// linker symbol
+extern "C" uint32_t __StackOneBottom;	// linker symbol (NOLINT: the name is the SDK's)
+extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK's)
 
 void __isr
 __time_critical_func(gpio_clock_eq_irq_handler())
@@ -282,7 +287,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// by Q-falling the 6809 has already updated them for the next cycle). Unpack
 		// immediately so that vma is valid before the DMA read ISR fires (~20 cycles later).
 		MC6809.set_busy_lic_avma(static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA));
-		uint8_t address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
+		auto address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
 		const auto new_bs = static_cast<enum bus_state>(bus_pins.bits.BS_BA & 0x03u);
 		const bool reset_now = RESET_IS_ASSERTED;
 #ifdef DEBUG
@@ -417,7 +422,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// the note by the definition.
 		if (high_pins.bits.FAULT
 		    && (!DAT_FAULT_AUTO_BLOCK || !high_pins.bits.NMI_BLOCK)) {
-			if (DAT_FAULT_AUTO_BLOCK)
+			if constexpr (DAT_FAULT_AUTO_BLOCK)
 				gpio_put(GPIO_NMI_BLOCK, true);
 			// Tell the BUS_IRQ case that the NMI now on its way is a fault,
 			// so it can drop the guest into task 0 for the handler.
@@ -510,7 +515,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// persists.  SYSTEM_DAT_FAULT_LOC is left alone: it only means
 			// anything while a fault is latched, and the next fault
 			// overwrites it, so the guest can read the two in either order.
-			reg[SYSTEM_DAT_FAULT] &= uint8_t(~DAT_FAULT_LATCHED);
+			reg[SYSTEM_DAT_FAULT] &= static_cast<uint8_t>(~DAT_FAULT_LATCHED);
 		} else {
 			read_location = loc;
 			read_irq_received = true;
@@ -604,15 +609,14 @@ __time_critical_func(dma_bus_write_irq_handler())
 			if (block)
 				reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
 			else
-				reg[SYSTEM_DAT_FAULT] &= uint8_t(~DAT_FAULT_NMI_BLOCK);
+				reg[SYSTEM_DAT_FAULT] &= static_cast<uint8_t>(~DAT_FAULT_NMI_BLOCK);
 		}
 		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
 		// CPU is concerned. When watchpoint is armed, writes to snippet space ($FFE0-$FFEF) and
 		// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
 		// and the vectors it guards.
-		else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET) {
+		else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET)
 			watchpoint_nmi_pending = true;
-		}
 		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
 			reg[wloc] = wval;
 		// Queue for the for(;;) loop to do full dispatch.
@@ -823,14 +827,11 @@ sysreq_process()
 				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
-		case REQUEST_MOUNT: {
+		case REQUEST_MOUNT:
+		case REQUEST_UNMOUNT:
+			// Neither is implemented yet
 			reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
-		}
-		case REQUEST_UNMOUNT: {
-			reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
-			break;
-		}
 		}
 	}
 }
@@ -853,7 +854,7 @@ print_time()
 
 /* cmd_parse() - glue between process_command() and the flex/bison parser */
 bool
-cmd_parse(char *input, parsed_cmd_t *out)
+cmd_parse(const char *input, parsed_cmd_t *out)
 {
 	out->tag = CMD_NONE;
 	cmd_yy_reset_str_pool();
@@ -889,15 +890,15 @@ console_has_interrupt()
 static inline float
 adc_bus_volts(const uint16_t raw)
 {
-	// The divider halves the 5v line, so the pin sees Vbus/2 - scale the
+	// The divider halves the 5V line, so the pin sees Vbus/2 - scale the
 	// pin voltage back up rather than down
-	return raw*3.3f*2/4096;
+	return static_cast<float>(raw)*3.3f*2.0f/4096.0f;
 }
 
 static inline float
 adc_die_celsius(const uint16_t raw)
 {
-	return 27.0f - ((raw*3.3f/4096) - 0.706f)/0.001721f;
+	return 27.0f - ((static_cast<float>(raw)*3.3f/4096.0f) - 0.706f)/0.001721f;
 }
 
 void
@@ -914,7 +915,7 @@ status_gather(status_snapshot_t *s)
 
 	s->power = POWER_IS_ASSERTED;
 #if PICO_THING_BOARD_VERSION >= 2
-	// The 5v line is divided by two onto GPIO 46, which only carries an
+	// The 5V line is divided by two onto GPIO 46, which only carries an
 	// ADC input on version 2 - version 1 has the power enable there.
 	adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
 	s->voltage = adc_read();
@@ -1019,7 +1020,7 @@ status_print(const status_snapshot_t *s)
 	       !s->reset ? "high" : "LOW",
 	       !s->halt ? "high" : "LOW");
 #if PICO_THING_BOARD_VERSION >= 2
-	printf("BUS VOLTAGE: %.2f\n", adc_bus_volts(s->voltage));
+	printf("BUS POWER: %.2fV\n", adc_bus_volts(s->voltage));
 #endif
 	printf("PICO TEMPERATURE: %.1f\n", adc_die_celsius(s->temperature));
 	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
@@ -1042,9 +1043,9 @@ status_print(const status_snapshot_t *s)
 
 	// 3. LIC / RTI (DEBUG only)
 #ifdef DEBUG
-	printf("LIC: %-10lu  RTI: %-10lu\n", s->lic_count, s->rti_count);
+	printf("LIC: %-10" PRIu32 "  RTI: %-10" PRIu32 "\n", s->lic_count, s->rti_count);
 	if (s->lic_stalled)
-		printf("WARNING: LIC stalled at %lu, run state is %s\n",
+		printf("WARNING: LIC stalled at %" PRIu32 ", run state is %s\n",
 		       s->lic_count, run_state_string[s->run_state]);
 	printf("\n");
 #endif
@@ -1061,12 +1062,14 @@ status_print(const status_snapshot_t *s)
 	       s->tick_irq_pending ? "yes" : "no");
 	printf("Core 1:\n");
 	printf("       Loop     Q Rise   IRQ Asrt   Wrt Ring   Read IRQ        ISR\n");
-	printf("  %9lu  %9lu  %9lu  %9lu  %9lu  %9lu\n",
+	printf("  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32
+	       "  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32 "\n",
 	       s->core1_loop, s->core1_qrise, s->core1_irq_assert,
 	       s->core1_write_ring, s->core1_read_irq, s->core1_isr);
 	printf("  Last Write: %02X   Last Read: %02X\n",
 	       s->core1_last_write, s->core1_last_read);
-	printf("  Stack Total: %lu  Free (min): %lu  Used (max): %lu\n",
+	printf("  Stack Total: %" PRIu32 "  Free (min): %" PRIu32
+	       "  Used (max): %" PRIu32 "\n",
 	       s->core1_stack_total, s->core1_stack_free,
 	       s->core1_stack_total - s->core1_stack_free);
 	printf("\n");
@@ -1098,7 +1101,7 @@ status_print(const status_snapshot_t *s)
 static void
 status_json_regs(const char *name, const uint8_t *regs)
 {
-	printf("\"%s\":\"", name);
+	printf(R"json("%s":")json", name);
 	for (int i = 0; i < 64; i++) {
 		if (i > 0) printf(" ");
 		printf("%02X", regs[i]);
@@ -1109,10 +1112,10 @@ status_json_regs(const char *name, const uint8_t *regs)
 static void
 status_json_acia(const char *name, const acia_status_t *a)
 {
-	printf("\"%s\":{\"interrupt_status\":%u,\"tx_level\":%u,\"rx_level\":%u", name,
+	printf(R"json("%s":{"interrupt_status":%u,"tx_level":%u,"rx_level":%u)json", name,
 	       a->interrupt_status, a->tx_level, a->rx_level);
 #ifdef DEBUG
-	printf(",\"control_count\":%u,\"tx_data_count\":%u,\"status_count\":%u,\"rx_data_count\":%u",
+	printf(R"json(,"control_count":%u,"tx_data_count":%u,"status_count":%u,"rx_data_count":%u)json",
 	       a->control_count, a->tx_data_count, a->status_count, a->rx_data_count);
 #endif
 	printf("}");
@@ -1121,17 +1124,17 @@ status_json_acia(const char *name, const acia_status_t *a)
 void
 status_json(const status_snapshot_t *s)
 {
-	printf("{\"run_state\":\"%s\",\"bus_state\":\"%s\",\"old_bus_state\":\"%s\"",
+	printf(R"json({"run_state":"%s","bus_state":"%s","old_bus_state":"%s")json",
 	       run_state_string[s->run_state], bus_state_string[s->bus_state],
 	       bus_state_string[s->old_bus_state]);
-	printf(",\"task\":%u,\"nesting_depth\":%u,\"task_stack_ptr\":%u", s->task, s->nesting_depth, s->task_stack_ptr);
-	printf(",\"task_history\":[");
+	printf(R"json(,"task":%u,"nesting_depth":%u,"task_stack_ptr":%u)json", s->task, s->nesting_depth, s->task_stack_ptr);
+	printf(R"json(,"task_history":[)json");
 	for (uint16_t i = 0; i < s->task_stack_ptr; i++) {
 		if (i > 0) printf(",");
 		printf("%u", s->task_history[i]);
 	}
 	printf("]");
-	printf(",\"power\":%s,\"reset\":%s,\"halt\":%s,\"nmi\":%s,\"firq\":%s,\"irq\":%s",
+	printf(R"json(,"power":%s,"reset":%s,"halt":%s,"nmi":%s,"firq":%s,"irq":%s)json",
 	       s->power ? "true" : "false", s->reset ? "true" : "false",
 	       s->halt ? "true" : "false", s->nmi ? "true" : "false",
 	       s->firq ? "true" : "false", s->irq ? "true" : "false");
@@ -1139,30 +1142,31 @@ status_json(const status_snapshot_t *s)
 	// the counts are what was actually measured.  Version 1 has no bus
 	// divider, so its voltage is null rather than a misleading zero.
 #if PICO_THING_BOARD_VERSION >= 2
-	printf(",\"voltage\":%.2f,\"voltage_raw\":%u", adc_bus_volts(s->voltage), s->voltage);
+	printf(R"json(,"voltage":%.2f,"voltage_raw":%u)json", adc_bus_volts(s->voltage), s->voltage);
 #else
-	printf(",\"voltage\":null,\"voltage_raw\":null");
+	printf(R"json(,"voltage":null,"voltage_raw":null)json");
 #endif
-	printf(",\"temperature\":%.1f,\"temperature_raw\":%u",
+	printf(R"json(,"temperature":%.1f,"temperature_raw":%u)json",
 	       adc_die_celsius(s->temperature), s->temperature);
 #ifdef DEBUG
-	printf(",\"lic_count\":%lu,\"rti_count\":%lu,\"lic_stalled\":%s",
+	printf(",\"lic_count\":%" PRIu32 ",\"rti_count\":%" PRIu32 ",\"lic_stalled\":%s",
 	       s->lic_count, s->rti_count, s->lic_stalled ? "true" : "false");
 #endif
 	printf(",");
 	status_json_regs("write_regs", s->write_regs);
 	printf(",");
 	status_json_regs("read_regs", s->read_regs);
-	printf(",\"tick_enabled\":%s,\"tick_irq_pending\":%s",
+	printf(R"json(,"tick_enabled":%s,"tick_irq_pending":%s)json",
 	       s->tick_enabled ? "true" : "false",
 	       s->tick_irq_pending ? "true" : "false");
-	printf(",\"core1_loop\":%lu,\"core1_qrise\":%lu,\"core1_irq_assert\":%lu",
+	printf(",\"core1_loop\":%" PRIu32 ",\"core1_qrise\":%" PRIu32
+	       ",\"core1_irq_assert\":%" PRIu32,
 	       s->core1_loop, s->core1_qrise, s->core1_irq_assert);
-	printf(",\"core1_write_ring\":%lu,\"core1_read_irq\":%lu",
+	printf(R"(,"core1_write_ring":%)" PRIu32 R"(,"core1_read_irq":%)" PRIu32,
 	       s->core1_write_ring, s->core1_read_irq);
-	printf(",\"core1_last_write\":%u,\"core1_last_read\":%u,\"core1_isr\":%lu",
+	printf(R"(,"core1_last_write":%u,"core1_last_read":%u,"core1_isr":%)" PRIu32,
 	       s->core1_last_write, s->core1_last_read, s->core1_isr);
-	printf(",\"core1_stack_total\":%lu,\"core1_stack_free\":%lu",
+	printf(R"(,"core1_stack_total":%)" PRIu32 R"(,"core1_stack_free":%)" PRIu32,
 	       s->core1_stack_total, s->core1_stack_free);
 	printf(",");
 	status_json_acia("console_acia", &s->console_acia);
@@ -1178,7 +1182,7 @@ void
 process_command(char *buf)
 {
 	static uint8_t buffer[256];
-	parsed_cmd_t cmd;
+	parsed_cmd_t cmd{};
 
 	/* Skip blank lines */
 	while (isspace(static_cast<unsigned char>(*buf)))
@@ -1265,7 +1269,7 @@ process_command(char *buf)
 		break;
 
 	case CMD_STATUS: {
-		status_snapshot_t snap;
+		status_snapshot_t snap{};
 		status_gather(&snap);
 		status_print(&snap);
 		uint32_t period = cmd.status.period;
@@ -1274,7 +1278,7 @@ process_command(char *buf)
 				usb_poll();
 				if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT)
 					goto status_done;
-				MC6809.uart_task(true);
+				mc6809::uart_task(true);
 				sleep_ms(1u);
 			}
 			printf("%s%s", ANSI_CLEAR_SCREEN, ANSI_CURSOR_HOME);
@@ -1292,13 +1296,13 @@ status_done:
 		break;
 
 	case CMD_EXAMINE_DAT: {
-		const uint16_t start = 0xFD00u;
-		const uint16_t end   = 0xFFC0u;
+		constexpr uint16_t start = 0xFD00u;
+		constexpr uint16_t end   = 0xFFC0u;
 		if (!MC6809.assert_stopped())
 			break;
 		MC6809.preserve_state();
-		const uint16_t display_start = start & 0xFFF0u;
-		const uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
+		constexpr uint16_t display_start = start & 0xFFF0u;
+		constexpr uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
 		absolute_time_t next_usb = get_absolute_time();
 		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
 			if (!copy(INWARDS, 16u, loc, buffer))
@@ -1315,7 +1319,7 @@ status_done:
 			printf(" |");
 			for (uint16_t i = 0; i < 16u; i++) {
 				if (loc + i >= start && loc + i < end) {
-					auto ch = static_cast<unsigned char>(buffer[i]) & 0x7Fu;
+					const int ch = static_cast<unsigned char>(buffer[i]) & 0x7F;
 					printf("%c", isprint(ch) ? ch : '.');
 				} else
 					printf(" ");
@@ -1356,7 +1360,7 @@ status_done:
 			printf(" |");
 			for (uint16_t i = 0; i < 16u; i++) {
 				if (loc + i >= start && loc + i < end) {
-					auto ch = static_cast<unsigned char>(buffer[i]) & 0x7Fu;
+					const int ch = static_cast<unsigned char>(buffer[i]) & 0x7F;
 					printf("%c", isprint(ch) ? ch : '.');
 				} else
 					printf(" ");
@@ -1723,14 +1727,11 @@ status_done:
 				}
 				found++;
 				if (j >= have)
-					printf("  %-5s at cycle %lu: pin never followed within the capture\n",
-					       prev_block ? "clear" : "set",
-					       static_cast<unsigned long>(i));
+					printf("  %-5s at cycle %" PRIu32 ": pin never followed within the capture\n",
+					       prev_block ? "clear" : "set", i);
 				else
-					printf("  %-5s at cycle %lu: pin followed within %lu E cycle%s%s\n",
-					       prev_block ? "clear" : "set",
-					       static_cast<unsigned long>(i),
-					       static_cast<unsigned long>(j - i),
+					printf("  %-5s at cycle %" PRIu32 ": pin followed within %" PRIu32 " E cycle%s%s\n",
+					       prev_block ? "clear" : "set", i, j - i,
 					       (j - i) == 1u ? "" : "s",
 					       (j - i) <= 1u
 					         ? " (the floor at this sampling rate)"
@@ -1738,9 +1739,8 @@ status_done:
 				prev_block = !prev_block;
 			}
 			if (found < 2u)
-				printf("  only %u of 2 writes to $%04X found in %lu cycles\n",
-				       found, REGISTER_BASE + SYSTEM_DAT_FAULT,
-				       static_cast<unsigned long>(have));
+				printf("  only %u of 2 writes to $%04X found in %" PRIu32 " cycles\n",
+				       found, REGISTER_BASE + SYSTEM_DAT_FAULT, have);
 			printf("  one cycle means the pin moved somewhere between E-fall of\n"
 			       "  the write and E-fall of the next cycle. The GAL's deadline\n"
 			       "  is Q-rise, a quarter cycle into that window, so whether it\n"
@@ -1805,7 +1805,7 @@ status_done:
 			// cannot cause a second entry: the 6809 masks I on IRQ entry and
 			// both F and I on FIRQ entry, so nothing can be taken again until
 			// the RTI that follows the release.
-			static const struct { interrupt intr; const char *name; } deliver[] = {
+			static constexpr struct { interrupt intr; const char *name; } deliver[] = {
 				{INTERRUPT_NMI,  "NMI"},
 				{INTERRUPT_FIRQ, "FIRQ"},
 				{INTERRUPT_IRQ,  "IRQ"},
@@ -1848,13 +1848,13 @@ status_done:
 			static const char *irq_names[] = {
 				"ILL", "SWI3", "SWI2", "FIRQ", "IRQ", "SWI", "NMI", "RESET", "NONE"
 			};
-			printf("  IRQ ack: %lu [", MC6809.get_irq_ack_total());
+			printf("  IRQ ack: %" PRIu32 " [", MC6809.get_irq_ack_total());
 			for (int i = 0; i < NUM_INTERRUPTS; i++) {
 				uint32_t c = MC6809.get_irq_ack_count(static_cast<interrupt>(i));
 				if (c > 0u)
-					printf(" %s=%lu", irq_names[i], c);
+					printf(" %s=%" PRIu32, irq_names[i], c);
 			}
-			printf(" ]  RTI: %lu\n", MC6809.get_rti_count());
+			printf(" ]  RTI: %" PRIu32 "\n", MC6809.get_rti_count());
 #endif
 			printf("Interrupt test: %s\n", success ? "PASS" : "FAIL");
 
@@ -1917,7 +1917,7 @@ status_done:
 				if (reg[REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i] != final_stack[i]) {
 					printf("mismatch %04X %02X %02X\n",
 					       REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i,
-					       static_cast<uint8_t>(reg.write(REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i)),
+					       static_cast<uint8_t>(registers::write(REGISTER_BUFFER_OFFSET + (16u - final_stack_length) + i)),
 					       final_stack[i]);
 					success = false;
 				}
@@ -1935,20 +1935,20 @@ status_done:
 			const bool irq_ack_ok = (irq_ack_total == expected_irq_ack_count);
 			if (!irq_ack_ok)
 				success = false;
-			printf("%s: IRQ ack: %s (expected %lu, got %lu) [",
+			printf("%s: IRQ ack: %s (expected %" PRIu32 ", got %" PRIu32 ") [",
 			       test_name, irq_ack_ok ? "PASS" : "FAIL",
 			       expected_irq_ack_count, irq_ack_total);
 			for (int i = 0; i < NUM_INTERRUPTS; i++) {
 				uint32_t c = MC6809.get_irq_ack_count(static_cast<interrupt>(i));
 				if (c > 0u)
-					printf(" %s=%lu", irq_names[i], c);
+					printf(" %s=%" PRIu32, irq_names[i], c);
 			}
 			printf(" ]\n");
 			const uint32_t rti_caught = MC6809.get_rti_count();
 			const bool rti_ok = (rti_caught == expected_rti_count);
 			if (!rti_ok)
 				success = false;
-			printf("%s: RTI capture: %s (expected %lu, got %lu)\n",
+			printf("%s: RTI capture: %s (expected %" PRIu32 ", got %" PRIu32 ")\n",
 			       test_name, rti_ok ? "PASS" : "FAIL",
 			       expected_rti_count, rti_caught);
 #endif
@@ -1979,9 +1979,9 @@ status_done:
 			bus_pins bp{}; bp.word = MC6809.trace_word(i);
 			high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(i);
 			BLA bla{}; bla.byte = static_cast<uint8_t>(bp.bits.BUSY_LIC_AVMA);
-			printf("%5lu  %c%c  %c  %02X %02X  %c   %-11s  %c %c %c  %c %c %c %c  "
+			printf("%5" PRIu32 "  %c%c  %c  %02X %02X  %c   %-11s  %c %c %c  %c %c %c %c  "
 			       "%2u%c  %u  %c%c\n",
-			       static_cast<unsigned long>(i),
+			       i,
 			       bp.bits.E ? 'E' : '.',
 			       bp.bits.Q ? 'Q' : '.',
 			       bp.bits.RW ? 'R' : 'W',
@@ -2002,8 +2002,7 @@ status_done:
 			       hp.bits.FAULT ? 'F' : '.',
 			       hp.bits.NMI_BLOCK ? 'M' : '.');
 		}
-		printf("%lu of %lu cycles%s\n\n",
-		       static_cast<unsigned long>(len), static_cast<unsigned long>(have),
+		printf("%" PRIu32 " of %" PRIu32 " cycles%s\n\n", len, have,
 		       MC6809.trace_is_full() ? " (buffer full)" : "");
 		break;
 	}
@@ -2019,10 +2018,10 @@ status_done:
 		break;
 
 	case CMD_TRACE_IRQ: {
-		static const char *const inames[NUM_INTERRUPTS] = {
+		static constexpr const char *const inames[NUM_INTERRUPTS] = {
 			"ILLEGAL", "SWI3", "SWI2", "FIRQ", "IRQ", "SWI", "NMI", "RESET", "NONE"
 		};
-		const interrupt it = static_cast<interrupt>(cmd.trace.intr);
+		auto it = static_cast<interrupt>(cmd.trace.intr);
 		MC6809.trace_set_irq_trigger(it);
 		printf("trace will arm (one-shot) when the %s vector is taken\n\n", inames[it]);
 		break;
@@ -2326,13 +2325,13 @@ poll_console()
 				watchdog_miss_count++;
 				if (!watchdog_stalled && watchdog_miss_count >= WATCHDOG_THRESHOLD) {
 					const bool isr_alive = (cur_isr != watchdog_last_isr_count);
-					printf("\n*** Core 1 for(;;) loop stalled (%lums)!\n",
+					printf("\n*** Core 1 for(;;) loop stalled (%" PRIu32 "ms)!\n",
 					       watchdog_miss_count * WATCHDOG_INTERVAL_MS);
 					if (!isr_alive)
 						printf("*** ISRs also stopped — probable hard fault or deadlock\n");
 					else
 						printf("*** ISRs still running — thread mode starved or hung\n");
-					printf("  loop=%lu  isr=%lu\n",
+					printf("  loop=%" PRIu32 "  isr=%" PRIu32 "\n",
 					       cur_loop, cur_isr);
 					printf("  last_write=%02X  last_read=%02X\n",
 					       core1_last_write_loc, core1_last_read_loc);
@@ -2341,7 +2340,8 @@ poll_console()
 					printf("  ACIA: int_status=%02X  Aux: int_status=%02X\n",
 					       fast_serial.interrupt_status(), aux_serial.interrupt_status());
 					printf("  Tick: enabled=%d  irq_pending=%d\n",
-					       (int)system_tick.is_enabled(), (int)system_tick.is_irq_pending());
+					       static_cast<int>(system_tick.is_enabled()),
+					       static_cast<int>(system_tick.is_irq_pending()));
 					// Stack watermark check
 					{
 						volatile uint32_t *bottom = &__StackOneBottom;
@@ -2351,7 +2351,7 @@ poll_console()
 							p++;
 						uint32_t used = (top - p) * sizeof(uint32_t);
 						uint32_t total = (top - bottom) * sizeof(uint32_t);
-						printf("  stack: %lu/%lu bytes used", used, total);
+						printf("  stack: %" PRIu32 "/%" PRIu32 " bytes used", used, total);
 						if (p == bottom)
 							printf(" *** STACK OVERFLOW ***");
 						printf("\n");
@@ -2360,7 +2360,7 @@ poll_console()
 				}
 			} else {
 				if (watchdog_stalled) {
-					printf("*** Core 1 for(;;) loop resumed after %lums (loop=%lu)\n",
+					printf("*** Core 1 for(;;) loop resumed after %" PRIu32 "ms (loop=%" PRIu32 ")\n",
 					       watchdog_miss_count * WATCHDOG_INTERVAL_MS,
 					       cur_loop);
 				}
@@ -2412,7 +2412,7 @@ poll_console()
 				}
 			}
 		}
-		MC6809.uart_task(idx > 0);
+		mc6809::uart_task(idx > 0);
 
 		// Check for watchpoint hit — BREAK snippet writes stack to SHARED and spins.
 		// PC at SHARED[10:11]; non-zero means the watchpoint fired.
@@ -2454,7 +2454,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	// Trace pins - ISR set.  Named individually rather than as a run: they
 	// sit on 37-38 on version 1 but 38-39 on version 2, where 37 is TASK0.
-	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
+	static constexpr uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
 	for (const uint8_t p : trace_pins) {
 		gpio_init(p);
 		gpio_put(p, false);
@@ -2529,7 +2529,7 @@ __no_inline_not_in_flash_func(main_core1)()
 		for (volatile uint32_t *p = bottom; p < sp - 16; p++)
 			*p = 0xDEADBEEFu;
 		uint32_t stack_free = (sp - bottom) * sizeof(uint32_t);
-		printf("Core1 stack: %lu bytes total, %lu bytes free at start\n",
+		printf("Core1 stack: %zu bytes total, %" PRIu32 " bytes free at start\n",
 		       (&__StackOneTop - &__StackOneBottom) * sizeof(uint32_t),
 		       stack_free);
 	}
@@ -3151,7 +3151,7 @@ pio_shutdown()
 	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock_offset);
 
 	// --- Trace pins to hi-Z (not a consecutive run on version 2) ---
-	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
+	static constexpr uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
 	for (const uint8_t p : trace_pins) {
 		gpio_put(p, false);
 		gpio_set_dir(p, GPIO_IN);
@@ -3246,7 +3246,7 @@ main()
 
 	adc_init();
 #if PICO_THING_BOARD_VERSION >= 2
-	adc_gpio_init(GPIO_POWER_ADC);   // 5v divider, version 2 only
+	adc_gpio_init(GPIO_POWER_ADC);   // 5V divider, version 2 only
 #endif
 	adc_set_temp_sensor_enabled(true);
 	usb_init();

@@ -148,7 +148,9 @@ tud_umount_cb(void)
 
 /* CDC handled by polling; no extra callbacks required for simple loopback */
 
+#ifdef USB_DEBUG
 static absolute_time_t g_next_originate;
+#endif
 
 void
 tud_vendor_rx_cb(uint8_t itf, uint8_t const *buf, uint16_t bufsize)
@@ -180,6 +182,7 @@ tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes)
 }
 #endif
 
+#ifdef USB_DEBUG
 /* Periodic originate interval (ms) */
 #define VENDOR_ORIGINATE_MS   5000
 /* Utility: send periodic vendor-originated message */
@@ -198,6 +201,7 @@ vendor_maybe_originate(void)
 
 	g_next_originate = make_timeout_time_ms(VENDOR_ORIGINATE_MS);
 }
+#endif
 
 void
 usb_poll(void)

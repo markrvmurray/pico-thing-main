@@ -24,7 +24,7 @@ hex(const char *buf, const uint count)
 		else if (*buf >= 'a' && *buf <= 'f')
 			val += *buf - 'a' + 10;
 		else
-			return (uint)-1;
+			return static_cast<uint>(-1);
 		buf++;
 		tally++;
 		if (count && tally == count)
@@ -61,7 +61,7 @@ process_srecord(const char *buf, uint8_t *count, uint16_t *address, uint8_t *dat
 		sum += val;
 		pos += 2;
 	}
-	sum = 0x00FF - (uint8_t)sum;
+	sum = 0x00FF - static_cast<uint8_t>(sum);
 	if ((hexnum = hex(buf + pos, 2)) > 0xFF)
 		return false;
 	*checksum = hexnum;

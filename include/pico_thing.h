@@ -82,7 +82,7 @@ enum {
 	GPIO_FAULT = 41,           // [ ] [i]  Attempt to read or write unassigned memory
 	GPIO_NMI_BLOCK = 42,       // [ ] [o]  Prevent DAT Fault NMI
 	GPIO_A_HI_BASE = 43,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
-	GPIO_POWER_ADC = 46,       // [ ] [i]  ADC connected to the 5v line, divided by 2
+	GPIO_POWER_ADC = 46,       // [ ] [i]  ADC connected to the 5V line, divided by 2
 #else
 	// Version 1: the task pins and the power enable sit at the bottom of the
 	// range, so the DAT fault signals go in the free run above them.
@@ -104,7 +104,7 @@ enum {
 	GPIO_POWER = 46,           // [Y] [o]  External power enable
 
 	// Used by the PSRAM !CS on the PGA2350. Bummer.
-	// GPIO_POWER_ADC = 47,    // [N] [i]  ADC connected to the 5v line, divided by 2
+	// GPIO_POWER_ADC = 47,    // [N] [i]  ADC connected to the 5V line, divided by 2
 #endif
 };
 

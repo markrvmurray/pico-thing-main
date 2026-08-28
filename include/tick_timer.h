@@ -17,7 +17,9 @@ class registers;
 class tick_timer {
 	static constexpr int64_t TICK_PERIOD_US = -20000; // 50 Hz, negative = fixed interval
 	registers &reg;
-	uint16_t control_offset;
+	// Kept so the constructor still names both registers, but the control
+	// register is serviced by the write ISR rather than from in here.
+	[[maybe_unused]] uint16_t control_offset;
 	uint16_t status_offset;
 	struct repeating_timer hw_timer{};
 	volatile bool irq_pending = false;
