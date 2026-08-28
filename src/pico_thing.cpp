@@ -2412,9 +2412,8 @@ __no_inline_not_in_flash_func(main_core1)()
 	printf("Core1 process starting\n");
 
 	// Trace pins - ISR set.  Named individually rather than as a run: they
-	// are consecutive on version 1 (37-39) but not on version 2, where 37 is
-	// TASK0 and TRACE_E has been pushed up to 46.
-	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D, GPIO_TRACE_E };
+	// sit on 37-38 on version 1 but 38-39 on version 2, where 37 is TASK0.
+	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
 	for (const uint8_t p : trace_pins) {
 		gpio_init(p);
 		gpio_put(p, false);
@@ -3111,7 +3110,7 @@ pio_shutdown()
 	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock_offset);
 
 	// --- Trace pins to hi-Z (not a consecutive run on version 2) ---
-	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D, GPIO_TRACE_E };
+	static const uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
 	for (const uint8_t p : trace_pins) {
 		gpio_put(p, false);
 		gpio_set_dir(p, GPIO_IN);
