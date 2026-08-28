@@ -3222,6 +3222,11 @@ main()
 
 	printf("\n\nPico2 MC6809E bus supervisor %s\n", DEVICE_VERSION);
 	printf("Pico2 MC6809E built on %s %s\n", __DATE__, __TIME__);
+	// Which pin map this image was built for.  The two revisions swap the
+	// task pins and the DAT fault signals over, so an image flashed onto
+	// the wrong board drives outputs into outputs - say so before anything
+	// else has a chance to scroll off the console.
+	printf("Pico2 MC6809E built for board revision %d\n", PICO_THING_BOARD_VERSION);
 #ifdef DEBUG
 	printf("Core0 build with DEBUG defined\n");
 #endif

@@ -184,10 +184,11 @@ target_sources(pico-thing
 
 # Board revision selects the GPIO map.  Both revisions carry the same signals:
 # version 1 puts TASK[4:0], TASK0 and the power enable on GPIO 40-46 with the
-# DAT fault signals on 32-36, version 2 puts the task pins on 32-37 and the
-# fault signals on 41-45.  Flashing the wrong one drives outputs into outputs,
-# so the default is the older board.
-set(PICO_THING_BOARD_VERSION 1 CACHE STRING "Pico-Thing board revision (1 or 2)")
+# DAT fault signals on 32-36, version 2 puts the task pins on 32-37, the power
+# enable on 40, the fault signals on 41-45 and the 5v ADC on 46.  Flashing the
+# wrong one drives outputs into outputs, so pass -DPICO_THING_BOARD_VERSION=1
+# when building for one of the older boards.
+set(PICO_THING_BOARD_VERSION 2 CACHE STRING "Pico-Thing board revision (1 or 2)")
 set_property(CACHE PICO_THING_BOARD_VERSION PROPERTY STRINGS 1 2)
 if(NOT PICO_THING_BOARD_VERSION MATCHES "^[12]$")
 	message(FATAL_ERROR

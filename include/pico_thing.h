@@ -6,7 +6,7 @@
 
 #pragma once
 
-#define DEVICE_VERSION "v0.1.0"
+#define DEVICE_VERSION "v0.2.0"
 
 extern volatile bool verbose;
 
@@ -18,10 +18,11 @@ extern volatile bool verbose;
 // Board revision. Both revisions carry the same signals, on different pins:
 // version 1 puts the task pins and the power enable at the bottom of the GPIO
 // range and the DAT fault signals above them, version 2 the other way round.
-// Set from CMake with -DPICO_THING_BOARD_VERSION=2; anything that includes
-// this header without the build system (the unit tests) gets version 1.
+// Set from CMake with -DPICO_THING_BOARD_VERSION=1 to build for the older
+// board; anything that includes this header without the build system (the
+// unit tests) gets version 2.
 #ifndef PICO_THING_BOARD_VERSION
-#define PICO_THING_BOARD_VERSION 1
+#define PICO_THING_BOARD_VERSION 2
 #endif
 
 #if PICO_THING_BOARD_VERSION != 1 && PICO_THING_BOARD_VERSION != 2
