@@ -123,9 +123,8 @@ mc6809::setup(enum run_state rs)
 void
 mc6809::init()
 {
-	POWER_ASSERT;
-	// 0.25s should be enough for power to stabilise
-	sleep_ms(250u);
+	// The 5V rail is brought up by the caller, which also confirms it
+	// actually came up before anything is driven into the guest logic.
 
 	// Assert reset until the guest is needed
 	gpio_init(GPIO_RESET);
@@ -180,7 +179,7 @@ mc6809::deinit()
 	gpio_put(GPIO_IRQ, false);
 	DEASSERT_IRQ;
 
-	POWER_DEASSERT;
+	// The caller drops the 5V rail once every pin is released.
 	old_bus_state = BUS_RUNNING;
 	bus_state = BUS_RUNNING;
 	run_state = RS_UNPOWERED;

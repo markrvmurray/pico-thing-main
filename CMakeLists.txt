@@ -196,11 +196,37 @@ if(NOT PICO_THING_BOARD_VERSION MATCHES "^[12]$")
 endif()
 message(STATUS "Pico-Thing board version ${PICO_THING_BOARD_VERSION}")
 
+# Version 2 reads the external 5V supply on ADC channel 6 and refuses to close
+# the load switch below this.  A nominal 5V supply may sag 10%, so the default
+# sits just above that: high enough to reject an absent or failing supply,
+# low enough not to reject a working one under load.
+set(PICO_THING_POWER_RAIL_MIN_VOLTS 4.5 CACHE STRING
+	"Minimum external 5V, in volts, before the load switch is closed")
+message(STATUS "Pico-Thing power rail minimum ${PICO_THING_POWER_RAIL_MIN_VOLTS}V")
+
+# The supply monitor drops the load switch below this.  Deliberately under the
+# arming threshold above: a rail sagging under load should not be switched off
+# and straight back on again, so there is hysteresis between the two.
+set(PICO_THING_POWER_RAIL_DROP_VOLTS 4.0 CACHE STRING
+	"External 5V, in volts, below which the load switch is dropped")
+message(STATUS "Pico-Thing power rail cutout ${PICO_THING_POWER_RAIL_DROP_VOLTS}V")
+
+# How long the rail is given to come up before the monitor is allowed to judge
+# it.  Closing the switch into the board's bulk capacitance pulls the supply
+# down until it has charged, and how far and for how long depends on how much
+# of the board is populated, so this wants raising as chips go in.
+set(PICO_THING_POWER_RAIL_SETTLE_MS 250 CACHE STRING
+	"Milliseconds the 5V rail is given to settle before it is judged")
+message(STATUS "Pico-Thing power rail settle ${PICO_THING_POWER_RAIL_SETTLE_MS}ms")
+
 # Core 1 stack is 0x800 (2 KiB) by default — too small for three nested
 # ISR levels (DMA prio-0 → GPIO prio-1 → thread) with FPU lazy stacking.
 target_compile_definitions(pico-thing PRIVATE
 	PICO_CORE1_STACK_SIZE=0x1000
 	PICO_THING_BOARD_VERSION=${PICO_THING_BOARD_VERSION}
+	PICO_THING_POWER_RAIL_MIN_VOLTS=${PICO_THING_POWER_RAIL_MIN_VOLTS}f
+	PICO_THING_POWER_RAIL_DROP_VOLTS=${PICO_THING_POWER_RAIL_DROP_VOLTS}f
+	PICO_THING_POWER_RAIL_SETTLE_MS=${PICO_THING_POWER_RAIL_SETTLE_MS}u
 )
 
 target_link_libraries(pico-thing

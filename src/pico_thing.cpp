@@ -901,6 +901,91 @@ adc_die_celsius(const uint16_t raw)
 	return 27.0f - ((static_cast<float>(raw)*3.3f/4096.0f) - 0.706f)/0.001721f;
 }
 
+// --- Supply monitor -----------------------------------------------------
+//
+// Sampled from a hardware alarm rather than from either core's loop.  The
+// console loop stalls for as long as whatever command it is running takes,
+// and Core 1's loop is the bus path and has no business blocking on an ADC
+// conversion, so neither can promise to look at the rail often enough.  The
+// alarm fires on Core 0 whatever those loops are doing.
+//
+// It is also the only thing that touches the ADC.  There is one input mux,
+// so a sample taken anywhere else could be preempted between selecting the
+// channel and reading it, and both readings would be wrong.  Everything else
+// reads the counts cached here.
+
+// Below this the supply is no longer usable and the load switch is dropped.
+// Set from CMake with -DPICO_THING_POWER_RAIL_DROP_VOLTS=<volts>.
+#ifndef PICO_THING_POWER_RAIL_DROP_VOLTS
+#define PICO_THING_POWER_RAIL_DROP_VOLTS 4.0f
+#endif
+static constexpr float POWER_RAIL_DROP_VOLTS = PICO_THING_POWER_RAIL_DROP_VOLTS;
+
+// How long the rail is given to charge the board's bulk capacitance before
+// the monitor is allowed to judge it.  Set from CMake with
+// -DPICO_THING_POWER_RAIL_SETTLE_MS=<milliseconds>.
+#ifndef PICO_THING_POWER_RAIL_SETTLE_MS
+#define PICO_THING_POWER_RAIL_SETTLE_MS 250u
+#endif
+static constexpr uint32_t RAIL_SETTLE_MS = PICO_THING_POWER_RAIL_SETTLE_MS;
+
+static constexpr uint32_t RAIL_MONITOR_MS = 20u;
+// A supply that is genuinely gone stays gone.  Requiring several samples in a
+// row rides out the dip a bus cycle or an inrush transient puts on the rail,
+// the same way the Core 1 watchdog waits for consecutive misses.
+static constexpr uint32_t RAIL_LOW_SAMPLES = 3u;
+
+static repeating_timer rail_timer;
+static volatile uint16_t rail_raw = 0u;		// counts, external 5V through the divider
+static volatile uint16_t rail_trip_raw = 0u;	// the sample that opened the switch
+static volatile uint16_t die_raw = 0u;		// counts, internal temperature sensor
+static volatile uint32_t rail_low_count = 0u;	// consecutive samples below the cutout
+static volatile uint64_t rail_settle_until = 0u;	// us since boot; no judging before this
+static volatile bool rail_sampled = false;	// at least one pass has run
+static volatile bool rail_collapsed = false;	// set here, acted on by the console loop
+
+static bool
+power_rail_monitor(repeating_timer *)
+{
+#if PICO_THING_BOARD_VERSION >= 2
+	adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
+	const uint16_t raw = adc_read();
+	rail_raw = raw;
+	// Opening the switch is a single gpio_put, which is all that can safely
+	// be done from an alarm callback - and it is the part that matters.
+	// Stopping the PIOs, the DMA and Core 1 needs the console loop, so that
+	// is left to it.
+	if (POWER_IS_ASSERTED && !rail_collapsed && time_us_64() >= rail_settle_until) {
+		if (adc_bus_volts(raw) < POWER_RAIL_DROP_VOLTS) {
+			if (++rail_low_count >= RAIL_LOW_SAMPLES) {
+				// Keep the sample that decided it.  By the time the
+				// console loop reports this the switch is open, the
+				// load is gone and the rail has recovered, so a
+				// reading taken then says nothing about why.
+				rail_trip_raw = raw;
+				POWER_DEASSERT;
+				rail_collapsed = true;
+			}
+		} else
+			rail_low_count = 0u;
+	}
+#endif
+	// The die sensor is internal, on the channel above the pins
+	adc_select_input(NUM_ADC_CHANNELS - 1);
+	die_raw = adc_read();
+	rail_sampled = true;
+	return true;
+}
+
+static void
+power_rail_monitor_start()
+{
+	add_repeating_timer_ms(static_cast<int32_t>(RAIL_MONITOR_MS),
+			       power_rail_monitor, nullptr, &rail_timer);
+	while (!rail_sampled)		// so the first power-on has a reading to judge
+		tight_loop_contents();
+}
+
 void
 status_gather(status_snapshot_t *s)
 {
@@ -914,17 +999,15 @@ status_gather(status_snapshot_t *s)
 		s->task_history[i] = MC6809.get_task_history(i);
 
 	s->power = POWER_IS_ASSERTED;
+	// Both readings come from the supply monitor's cache; nothing else may
+	// touch the ADC mux.  Version 1 has the power enable on GPIO 46 rather
+	// than a divider, so it has no supply reading to report.
 #if PICO_THING_BOARD_VERSION >= 2
-	// The 5V line is divided by two onto GPIO 46, which only carries an
-	// ADC input on version 2 - version 1 has the power enable there.
-	adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
-	s->voltage = adc_read();
+	s->voltage = rail_raw;
 #else
 	s->voltage = 0u;           // no bus voltage divider on version 1
 #endif
-	// The die temperature sensor is internal, on the channel above the pins
-	adc_select_input(NUM_ADC_CHANNELS - 1);
-	s->temperature = adc_read();
+	s->temperature = die_raw;
 	s->reset = RESET_IS_ASSERTED;
 	s->halt = HALT_IS_ASSERTED;
 	s->nmi = NMI_IS_ASSERTED;
@@ -1175,7 +1258,7 @@ status_json(const status_snapshot_t *s)
 	printf("}\n");
 }
 
-static void set_power();
+static bool set_power();
 static void reset_power();
 
 void
@@ -2318,6 +2401,22 @@ poll_console()
 	bool watchdog_stalled = false;
 
 	for (;;) {
+		// The supply monitor has already opened the load switch; finish the
+		// job here, where stopping Core 1, the PIOs and the DMA is safe.
+		// The console itself is untouched, so the supply can be looked at
+		// and "power on" tried again.
+		if (rail_collapsed) {
+			rail_collapsed = false;
+			printf("\n*** external 5V collapsed to %.2fV - guest powered down ***\n",
+			       adc_bus_volts(rail_trip_raw));
+			printf("    (reads %.2fV now the load is off)\n",
+			       adc_bus_volts(rail_raw));
+			if (!MC6809.is_unpowered())
+				reset_power();
+			printf("Console still up; check the supply, then \"power on\".\n");
+			prompted = false;
+		}
+
 		if (absolute_time_diff_us(get_absolute_time(), watchdog_next) <= 0) {
 			const uint32_t cur_loop = core1_loop_count;
 			const uint32_t cur_isr = core1_isr_count;
@@ -3162,9 +3261,58 @@ pio_shutdown()
 	gpio_set_dir(GPIO_NMI_BLOCK, GPIO_IN);
 }
 
+// How much external 5V has to be there before the load switch is closed.
+// Set from CMake with -DPICO_THING_POWER_RAIL_MIN_VOLTS=<volts>; the fallback
+// here is for anything that compiles this without the build system.  A
+// nominal 5V supply may sag 10%, so the value sits just above that: high
+// enough to reject an absent or failing supply, low enough to accept a
+// working one under load.
+#ifndef PICO_THING_POWER_RAIL_MIN_VOLTS
+#define PICO_THING_POWER_RAIL_MIN_VOLTS 4.5f
+#endif
+static constexpr float POWER_RAIL_MIN_VOLTS = PICO_THING_POWER_RAIL_MIN_VOLTS;
+
+// Close the load switch, and give the rail time to settle before anything is
+// driven into the guest logic.  On version 2 the external supply is measured
+// first: ADC channel 6 reads it through the divider ahead of the switch, so
+// it can be checked while the board itself is still unpowered.  No supply
+// means the switch stays open - driving reset, halt and the interrupt lines
+// into logic that has no rail is how latch-up happens.
+static bool
+power_rail_enable()
+{
+#if PICO_THING_BOARD_VERSION >= 2
+	const float volts = adc_bus_volts(rail_raw);
+	if (volts < POWER_RAIL_MIN_VOLTS) {
+		printf("Core0 external 5V not present (%.2fV, need %.2fV) - power not switched on\n",
+		       volts, POWER_RAIL_MIN_VOLTS);
+		return false;
+	}
+	printf("Core0 external 5V present at %.2fV\n", volts);
+#endif
+	// Hold the monitor off until the rail has charged the board.  Closing
+	// the switch pulls the supply down until the bulk capacitance is full,
+	// and that dip is not a collapse.
+	rail_collapsed = false;
+	rail_low_count = 0u;
+	rail_settle_until = time_us_64() + (RAIL_SETTLE_MS * 1000ull);
+	POWER_ASSERT;
+	sleep_ms(RAIL_SETTLE_MS);
+	return true;
+}
+
 static void
+power_rail_disable()
+{
+	POWER_DEASSERT;
+}
+
+static bool
 set_power()
 {
+	if (!power_rail_enable())
+		return false;
+
 	// Setup !Reset, !Halt, and the interrupt pins.
 	MC6809.init();
 	MC6809.set_setup_callback([] {
@@ -3183,6 +3331,7 @@ set_power()
 	printf("Core0 emulated RAM and devices initialised\n");
 
 	multicore_launch_core1(main_core1);
+	return true;
 }
 
 static void
@@ -3207,6 +3356,9 @@ reset_power()
 
 	MC6809.deinit();
 	printf("Core0 guest pins released\n");
+
+	power_rail_disable();
+	printf("Core0 5V rail off\n");
 }
 
 int
@@ -3249,13 +3401,15 @@ main()
 	adc_gpio_init(GPIO_POWER_ADC);   // 5V divider, version 2 only
 #endif
 	adc_set_temp_sensor_enabled(true);
+	power_rail_monitor_start();
+	printf("Core0 supply monitor sampling every %" PRIu32 "ms\n", RAIL_MONITOR_MS);
 	usb_init();
 	printf("Core0 initialised USB\n");
 
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
 	gpio_set_dir(GPIO_POWER, GPIO_OUT);
-	set_power();
+	const bool powered = set_power();
 
 	tm tm = build_time_tm();
 	aon_timer_stop();
@@ -3263,25 +3417,33 @@ main()
 
 	printf("Core0 ready!\n");
 
-	// Wait for Core 1's main loop to be running before executing
-	// startup commands — core1_initialised is set before the loop
-	// starts, but devices need a few loop iterations to settle.
-	while (core1_loop_count < 100u) {
-		sleep_ms(1u);
-		usb_poll();
-	}
+	// Nothing below runs on a board whose 5V rail never came up: Core 1
+	// was not launched, so the wait loop would never finish, and the
+	// startup commands have no guest to talk to.  The same goes for a rail
+	// that came up and then collapsed while the guest was starting - the
+	// switch is already open by then.  Fall through to the console either
+	// way, so the fault can be looked at and "power on" retried.
+	if (powered && !rail_collapsed) {
+		// Wait for Core 1's main loop to be running before executing
+		// startup commands — core1_initialised is set before the loop
+		// starts, but devices need a few loop iterations to settle.
+		while (core1_loop_count < 100u) {
+			sleep_ms(1u);
+			usb_poll();
+		}
 
-	// Startup commands — executed once before entering the console loop
-	static const char *startup_commands[] = {
-		"run 0",
-		nullptr
-	};
-	for (const char **cmd = startup_commands; *cmd != nullptr; cmd++) {
-		char cmdbuf[COMMAND_BUFFER_LEN];
-		strncpy(cmdbuf, *cmd, sizeof(cmdbuf) - 1);
-		cmdbuf[sizeof(cmdbuf) - 1] = '\0';
-		printf("> %s\n", cmdbuf);
-		process_command(cmdbuf);
+		// Startup commands — executed once before entering the console loop
+		static const char *startup_commands[] = {
+			"run 0",
+			nullptr
+		};
+		for (const char **cmd = startup_commands; *cmd != nullptr; cmd++) {
+			char cmdbuf[COMMAND_BUFFER_LEN];
+			strncpy(cmdbuf, *cmd, sizeof(cmdbuf) - 1);
+			cmdbuf[sizeof(cmdbuf) - 1] = '\0';
+			printf("> %s\n", cmdbuf);
+			process_command(cmdbuf);
+		}
 	}
 
 	poll_console();
