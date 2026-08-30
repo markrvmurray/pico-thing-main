@@ -32,12 +32,12 @@ extern volatile bool verbose;
 // === Pin map ===
 enum {
 	// Fast/timing-critical - GPIO Bank0, done by PIO
-	//	GPIO_E = 0,		// [ ] [o]  E clock
-	//	GPIO_Q = 1,		// [ ] [o]  Q clock
-	//	GPIO_RW = 2,		// [ ] [i]  Bus R/!W
-	//	GPIO_A_BASE = 3,	// [ ] [i]  Address bus, 6 pins
-	//	GPIO_D_BASE = 9,	// [ ] [io] Data bus, 8 pins
-	//	GPIO_CS = 17,		// [ ] [i]  Device !CS
+	//	GPIO_E = 0,		// [Y] [o]  E clock
+	//	GPIO_Q = 1,		// [Y] [o]  Q clock
+	//	GPIO_RW = 2,		// [Y] [i]  Bus R/!W
+	//	GPIO_A_BASE = 3,	// [Y] [i]  Address bus, 6 pins
+	//	GPIO_D_BASE = 9,	// [Y] [io] Data bus, 8 pins
+	//	GPIO_CS = 17,		// [Y] [i]  Device !CS
 
 	// Fast/cycle-critical - GPIO Bank0, done by ISR
 	// BS/BA and BUSY/LIC/AVMA must be on consecutive pin runs in this order
@@ -54,35 +54,35 @@ enum {
 	GPIO_IRQ = 26,  // [ ] [o*] !IRQ
 
 	// Fast/timing-critical - GPIO Bank0 - will be removed when debugging is done
-	//	GPIO_TRACE_RD = 27,	// [ ] [o]  PIO side-set temporary debugging output pins for the scope
-	//	GPIO_TRACE_WR = 28,	// [ ] [o]  PIO side-set temporary debugging output pins for the scope
+	//	GPIO_TRACE_RD = 27,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
+	//	GPIO_TRACE_WR = 28,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
 
 	// Slow - set at a leisurely pace at human-user speeds
-	GPIO_RESET = 29, // [ ] [o]  !RESET
+	GPIO_RESET = 29, // [Y] [o]  !RESET
 
 	// Default assignment
-	GPIO_UART_TX = 30, // [ ] [o]  RP2xxx UART Tx
-	GPIO_UART_RX = 31, // [ ] [i]  RP2xxx UART Rx
+	GPIO_UART_TX = 30, // [Y] [o]  RP2xxx UART Tx
+	GPIO_UART_RX = 31, // [Y] [i]  RP2xxx UART Rx
 
 #if PICO_THING_BOARD_VERSION >= 2
 	// Slow - guest instruction-level timing
 	GPIO_TASK_BASE = 32,       // [ ] [o]  TASK[4:0], five pins
-	GPIO_TASK_0 = 37,          // [ ] [o]  TASK0, set when the task number is zero
+	GPIO_TASK_0 = 37,          // [Y] [o]  TASK0, set when the task number is zero
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
 	// NOTE: version 1 has these on 37-38, but 37 is TASK0/Root here, so
 	// they shift up one to 38-39.  Provisional - see the pin map.
-	GPIO_TRACE_C = 38,         // [ ] [o]  Temporary debugging output pins for the scope
-	GPIO_TRACE_D = 39,         // [ ] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_C = 38,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_D = 39,         // [Y] [o]  Temporary debugging output pins for the scope
 
 	// Slow - set at a leisurely pace at human-user speeds
-	GPIO_POWER = 40,           // [ ] [o]  External power enable
+	GPIO_POWER = 40,           // [Y] [o]  External power enable
 
 	// Medium - per-instruction timing
 	GPIO_FAULT = 41,           // [ ] [i]  Attempt to read or write unassigned memory
 	GPIO_NMI_BLOCK = 42,       // [ ] [o]  Prevent DAT Fault NMI
 	GPIO_A_HI_BASE = 43,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
-	GPIO_POWER_ADC = 46,       // [ ] [i]  ADC connected to the 5V line, divided by 2
+	GPIO_POWER_ADC = 46,       // [Y] [i]  ADC connected to the 5V line, divided by 2
 #else
 	// Version 1: the task pins and the power enable sit at the bottom of the
 	// range, so the DAT fault signals go in the free run above them.
