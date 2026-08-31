@@ -129,6 +129,24 @@ static uint16_t watchpoint_saved_nmi_vector = 0u;
 // A separate flag also avoids racing the read-modify-write on pending_interrupts.
 static volatile bool watchpoint_nmi_pending = false;
 
+// Take the watchpoint down and clear the evidence that it fired.  The BREAK
+// snippet leaves the stacked PC in SHARED[10:11], and anything that finds it
+// non-zero while the watchpoint is armed reads it as a fresh hit - so a report
+// that does not clear it gets made again by the next thing to look.  Restoring
+// the NMI vector matters too: while armed it points at BREAK rather than at
+// wherever the guest had it.
+static void
+watchpoint_disarm()
+{
+	if (watchpoint_armed) {
+		reg[REGISTER_VECTOR_NMI_OFFSET] = watchpoint_saved_nmi_vector;
+		watchpoint_armed = false;
+	}
+	watchpoint_nmi_pending = false;
+	reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
+	reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
+}
+
 static volatile bool q_rising_edge = false;
 static volatile bool q_falling_edge = false;
 static volatile bool core1_initialised = false;
@@ -2149,6 +2167,10 @@ status_done:
 				printf("  Watchpoint: FAIL (no break detected)\n");
 				success = false;
 			}
+			// Reported here, so leave nothing for the console loop to
+			// report a second time - and do not leave the guest's NMI
+			// vector pointing at BREAK once the test is over.
+			watchpoint_disarm();
 
 			printf("Interrupt chunk test: %s\n", success ? "ALL PASS" : "FAIL");
 			break;
@@ -2707,7 +2729,7 @@ poll_console()
 				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 8]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 9]),
 				       wp_pc);
 				printf("  Write to vector area at PC=$%04X\n", wp_pc);
-				watchpoint_armed = false;
+				watchpoint_disarm();
 				MC6809.stop();
 				prompted = false;
 			}
