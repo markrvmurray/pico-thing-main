@@ -277,7 +277,41 @@ trace_hw_start()
 // scope.  With !NMI wired, a single bad pointer would then NMI-storm the guest
 // with nothing to stop it, and SYSTEM_DAT_FAULT would hold the latest fault
 // rather than the first.
-#define DAT_FAULT_AUTO_BLOCK 1
+// Set from CMake with -DPICO_THING_DAT_FAULT_AUTO_BLOCK=0, so bring-up does
+// not need a source edit.
+#ifndef PICO_THING_DAT_FAULT_AUTO_BLOCK
+#define PICO_THING_DAT_FAULT_AUTO_BLOCK 1
+#endif
+#define DAT_FAULT_AUTO_BLOCK PICO_THING_DAT_FAULT_AUTO_BLOCK
+
+// How many Q-risings to wait before raising NMIBlock after a fault.
+//
+// The GAL generates the fault NMI as a registered output clocked by Q:
+//
+//	NMI.D = MMU_dat & Last_Block & !NMIBlock;
+//
+// so raising the mask in the same handler pass that first sees the fault
+// removes the NMI's D term before the 6809 has had a full E cycle to sample
+// it, and the interrupt the fault was supposed to raise never arrives.  The
+// mask still has to go up - a guest dying of a bad pointer would otherwise
+// NMI-storm - but not until the NMI it is masking has been seen.
+//
+// The window has to outlast the instruction that faulted, not just one E
+// cycle.  The 6809 samples !NMI on Q-falling of the cycle before LIC and only
+// acts on it at an instruction boundary, so a mask that goes up two cycles
+// after the fault can still be up before the boundary arrives - and the
+// longest instructions run to about twenty cycles.  The default clears that
+// with room to spare.  Set from CMake with
+// -DPICO_THING_DAT_FAULT_BLOCK_DELAY=<cycles>; a wider window is also what
+// makes the fault NMI visible on a scope.
+#ifndef PICO_THING_DAT_FAULT_BLOCK_DELAY
+#define PICO_THING_DAT_FAULT_BLOCK_DELAY 32u
+#endif
+static constexpr uint8_t DAT_FAULT_BLOCK_DELAY = PICO_THING_DAT_FAULT_BLOCK_DELAY;
+
+// Counts down to the NMIBlock assertion above.  Zero means idle, and also
+// means the sampler is free to latch the next fault.
+static volatile uint8_t dat_fault_block_countdown = 0u;
 
 // Set when a DAT fault is latched, cleared when the resulting NMI takes its
 // vector.  Distinguishes a fault NMI from the timer and watchpoint NMIs, which
@@ -379,6 +413,12 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 				break;
 			}
 		}
+		// Deferred NMIBlock assertion after a DAT fault, giving the NMI the
+		// GAL raised time to be seen before its D term is taken away.
+		if (dat_fault_block_countdown > 0u && --dat_fault_block_countdown == 0u) {
+			gpio_put(GPIO_NMI_BLOCK, true);
+			reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
+		}
 		// Deferred task restore after RTI detection
 		MC6809.tick_rti_countdown();
 		// E-cycle countdown NMI timer
@@ -449,18 +489,39 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		//
 		// DAT_FAULT_AUTO_BLOCK == 0 suspends all of that for bring-up: see
 		// the note by the definition.
-		if (high_pins.bits.FAULT
+		if (high_pins.bits.FAULT && dat_fault_block_countdown == 0u
 		    && (!DAT_FAULT_AUTO_BLOCK || !high_pins.bits.NMI_BLOCK)) {
+			// Arm the mask rather than raising it here: see the note by
+			// DAT_FAULT_BLOCK_DELAY.  Until it expires this countdown also
+			// stands in for the mask as the "already latched" test above, so
+			// a second fault inside the window cannot overwrite the first.
 			if constexpr (DAT_FAULT_AUTO_BLOCK)
-				gpio_put(GPIO_NMI_BLOCK, true);
+				dat_fault_block_countdown = DAT_FAULT_BLOCK_DELAY;
 			// Tell the BUS_IRQ case that the NMI now on its way is a fault,
 			// so it can drop the guest into task 0 for the handler.
 			dat_fault_nmi_pending = true;
-			// Nothing else writes bits 2-6, and NMIBlock was clear on the way
-			// in, so the whole byte can be stored rather than merged.
+			// And ask for that NMI rather than relying on the GAL's.
+			//
+			// The GAL raises one - NMI.D = MMU_dat & Last_Block & !NMIBlock -
+			// but it lasts only as long as the faulting access is on the bus,
+			// because the D term goes false the moment the access ends.  That
+			// puts the whole pulse inside the faulting instruction's own last
+			// cycle, and the 6809 samples !NMI on Q-falling of the cycle
+			// BEFORE the last one, so it arrives a cycle too late for the
+			// boundary it caused and is gone before the next.  Seen on a bus
+			// trace as N asserted on the same row as LIC and clear again two
+			// rows later, with no vector fetch anywhere after it.
+			//
+			// Going through pending_interrupts asserts from the next Q-rising
+			// and holds the pin from the handler, which is the path the
+			// watchpoint and the irq tests already use and which is known to
+			// be taken.  The GAL's pulse becomes confirmation rather than the
+			// only mechanism.
+			pending_interrupts |= PEND_NMI;
+			// Nothing else writes bits 2-6.  The NMIBlock bit is not set
+			// here: it mirrors the pin, and the pin is not up yet.
 			reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(
 				DAT_FAULT_FAULT
-				| (DAT_FAULT_AUTO_BLOCK ? DAT_FAULT_NMI_BLOCK : 0u)
 				| (gpio_get(GPIO_RW) ? DAT_FAULT_RW : 0u));
 			// The task pins are read back rather than taken from MC6809.task,
 			// so this is what the DAT hardware itself saw.
@@ -634,6 +695,10 @@ __time_critical_func(dma_bus_write_irq_handler())
 			// 1 (Fault and R/!W) are owned by the Q-rising sampler and are
 			// read-only, so writes leave them alone.
 			const bool block = (wval & DAT_FAULT_NMI_BLOCK) != 0u;
+			// An explicit write wins over a pending automatic assertion:
+			// leaving the countdown armed would raise the mask again a
+			// cycle or two after the guest had just cleared it.
+			dat_fault_block_countdown = 0u;
 			gpio_put(GPIO_NMI_BLOCK, block);
 			if (block)
 				reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
@@ -1441,7 +1506,8 @@ process_command(char *buf)
 		"                           absolute, so offset dumps line up\n"
 		"  trace <vector>     (tr)  arm on swi|swi2|swi3|nmi|firq|irq\n"
 		"  break [addr|r]     (br)  breakpoint; r resumes\n"
-		"  irq <0-7>          (ir)  interrupt tests; 7 is NMIBlock latency\n"
+		"  irq <0-8>          (ir)  interrupt tests; 7 is NMIBlock latency,\n"
+		"                           8 is the DAT fault path\n"
 		"  loop <type> <addr> (lo)  hammer addr for scope work.  The type is\n"
 		"                           CASE-SENSITIVE: lower case is a byte access,\n"
 		"                           upper case a word:\n"
@@ -2009,6 +2075,157 @@ status_done:
 			// Consume the one-shot: with the CPU about to be stopped it can
 			// never fill, and an armed trace keeps the E-fall interrupt alive.
 			MC6809.trace_stop();
+			break;
+		} else if (hexnum == 8) {
+			// DAT fault.  The snippet unmaps one 8kB block of the running
+			// task and then reads from it; the fault sampler latches the
+			// fault, its direction, and the task and page the DAT saw.
+			//
+			// Pages 1, 2 and 4 drive one A_HI line high at a time and 6
+			// drives two at once, so a line stuck high, stuck low or
+			// crossed with another cannot pass all four.  The reported page
+			// is the only evidence for those pins, and it is read back from
+			// the bus rather than from anything the Pico already knows.
+			//
+			// Each page is faulted twice, once by a read and once by a
+			// write, so the direction the sampler latches is checked against
+			// a known answer rather than merely reported.  The later cases
+			// fault from a non-zero task: the latched task is read back off
+			// the task pins, so a task of zero every time - which is what
+			// five lines stuck low would give - is not enough to prove them.
+			//
+			// A fault is fatal to the access that caused it, so every page
+			// and direction needs its own run.
+			printf("DAT fault test\n");
+			// Extended LDA and STA differ in one bit, take the same operand,
+			// and the accumulator already holds the byte a store would write,
+			// so the direction of the faulting access is a one-byte patch.
+			//
+			// The pages walk each A_HI line alone and then two together; the
+			// tasks walk each TASK line alone and then all five together.  A
+			// line stuck either way, or crossed with its neighbour, fails
+			// somewhere in that set.
+			static constexpr struct {
+				uint8_t task;
+				uint8_t page;
+				uint8_t opcode;
+				char    dir;
+				bool    reads;
+			} fault_cases[] = {
+				{  0u, 1u, 0xB6u, 'R', true  }, {  0u, 1u, 0xB7u, 'W', false },
+				{  0u, 2u, 0xB6u, 'R', true  }, {  0u, 2u, 0xB7u, 'W', false },
+				{  0u, 4u, 0xB6u, 'R', true  }, {  0u, 4u, 0xB7u, 'W', false },
+				{  0u, 6u, 0xB6u, 'R', true  }, {  0u, 6u, 0xB7u, 'W', false },
+				{  1u, 1u, 0xB6u, 'R', true  },
+				{  2u, 1u, 0xB6u, 'R', true  },
+				{  4u, 1u, 0xB6u, 'R', true  },
+				{  8u, 1u, 0xB6u, 'R', true  },
+				{ 16u, 1u, 0xB6u, 'R', true  },
+				{ 31u, 1u, 0xB6u, 'R', true  },
+			};
+			bool all_pass = true;
+			for (const auto &d : fault_cases) {
+				const uint8_t page = d.page;
+				MC6809.stop();
+				sleep_ms(1u);	// let the Q-rising handler see the reset
+
+				// Unmap the block from task zero, which is the only task the
+				// GAL lets write DAT RAM - MMU_cs is qualified by Root.  This
+				// runs a copy snippet of its own, so it has to finish before
+				// the fault snippet is laid down.
+				task_pins_update(MC6809.task_change(0u));
+				const uint8_t unavailable = 0xFFu;
+				if (!copy(OUTWARDS, 1u, static_cast<uint16_t>(0xFE00u + d.task * 8u + page),
+					  &unavailable)) {
+					printf("  task %2u page %u %c: FAIL  could not write the DAT entry\n",
+					       d.task, page, d.dir);
+					all_pass = false;
+					continue;
+				}
+
+				// Then enter the task the fault is to come from.  A reset does
+				// not disturb the task, so this survives the start below.
+				MC6809.stop();
+				sleep_ms(1u);
+				task_pins_update(MC6809.task_change(d.task));
+
+				snippet_copy(DAT_FAULT);
+				// Only the access itself is patched: the opcode picks the
+				// direction, the high byte picks the page.
+				reg[REGISTER_SNIPPET_OFFSET + 4u] = d.opcode;
+				reg[REGISTER_SNIPPET_OFFSET + 5u] = static_cast<uint8_t>(page << 5);
+				// Aim the fault's NMI at the SYNC that ends the snippet, so
+				// the handler parks instead of re-entering the code that
+				// faulted and faulting again.
+				reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 7u);
+
+				// The mask and the latch are cleared by the reset that
+				// start() performs, so there is deliberately no local
+				// workaround here: if that ever stops happening this test
+				// should fail rather than paper over it.
+				const uint32_t nmi_acked = MC6809.get_irq_ack_count(INTERRUPT_NMI);
+				MC6809.start();
+				uint32_t waited = 0u;
+				while (!(static_cast<uint8_t>(reg[SYSTEM_DAT_FAULT]) & DAT_FAULT_FAULT)) {
+					sleep_us(10u);
+					if (++waited > 100000u)
+						break;
+				}
+				// The latch is not the end of it.  The 6809 has to finish the
+				// faulting instruction, run the one after it, and push twelve
+				// bytes before it fetches the NMI vector - twenty-odd cycles
+				// on a bus trace.  Stopping as soon as the fault appears takes
+				// the clock away before any of that happens, which reads as an
+				// undelivered NMI when the guest was simply never given time.
+				for (uint32_t settle = 0u;
+				     settle < 1000u
+				     && MC6809.get_irq_ack_count(INTERRUPT_NMI) == nmi_acked;
+				     settle++)
+					sleep_us(10u);
+				// Sampled before the stop, so the task is the one the fault
+				// handler left behind rather than anything the stop does.
+				const bool delivered =
+					MC6809.get_irq_ack_count(INTERRUPT_NMI) > nmi_acked;
+				const uint8_t task_after = MC6809.task_get();
+				MC6809.stop();
+
+				const uint8_t status = static_cast<uint8_t>(reg[SYSTEM_DAT_FAULT]);
+				const uint8_t loc = static_cast<uint8_t>(reg[SYSTEM_DAT_FAULT_LOC]);
+				const uint8_t got_page = static_cast<uint8_t>(loc & DAT_FAULT_LOC_PAGE_MASK);
+				const uint8_t got_task = static_cast<uint8_t>(
+					(loc & DAT_FAULT_LOC_TASK_MASK) >> DAT_FAULT_LOC_TASK_SHIFT);
+				const bool raised = (status & DAT_FAULT_FAULT) != 0u;
+				const bool got_reads = (status & DAT_FAULT_RW) != 0u;
+				// Delivery is checked as well as latching.  The sampler
+				// records a fault whether or not the 6809 ever takes the NMI,
+				// so a test that stopped at "raised" passed for a long time
+				// while no interrupt was reaching the processor at all.  The
+				// switch to task zero is a second, independent witness: it
+				// happens only on the NMI vector fetch.
+				const bool ok = raised && got_page == page && got_task == d.task
+						&& got_reads == d.reads
+						&& delivered && task_after == 0u;
+				printf("  task %2u page %u %c: %-4s  raised=%s  dir=%c  page=%u  task=%u"
+				       "  nmi=%s  ->task%u\n",
+				       d.task, page, d.dir, ok ? "PASS" : "FAIL", raised ? "yes" : "no",
+				       got_reads ? 'R' : 'W', got_page, got_task,
+				       delivered ? "yes" : "no", task_after);
+				if (!raised)
+					printf("    (no fault seen in %" PRIu32 "ms)\n", waited / 100u);
+				all_pass = all_pass && ok;
+			}
+			// Put back the NMI vector and the task, so nothing after this
+			// inherits the test's rigging.  The fault handler switches to
+			// task zero itself on every fault, but a case that failed to
+			// fault would not have, and would leave the guest somewhere odd.
+			//
+			// The fault mask is deliberately left as the last fault set it.
+			// That is not rigging, it is the state a fault is supposed to
+			// leave behind - an unhandled fault masks further ones until the
+			// guest is reset, and reset is what lowers it.
+			reg[REGISTER_VECTOR_NMI_OFFSET] = REGISTER_SNIPPET;
+			task_pins_update(MC6809.task_change(0u));
+			printf("DAT fault test: %s\n\n", all_pass ? "ALL PASS" : "FAIL");
 			break;
 		} else {
 		irq_chunk_test:
@@ -3519,6 +3736,19 @@ set_power()
 		aux_serial.reset();
 		watchpoint_armed = false;
 		watchpoint_nmi_pending = false;
+		// Lower the DAT fault mask.  A fault raises it and only a guest
+		// write to SYSTEM_DAT_FAULT lowers it again, so a guest that
+		// faulted and did not clear it - one that was killed by the fault,
+		// or a test that parked instead of handling it - would hand the
+		// mask to whatever ran next.  Fault detection would then be
+		// silently dead: the fault line still asserts on every bad access
+		// and the sampler ignores all of them.  Reset is the point at which
+		// the guest stops being the one that faulted, so the mask goes down
+		// here with the rest of the per-run state.
+		dat_fault_block_countdown = 0u;
+		gpio_put(GPIO_NMI_BLOCK, false);
+		reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(0u);
+		reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(0u);
 	});
 	MC6809.set_task_pin_callback(task_pins_update);
 	printf("Core0 guest powered on and initialised\n");

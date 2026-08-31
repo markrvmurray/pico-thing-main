@@ -235,6 +235,29 @@ NmiBlk	LDA	#$01
 	CLR	DATFLT	clear it again - the re-arm path
 	SYNC
 
+* Touch an 8kB block that the Pico has already unmapped, from a task the
+* Pico has already entered, and take the fault.  Two bytes are patched per
+* run: the opcode of the touch and the address it touches.  Extended LDA is
+* $B6 and extended STA is $B7, so one bit picks whether the fault is a read
+* or a write.
+*
+* LDS comes first, and not for the sake of the stack.  The 6809 masks NMI
+* from reset until the stack pointer is loaded, so without it the fault NMI
+* is asserted on the pin and ignored by the processor - which on a bus trace
+* looks exactly like a fault that was never raised.  START is in block 7,
+* the page the GAL leaves untranslated, so a stack descending from the top
+* of it lands in real memory whatever the DAT is doing to the rest of the
+* map.
+*
+* Unmapping the block and entering the task are the Pico's job rather than
+* this snippet's.  DAT RAM is only writable from task zero, so those two
+* have to happen in that order, and doing them here as well as the LDS does
+* not fit in sixteen bytes.
+	ORG	START
+DatFlt	LDS	#DATRAM	stack descends through the fixed block, below the DAT
+	LDA	$6000	opcode and address patched by the Pico - the faulting access
+	SYNC		park; the NMI vector is aimed here
+
 	ORG	CHUNK
 	INCLUDEBIN	../chunk/dl.raw
 
@@ -523,6 +546,8 @@ str.TK              fcn       "  TK = "
 	FCC	"BREAK"
 	FCB	' '
 	FCC	"NMI_BLOCK_LAT"
+	FCB	' '
+	FCC	"DAT_FAULT"
 	FCB	' '
 	FCC	"DOWNLOAD"
 	FCB	' '

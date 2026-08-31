@@ -747,9 +747,14 @@ TEST_CASE("irq command", "[parser][irq]")
 		REQUIRE(parse("irq 7", &cmd));
 		CHECK(cmd.irq.testnum == 7);
 	}
-	SECTION("irq 8 (out of range) is rejected")
+	SECTION("irq 8 is the DAT fault test")
 	{
-		CHECK_FALSE(parse("irq 8", &cmd));
+		REQUIRE(parse("irq 8", &cmd));
+		CHECK(cmd.irq.testnum == 8);
+	}
+	SECTION("irq 9 (out of range) is rejected")
+	{
+		CHECK_FALSE(parse("irq 9", &cmd));
 		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
 	}
 }

@@ -219,6 +219,21 @@ set(PICO_THING_POWER_RAIL_SETTLE_MS 250 CACHE STRING
 	"Milliseconds the 5V rail is given to settle before it is judged")
 message(STATUS "Pico-Thing power rail settle ${PICO_THING_POWER_RAIL_SETTLE_MS}ms")
 
+# Whether a DAT fault automatically raises NMIBlock.  Zero suspends that for
+# bring-up, so a faulting loop keeps re-raising the fault NMI instead of
+# masking itself after the first one - which is what makes it visible on a
+# scope.  A guest with a bad pointer will then NMI-storm, so this is a
+# measurement setting, not one to leave on.
+set(PICO_THING_DAT_FAULT_AUTO_BLOCK 1 CACHE STRING
+	"Raise NMIBlock automatically on a DAT fault (0 for scope bring-up)")
+# E cycles between a DAT fault and NMIBlock going up.  Has to outlast the
+# faulting instruction, since the 6809 only acts on NMI at an instruction
+# boundary - raise it further to widen the pulse for a scope.
+set(PICO_THING_DAT_FAULT_BLOCK_DELAY 32 CACHE STRING
+	"E cycles from a DAT fault to NMIBlock being raised")
+message(STATUS "Pico-Thing DAT fault auto-block ${PICO_THING_DAT_FAULT_AUTO_BLOCK}, "
+	"block delay ${PICO_THING_DAT_FAULT_BLOCK_DELAY} cycles")
+
 # The ADC calibration - reference voltage, divider ratio and converter zero
 # error - is deliberately not settable here.  Those three are measurements of
 # one physical board, not choices about how to build it, and as cache
@@ -234,6 +249,8 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_POWER_RAIL_MIN_VOLTS=${PICO_THING_POWER_RAIL_MIN_VOLTS}f
 	PICO_THING_POWER_RAIL_DROP_VOLTS=${PICO_THING_POWER_RAIL_DROP_VOLTS}f
 	PICO_THING_POWER_RAIL_SETTLE_MS=${PICO_THING_POWER_RAIL_SETTLE_MS}u
+	PICO_THING_DAT_FAULT_AUTO_BLOCK=${PICO_THING_DAT_FAULT_AUTO_BLOCK}
+	PICO_THING_DAT_FAULT_BLOCK_DELAY=${PICO_THING_DAT_FAULT_BLOCK_DELAY}u
 )
 
 target_link_libraries(pico-thing

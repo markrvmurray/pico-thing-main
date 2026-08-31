@@ -66,7 +66,7 @@ enum {
 
 #if PICO_THING_BOARD_VERSION >= 2
 	// Slow - guest instruction-level timing
-	GPIO_TASK_BASE = 32,       // [ ] [o]  TASK[4:0], five pins
+	GPIO_TASK_BASE = 32,       // [Y] [o]  TASK[4:0], five pins
 	GPIO_TASK_0 = 37,          // [Y] [o]  TASK0, set when the task number is zero
 
 	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
@@ -79,9 +79,9 @@ enum {
 	GPIO_POWER = 40,           // [Y] [o]  External power enable
 
 	// Medium - per-instruction timing
-	GPIO_FAULT = 41,           // [ ] [i]  Attempt to read or write unassigned memory
-	GPIO_NMI_BLOCK = 42,       // [ ] [o]  Prevent DAT Fault NMI
-	GPIO_A_HI_BASE = 43,       // [ ] [i]  Address bus A13-A15, the DAT page of a fault
+	GPIO_FAULT = 41,           // [Y] [i]  Attempt to read or write unassigned memory
+	GPIO_NMI_BLOCK = 42,       // [Y] [o]  Prevent DAT Fault NMI
+	GPIO_A_HI_BASE = 43,       // [Y] [i]  Address bus A13-A15, the DAT page of a fault
 	GPIO_POWER_ADC = 46,       // [Y] [i]  ADC on the 5V line, divided by 1.9407 measured
 #else
 	// Version 1: the task pins and the power enable sit at the bottom of the
