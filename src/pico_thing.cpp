@@ -298,6 +298,17 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 				MC6809.run_state = RS_RESET;
 				MC6809.task_stack_ptr = 0;
 			}
+			// Keep the reported state honest while the guest is held: this
+			// branch used to leave bus_state frozen at whatever it was when
+			// the reset pin went low, and status reported that as current.
+			// It is done here rather than ahead of the chain so the running
+			// path below is left exactly as it was - the budget in this
+			// handler is measured in a few instructions, and the cycles
+			// spent here are ones where no bus traffic needs servicing.
+			if (new_bs != MC6809.bus_state) {
+				MC6809.old_bus_state = MC6809.bus_state;
+				MC6809.bus_state = new_bs;
+			}
 		} else if (MC6809.run_state == RS_RESET) {
 			MC6809.run_state = RS_RUNNING;
 			// The guest has started fetching.  Release a trace that was
@@ -928,6 +939,18 @@ static constexpr float POWER_RAIL_DROP_VOLTS = PICO_THING_POWER_RAIL_DROP_VOLTS;
 #define PICO_THING_POWER_RAIL_SETTLE_MS 250u
 #endif
 static constexpr uint32_t RAIL_SETTLE_MS = PICO_THING_POWER_RAIL_SETTLE_MS;
+
+// How settled Core 1 has to be before the startup commands run: core1_initialised
+// is set before its loop starts, but the emulated devices need a few turns of
+// that loop to reach a sane state.
+static constexpr uint32_t CORE1_START_LOOPS = 100u;
+
+// And how long it is given to get there.  Generous rather than tight: with the
+// guest held in reset the bus still runs, and the interrupt load that puts on
+// Core 1 has been seen to hold its loop down to tens of turns a second for the
+// first couple of seconds.  This is a backstop against a Core 1 that will never
+// arrive, not a judgement on one that is merely slow.
+static constexpr uint32_t CORE1_START_TIMEOUT_MS = 10000u;
 
 static constexpr uint32_t RAIL_MONITOR_MS = 20u;
 // A supply that is genuinely gone stays gone.  Requiring several samples in a
@@ -2380,12 +2403,28 @@ poll_console()
 	static int idx = 0;
 	static bool prompted = false;
 
-	while (!core1_initialised) {
+	// Only wait for Core 1 if there is a guest for it to be servicing.  When
+	// the supply was missing at boot the switch was never closed and Core 1
+	// was never launched, so waiting on it here would hang the console - and
+	// the console is the one thing that has to survive a missing supply,
+	// since it is where "power on" is typed once the supply arrives.
+	// Bounded, and only entered when there is a guest for Core 1 to be
+	// servicing.  A Core 1 that never comes up must not cost the console:
+	// the console is where the problem gets diagnosed, and hanging here
+	// leaves no way in at all.
+	absolute_time_t core1_deadline = make_timeout_time_ms(CORE1_START_TIMEOUT_MS);
+	while (POWER_IS_ASSERTED && !core1_initialised
+	       && absolute_time_diff_us(get_absolute_time(), core1_deadline) > 0) {
 		sleep_ms(1u);
 		usb_poll();
 	}
 
 	print_time();
+	if (!POWER_IS_ASSERTED)
+		printf("Guest is unpowered; connect the supply, then \"power on\".\n");
+	else if (!core1_initialised)
+		printf("*** Core 1 never initialised (%" PRIu32 "ms); console only ***\n",
+		       CORE1_START_TIMEOUT_MS);
 
 	// Software watchdog: detect Core 1 for(;;) loop stalls.
 	// Sampled every WATCHDOG_INTERVAL_MS from Core 0.  Requires
@@ -3427,22 +3466,40 @@ main()
 		// Wait for Core 1's main loop to be running before executing
 		// startup commands — core1_initialised is set before the loop
 		// starts, but devices need a few loop iterations to settle.
-		while (core1_loop_count < 100u) {
+		// Bounded: if Core 1 wedges on the way up, say so and carry on to
+		// the console rather than hanging here with no way to look at it.
+		absolute_time_t core1_deadline = make_timeout_time_ms(CORE1_START_TIMEOUT_MS);
+		while (core1_loop_count < CORE1_START_LOOPS
+		       && absolute_time_diff_us(get_absolute_time(), core1_deadline) > 0) {
 			sleep_ms(1u);
 			usb_poll();
 		}
-
-		// Startup commands — executed once before entering the console loop
-		static const char *startup_commands[] = {
-			"run 0",
-			nullptr
-		};
-		for (const char **cmd = startup_commands; *cmd != nullptr; cmd++) {
-			char cmdbuf[COMMAND_BUFFER_LEN];
-			strncpy(cmdbuf, *cmd, sizeof(cmdbuf) - 1);
-			cmdbuf[sizeof(cmdbuf) - 1] = '\0';
-			printf("> %s\n", cmdbuf);
-			process_command(cmdbuf);
+		// Sampled once, and both the decision and the report use that one
+		// sample.  Reading the counter again for the message let it race
+		// past the threshold between the two, which produced a complaint
+		// that Core 1 had not reached its loop alongside a count saying it
+		// had.
+		const uint32_t core1_loops = core1_loop_count;
+		if (core1_loops < CORE1_START_LOOPS) {
+			printf("*** Core 1 reached only %" PRIu32 " of %" PRIu32
+			       " loops in %" PRIu32 "ms ***\n",
+			       core1_loops, CORE1_START_LOOPS, CORE1_START_TIMEOUT_MS);
+			printf("    initialised=%s  isr=%" PRIu32 "\n",
+			       core1_initialised ? "yes" : "no", core1_isr_count);
+			printf("    skipping startup commands; the console is up\n");
+		} else {
+			// Startup commands — executed once before entering the console loop
+			static const char *startup_commands[] = {
+				"run 0",
+				nullptr
+			};
+			for (const char **cmd = startup_commands; *cmd != nullptr; cmd++) {
+				char cmdbuf[COMMAND_BUFFER_LEN];
+				strncpy(cmdbuf, *cmd, sizeof(cmdbuf) - 1);
+				cmdbuf[sizeof(cmdbuf) - 1] = '\0';
+				printf("> %s\n", cmdbuf);
+				process_command(cmdbuf);
+			}
 		}
 	}
 
