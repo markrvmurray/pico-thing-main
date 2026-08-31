@@ -400,7 +400,15 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 				// count, so it has to be maintained in every build.
 				if (eirq <= INTERRUPT_RESET)
 					MC6809.count_irq_ack(eirq);
-				MC6809.run_state = RS_IN_IRQ;
+				// Reset fetches its vector through here too, and that is the
+				// guest starting rather than the guest taking an interrupt.
+				// Counting it as one stuck: nesting_depth is not incremented
+				// for reset - the task stack push above is guarded the same
+				// way - so apply_rti() had nothing to unwind, BUS_RUNNING
+				// deliberately will not undo RS_IN_IRQ, and every guest read
+				// as being in an interrupt from the moment it started.
+				if (eirq < INTERRUPT_RESET)
+					MC6809.run_state = RS_IN_IRQ;
 				break;
 			}
 			case BUS_SYNC:  MC6809.run_state = RS_SYNCED; break;
