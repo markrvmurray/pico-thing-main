@@ -35,6 +35,7 @@ typedef enum cmd_tag {
 	CMD_LOOP,
 
 	CMD_VECTOR,
+	CMD_ADC,
 
 	CMD_FILL_ALL,
 	CMD_FILL_ALL_VALUE,

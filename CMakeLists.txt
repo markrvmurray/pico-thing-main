@@ -219,6 +219,13 @@ set(PICO_THING_POWER_RAIL_SETTLE_MS 250 CACHE STRING
 	"Milliseconds the 5V rail is given to settle before it is judged")
 message(STATUS "Pico-Thing power rail settle ${PICO_THING_POWER_RAIL_SETTLE_MS}ms")
 
+# The ADC calibration - reference voltage, divider ratio and converter zero
+# error - is deliberately not settable here.  Those three are measurements of
+# one physical board, not choices about how to build it, and as cache
+# variables a build directory configured before they were measured keeps the
+# nominal values and silently reports wrong volts and degrees.  They live in
+# src/pico_thing.cpp, where the tracked value is the value that is used.
+
 # Core 1 stack is 0x800 (2 KiB) by default — too small for three nested
 # ISR levels (DMA prio-0 → GPIO prio-1 → thread) with FPU lazy stacking.
 target_compile_definitions(pico-thing PRIVATE

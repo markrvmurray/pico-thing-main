@@ -755,6 +755,23 @@ TEST_CASE("irq command", "[parser][irq]")
 }
 
 // ============================================================
+//  adc
+// ============================================================
+TEST_CASE("adc", "[adc]")
+{
+	parsed_cmd_t cmd{};
+	SECTION("adcdump takes no arguments")
+	{
+		REQUIRE(parse("adcdump", &cmd));
+		CHECK(cmd.tag == CMD_ADC);
+	}
+	SECTION("\"adc\" is three hex digits, not this command")
+	{
+		CHECK_FALSE(parse("adc", &cmd));
+	}
+}
+
+// ============================================================
 //  trace
 // ============================================================
 

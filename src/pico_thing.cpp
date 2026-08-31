@@ -898,18 +898,56 @@ console_has_interrupt()
 
 // Raw ADC counts to engineering units.  Shared by the human-readable and the
 // JSON status output so the constants cannot drift apart.
+//
+// Both conversions turn on the reference the ADC measures against, which is
+// ADC_AVDD - nominally 3.3V, in practice whatever the board delivers.  The
+// datasheet is blunt about what that costs: at 3.3V a reading of 891 is
+// 20.1C, and a reference one percent lower makes the same reading 24.3C.  A
+// reference reading low inflates every voltage and deflates every
+// temperature, which is exactly the pair of symptoms a board shows when this
+// is left at its nominal value.  Measure ADC_AVDD and set it here.
+static constexpr float ADC_VREF_VOLTS = 3.270f;	// TP607, first version 2 board
+
+// What the divider feeding GPIO 46 actually divides the 5V line by.  The pin
+// map calls it two; measured on the first version 2 board it is 1.9407, from
+// 4.846V at the rail against 2.497V at the pin.  Unlike the reference it
+// affects only the supply reading, so the two can be told apart by whether
+// the die temperature moves with it.
+static constexpr float BUS_DIVIDER_RATIO = 1.9407f;	// 4.846V rail / 2.497V pin
+
+// The converter's zero error, in counts, subtracted before anything is scaled.
+// It is not a per-channel figure: the same offset appears on the supply
+// divider and on the die sensor, which is what distinguishes it from a
+// reference error - a reference error scales, an offset shifts, and no single
+// reference value fits both channels while one offset fits both.
+//
+// Measured on the first version 2 board: a pin held at 2.497V should read
+// 2.497 x 4096 / 3.270 = 3128 counts and reads 3182, so the zero error is 54.
+// That same 54 turns the die channel's 928 counts into 31.8C against a 25.0C
+// ambient, which is a believable rise for this part at 320MHz.
+static constexpr float ADC_OFFSET_COUNTS = 54.0f;	// 3182 counts read for 3128 expected
+
+// Counts to the voltage on the pin: a 12-bit conversion against the reference,
+// with the converter's own zero error taken out first.
 static inline float
-adc_bus_volts(const uint16_t raw)
+adc_pin_volts(const uint16_t raw)
 {
-	// The divider halves the 5V line, so the pin sees Vbus/2 - scale the
-	// pin voltage back up rather than down
-	return static_cast<float>(raw)*3.3f*2.0f/4096.0f;
+	return (static_cast<float>(raw) - ADC_OFFSET_COUNTS)*ADC_VREF_VOLTS/4096.0f;
 }
 
 static inline float
+adc_bus_volts(const uint16_t raw)
+{
+	return adc_pin_volts(raw)*BUS_DIVIDER_RATIO;
+}
+
+static inline float
+// Vbe is 0.706V at 27C with a slope of -1.721mV per degree.  These are the
+// RP2350's own figures, not carried over from the RP2040: section 12.4.6 of
+// the RP2350 datasheet gives the same two numbers.
 adc_die_celsius(const uint16_t raw)
 {
-	return 27.0f - ((static_cast<float>(raw)*3.3f/4096.0f) - 0.706f)/0.001721f;
+	return 27.0f - (adc_pin_volts(raw) - 0.706f)/0.001721f;
 }
 
 // --- Supply monitor -----------------------------------------------------
@@ -967,11 +1005,36 @@ static volatile uint64_t rail_settle_until = 0u;	// us since boot; no judging be
 static volatile bool rail_sampled = false;	// at least one pass has run
 static volatile bool rail_collapsed = false;	// set here, acted on by the console loop
 
+// TODO: take a median of several samples per channel rather than one.
+//
+// adcdump measured the spread on this board.  Standing still both channels
+// sit within about two counts, but with the bus busy the die sensor reaches
+// 17 counts of standard deviation and, in a loop that faults every pass, the
+// supply divider reaches 84 - about 0.13V at the rail.  The means barely
+// move across those conditions, 0.074V on the supply and nine degrees on the
+// die, so this is scatter rather than a shifted reading and a median of
+// enough samples removes most of it.
+//
+// Nine samples would cost about 40us of the 20ms tick and take the die
+// channel from roughly plus or minus 19 degrees to plus or minus 6, and the
+// supply from 0.13V to about 0.045V.  Median rather than mean because the
+// disturbance looks impulsive.
+//
+// Not urgent for the supply: the 4.0V cutout is seven standard deviations
+// below the mean even under fault load, and three consecutive samples are
+// needed to act.  It is the die reading that is unusable sample by sample.
 static bool
 power_rail_monitor(repeating_timer *)
 {
 #if PICO_THING_BOARD_VERSION >= 2
+	// Every conversion here follows a mux change, and the sample capacitor
+	// has to charge to the new channel through whatever impedance drives
+	// it.  The first conversion after a switch is thrown away so the second
+	// starts from a settled cap.  This matters most for the die sensor: it
+	// is a biased diode with a far higher source impedance than a resistive
+	// divider, and it is preceded by a channel sitting three times higher.
 	adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
+	(void) adc_read();
 	const uint16_t raw = adc_read();
 	rail_raw = raw;
 	// Opening the switch is a single gpio_put, which is all that can safely
@@ -995,6 +1058,7 @@ power_rail_monitor(repeating_timer *)
 #endif
 	// The die sensor is internal, on the channel above the pins
 	adc_select_input(NUM_ADC_CHANNELS - 1);
+	(void) adc_read();
 	die_raw = adc_read();
 	rail_sampled = true;
 	return true;
@@ -1126,9 +1190,11 @@ status_print(const status_snapshot_t *s)
 	       !s->reset ? "high" : "LOW",
 	       !s->halt ? "high" : "LOW");
 #if PICO_THING_BOARD_VERSION >= 2
-	printf("BUS POWER: %.2fV\n", adc_bus_volts(s->voltage));
+	printf("BUS POWER: %.2fV (%u counts)\n",
+	       adc_bus_volts(s->voltage), s->voltage);
 #endif
-	printf("PICO TEMPERATURE: %.1f\n", adc_die_celsius(s->temperature));
+	printf("PICO TEMPERATURE: %.1fC (%u counts)\n",
+	       adc_die_celsius(s->temperature), s->temperature);
 	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
 	       s->nmi ? "OUTPUT LOW" : "hi-z",
 	       s->firq ? "OUTPUT LOW" : "hi-z",
@@ -1347,6 +1413,8 @@ process_command(char *buf)
 		"  fill <s> <e> [v]   (fi)  fill s..e with v (default 00)\n"
 		"  fill all [v]       (fi)  fill $0000-$FDFF\n"
 		"  vector [n]         (vc)  show or set the CPU vectors\n"
+		"  adcdump                  burst-sample both ADC channels under\n"
+		"                           three bus loads; dumps raw counts as CSV\n"
 		"  snippet [n]        (sn)  list snippets, or copy n to $FFE0\n"
 		"\n--- Debug ---\n"
 		"  trace on|off       (tr)  arm or disarm the %u-cycle one-shot\n"
@@ -1559,6 +1627,75 @@ status_done:
 		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.loop.address;
 		MC6809.start();
 		break;
+
+	case CMD_ADC: {
+		// Burst-sample both ADC channels under three bus conditions and dump
+		// every reading.  The die temperature has been seen to swing far more
+		// than the supply divider while the bus is busy - more than a shared
+		// reference error could explain - and one sample per condition cannot
+		// tell a noisy channel from a shifted one.  This prints the raw counts
+		// and leaves the judgement to whoever reads them.
+#if PICO_THING_BOARD_VERSION < 2
+		// Version 1 has the power enable on GPIO 46, not a supply divider,
+		// so there is no second channel to compare the die sensor against
+		// and nothing this would settle.
+		printf("No supply divider on version 1 - nothing to compare\n\n");
+#else
+		if (!MC6809.assert_powered())
+			break;
+		static constexpr uint32_t ADC_BURST = 64u;
+		static constexpr uint8_t ADC_BURST_PAGE = 1u;	// the page condition 2 unmaps
+
+		// Take the converter off the supply monitor for the duration: there is
+		// one input mux, and the two would otherwise fight over it.
+		cancel_repeating_timer(&rail_timer);
+
+		printf("ADC burst, raw counts, %" PRIu32 " samples per condition\n", ADC_BURST);
+		printf("cond 0 = guest in reset, 1 = LOOP_RW running, 2 = faulting loop\n");
+		printf("cond,n,bus,die\n");
+
+		for (uint8_t cond = 0u; cond < 3u; cond++) {
+			MC6809.stop();
+			sleep_ms(1u);
+			if (cond == 2u) {
+				// Unmap the page the loop is about to read, from task zero,
+				// which is the only task the GAL lets write DAT RAM.
+				task_pins_update(MC6809.task_change(0u));
+				const uint8_t unavailable = 0xFFu;
+				(void) copy(OUTWARDS, 1u,
+					    static_cast<uint16_t>(0xFE00u + ADC_BURST_PAGE),
+					    &unavailable);
+				MC6809.stop();
+				sleep_ms(1u);
+			}
+			if (cond != 0u) {
+				snippet_copy(LOOP_RW);
+				reg[REGISTER_SNIPPET_OFFSET + 0u] = static_cast<uint8_t>(0xB6u);	// LDA extended
+				reg[REGISTER_SNIPPET_OFFSET + 1u] =
+					static_cast<uint8_t>(ADC_BURST_PAGE << 5);
+				MC6809.start();
+				sleep_ms(2u);	// let the loop get going before sampling
+			}
+
+			for (uint32_t n = 0u; n < ADC_BURST; n++) {
+				adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
+				(void) adc_read();
+				const uint16_t bus_raw = static_cast<uint16_t>(adc_read());
+				adc_select_input(NUM_ADC_CHANNELS - 1);
+				(void) adc_read();
+				const uint16_t die_raw = static_cast<uint16_t>(adc_read());
+				printf("%u,%" PRIu32 ",%u,%u\n", cond, n, bus_raw, die_raw);
+			}
+		}
+
+		MC6809.stop();
+		sleep_ms(1u);
+		task_pins_update(MC6809.task_change(0u));
+		power_rail_monitor_start();
+		printf("end\n\n");
+#endif
+		break;
+	}
 
 	case CMD_VECTOR:
 		if (!MC6809.assert_powered())

@@ -143,6 +143,7 @@ static int _t_count;
 %token TOK_BREAK
 %token TOK_USB
 %token TOK_NITROS9
+%token TOK_ADC
 
 /* Subcommand keywords */
 %token TOK_DAT
@@ -205,6 +206,7 @@ command:
 	| usb_cmd
 	| srecord_cmd
 	| nitros9_cmd
+	| adc_cmd
 	| TOK_WORD        { printf("Unknown command \"%s\"\n", $1); YYERROR; }
 	;
 
@@ -240,6 +242,13 @@ status_cmd:
 
 reset_cmd:
 	TOK_RESET   { result->tag = CMD_RESET; }
+	;
+
+/* -----------------------------------------------------------------------
+ * adc   - burst-sample both ADC channels under three bus conditions
+ * ----------------------------------------------------------------------- */
+adc_cmd:
+	TOK_ADC     { result->tag = CMD_ADC; }
 	;
 
 /* -----------------------------------------------------------------------

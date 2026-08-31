@@ -105,6 +105,9 @@ match_command_keyword(const char *text)
 		{ "break",   "br", TOK_BREAK   },
 		{ "usb",     "ub", TOK_USB     },
 		{ "nitros9", "ni", TOK_NITROS9 },
+		/* Not "adc": three hex digits, so it lexes as a number and never
+		 * reaches this table.  See the note at the top of this file. */
+		{ "adcdump", NULL, TOK_ADC     },
 		{ NULL, NULL, 0 }
 	};
 
