@@ -41,17 +41,17 @@ enum {
 
 	// Fast/cycle-critical - GPIO Bank0, done by ISR
 	// BS/BA and BUSY/LIC/AVMA must be on consecutive pin runs in this order
-	GPIO_BS = 18,   // [ ] [i]  BS
-	GPIO_BA = 19,   // [ ] [i]  BA
-	GPIO_BUSY = 20, // [ ] [i]  BUSY
-	GPIO_LIC = 21,  // [ ] [i]  LIC
-	GPIO_AVMA = 22, // [ ] [i]  AVMA
+	GPIO_BS = 18,   // [Y] [i]  BS - this and BA are swapped on the LED indicator on V2
+	GPIO_BA = 19,   // [Y] [i]  BA
+	GPIO_BUSY = 20, // [Y] [i]  BUSY
+	GPIO_LIC = 21,  // [Y] [i]  LIC
+	GPIO_AVMA = 22, // [Y] [i]  AVMA
 
 	// Asynchronous, at cycle speed
-	GPIO_HALT = 23, // [ ] [o]  !HALT
-	GPIO_NMI = 24,  // [ ] [o*] !NMI
-	GPIO_FIRQ = 25, // [ ] [o*] !FIRQ
-	GPIO_IRQ = 26,  // [ ] [o*] !IRQ
+	GPIO_HALT = 23, // [Y] [o]  !HALT
+	GPIO_NMI = 24,  // [Y] [o*] !NMI
+	GPIO_FIRQ = 25, // [Y] [o*] !FIRQ
+	GPIO_IRQ = 26,  // [Y] [o*] !IRQ
 
 	// Fast/timing-critical - GPIO Bank0 - will be removed when debugging is done
 	//	GPIO_TRACE_RD = 27,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
