@@ -34,6 +34,7 @@ all: $(ASSIST09_TARGETS) \
      test_send.s19 test_send.bin \
      acia_torture.s19 acia_torture.bin tick_torture.s19 tick_torture.bin \
      hello.srec hello.raw disk_test.srec disk_test.raw \
+     disk_write_test.srec disk_write_test.raw \
      diskload.srec diskload.raw dat_torture.srec dat_torture.raw \
      stress_acia.srec stress_acia.raw \
      irq_test.s19 irq_test.raw
@@ -107,6 +108,7 @@ assist09.bin: assist09.asm
 diskload.o: ide_lib.h
 ide_lib.o: ide_lib.h
 disk_test.o: ide_lib.h
+disk_write_test.o: ide_lib.h
 dat_torture.o: ide_lib.h
 
 # -----------------------------------------------------------------------
@@ -128,6 +130,14 @@ disk_test.srec: disk_test.o pico.o ide_lib.o libcchunk.a
 disk_test.raw: disk_test.o pico.o ide_lib.o libcchunk.a
 	lwlink --script=cchunk.ld --map=$(basename $@).map --format=raw \
 		--output=$@ disk_test.o pico.o ide_lib.o -L. -lcchunk -L$(CMOC_LIBDIR) $(CMOC_LIBS)
+
+disk_write_test.srec: disk_write_test.o pico.o ide_lib.o libcchunk.a
+	lwlink --script=cchunk.ld --map=$(basename $@).map --format=srec \
+		--output=$@ disk_write_test.o pico.o ide_lib.o -L. -lcchunk -L$(CMOC_LIBDIR) $(CMOC_LIBS)
+
+disk_write_test.raw: disk_write_test.o pico.o ide_lib.o libcchunk.a
+	lwlink --script=cchunk.ld --map=$(basename $@).map --format=raw \
+		--output=$@ disk_write_test.o pico.o ide_lib.o -L. -lcchunk -L$(CMOC_LIBDIR) $(CMOC_LIBS)
 
 diskload.srec: diskload.o pico.o ide_lib.o libcchunk.a
 	lwlink --script=cchunk.ld --map=$(basename $@).map --format=srec \

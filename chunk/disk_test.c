@@ -63,7 +63,7 @@ main(void)
 	dump_buffer(buffer);
 	printf("Cylinders: %u\n", buffer[1]);
 	printf("Heads: %u\n", buffer[3]);
-	printf("Sectors/Track: %u\n", buffer[5]);
+	printf("Sectors/Track: %u\n", buffer[6]);	/* word 6; word 5 is reserved */
 	printf("LBA bit in: %04X - the LBA is %u\n", buffer[49], (buffer[49] & (1 << 9)) != 0);
 	LBA_sectors = (((uint32_t)buffer[61]) * 0x10000ul) + ((uint32_t)buffer[60]);
 	// capacity = (LBA_sectors*512u)/(1024u*1024u);

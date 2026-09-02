@@ -85,10 +85,21 @@ ide_identify(uint16_t *buf)
 	return 0;
 }
 
-int
-ide_read_sector(uint32_t lba, uint16_t *buf)
+/*
+ * Load the task file for a one-sector LBA28 command, then read it back.  The
+ * address registers are readable, so a command can be refused before it is
+ * issued when the drive has not latched the sector asked for: an address or
+ * decode fault would otherwise send a write somewhere else, and on a drive
+ * holding a filesystem that could be anywhere.  Bits 7 and 5 of Drive/Head
+ * are left out of the comparison, since later drives need not return them.
+ */
+static int
+ide_select_lba(uint32_t lba)
 {
-	IDE_DEVHEAD = (uint8_t)(0xE0 | ((lba >> 24) & 0x0F));
+	uint8_t devhead;
+
+	devhead = (uint8_t)(0xE0 | ((lba >> 24) & 0x0F));
+	IDE_DEVHEAD = devhead;
 	ide_wait_not_busy();
 
 	IDE_SECCNT = 1;
@@ -96,10 +107,46 @@ ide_read_sector(uint32_t lba, uint16_t *buf)
 	IDE_LBA1 = (uint8_t)(lba >> 8);
 	IDE_LBA2 = (uint8_t)(lba >> 16);
 
+	if (IDE_SECCNT != (uint8_t)1
+	    || IDE_LBA0 != (uint8_t)(lba)
+	    || IDE_LBA1 != (uint8_t)(lba >> 8)
+	    || IDE_LBA2 != (uint8_t)(lba >> 16)
+	    || (IDE_DEVHEAD & (uint8_t)0x5F) != (devhead & (uint8_t)0x5F))
+		return IDE_ERR_ADDRESS;
+	return 0;
+}
+
+/*
+ * Wait for the drive to finish a command phase.  DRQ and ERR mean nothing
+ * while BSY is set, so they are only trusted once it has cleared.
+ */
+static int
+ide_wait_data(void)
+{
+	uint8_t status;
+
+	for (;;) {
+		status = IDE_STATUS;
+		if (!(status & IDE_SR_BSY) && (status & (IDE_SR_DRQ | IDE_SR_ERR)))
+			break;
+	}
+	return (status & IDE_SR_ERR) ? IDE_ERR_DRIVE : 0;
+}
+
+int
+ide_read_sector(uint32_t lba, uint16_t *buf)
+{
+	int err;
+
+	err = ide_select_lba(lba);
+	if (err != 0)
+		return err;
+
 	IDE_COMMAND = IDE_CMD_READ_SECTORS;
 
-	while (!(IDE_STATUS & IDE_SR_DRQ))
-		;
+	err = ide_wait_data();
+	if (err != 0)
+		return err;
 
 	for (int i = 0; i < 256; i++)
 		buf[i] = IDE_DATA;
@@ -110,23 +157,26 @@ ide_read_sector(uint32_t lba, uint16_t *buf)
 int
 ide_write_sector(uint32_t lba, const uint16_t *buf)
 {
-	IDE_DEVHEAD = (uint8_t)(0xE0 | ((lba >> 24) & 0x0F));
-	ide_wait_not_busy();
+	int err;
 
-	IDE_SECCNT = 1;
-	IDE_LBA0 = (uint8_t)(lba);
-	IDE_LBA1 = (uint8_t)(lba >> 8);
-	IDE_LBA2 = (uint8_t)(lba >> 16);
+	err = ide_select_lba(lba);
+	if (err != 0)
+		return err;
 
 	IDE_COMMAND = IDE_CMD_WRITE_SECTORS;
 
-	while (!(IDE_STATUS & IDE_SR_DRQ))
-		;
+	err = ide_wait_data();
+	if (err != 0)
+		return err;
 
 	for (int i = 0; i < 256; i++)
 		IDE_DATA = buf[i];
 
+	/* BSY stays set while the drive commits the sector; ERR then says
+	 * whether it managed to. */
 	ide_wait_not_busy();
+	if (IDE_STATUS & IDE_SR_ERR)
+		return IDE_ERR_DRIVE;
 
 	return 0;
 }
