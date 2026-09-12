@@ -997,14 +997,14 @@ console_has_interrupt()
 // reference reading low inflates every voltage and deflates every
 // temperature, which is exactly the pair of symptoms a board shows when this
 // is left at its nominal value.  Measure ADC_AVDD and set it here.
-static constexpr float ADC_VREF_VOLTS = 3.270f;	// TP607, first version 2 board
+static constexpr float ADC_VREF_VOLTS = 3.2464f;	// TP607 on A601, replacement version 2 board
 
-// What the divider feeding GPIO 46 actually divides the 5V line by.  The pin
-// map calls it two; measured on the first version 2 board it is 1.9407, from
-// 4.846V at the rail against 2.497V at the pin.  Unlike the reference it
-// affects only the supply reading, so the two can be told apart by whether
-// the die temperature moves with it.
-static constexpr float BUS_DIVIDER_RATIO = 1.9407f;	// 4.846V rail / 2.497V pin
+// What the divider feeding GPIO 46 actually divides the 5V line by.  It is a
+// per-board figure: the first version 2 board measured 1.9407, the replacement
+// measures 2.0001, from 5.0005V at the rail against 2.5001V at GPIO 46.  Unlike
+// the reference it affects only the supply reading, so the two can be told
+// apart by whether the die temperature moves with it.
+static constexpr float BUS_DIVIDER_RATIO = 2.0001f;	// 5.0005V rail / 2.5001V pin
 
 // The converter's zero error, in counts, subtracted before anything is scaled.
 // It is not a per-channel figure: the same offset appears on the supply
@@ -1012,11 +1012,13 @@ static constexpr float BUS_DIVIDER_RATIO = 1.9407f;	// 4.846V rail / 2.497V pin
 // reference error - a reference error scales, an offset shifts, and no single
 // reference value fits both channels while one offset fits both.
 //
-// Measured on the first version 2 board: a pin held at 2.497V should read
-// 2.497 x 4096 / 3.270 = 3128 counts and reads 3182, so the zero error is 54.
-// That same 54 turns the die channel's 928 counts into 31.8C against a 25.0C
-// ambient, which is a believable rise for this part at 320MHz.
-static constexpr float ADC_OFFSET_COUNTS = 54.0f;	// 3182 counts read for 3128 expected
+// Measured on the replacement version 2 board it is zero: GPIO 46 at 2.5001V
+// should read 2.5001 x 4096 / 3.2464 = 3154.4 counts and reads 3154.7, a
+// difference well inside the two counts a reading wanders by at rest.  With
+// zero, the die channel's 870 counts are 36.6C.  The first board needed 54,
+// turning its 928 counts into 31.8C against a 25.0C ambient, so this too is a
+// per-board figure.
+static constexpr float ADC_OFFSET_COUNTS = 0.0f;	// 3154.7 counts read for 3154.4 expected
 
 // Counts to the voltage on the pin: a 12-bit conversion against the reference,
 // with the converter's own zero error taken out first.
