@@ -2992,7 +2992,20 @@ __no_inline_not_in_flash_func(main_core1)()
 	MC6809.set_e_frequency(GUEST_CLK_DEFAULT, pio_clock);
 	printf("Core1 E/Q clock set to %.1f MHz\n", MC6809.get_e_frequency());
 
-	gpio_add_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
+	// Added once per boot and never removed.  The SDK books a raw GPIO handler
+	// against the core that adds it - raw_irq_mask[core] - and only that core
+	// can take it off again.  Core 1 is killed with multicore_reset_core1(),
+	// so it never gets the chance, and a removal from Core 0 clears Core 0's
+	// mask instead; the relaunched Core 1 then trips "should not add multiple
+	// handlers for the same event", which is a hard_assert on the second
+	// "power on".  Leaving it in the chain is safe: only Core 1 ever enables
+	// the bank 0 IRQ, and the enable below acknowledges any edge that latched
+	// while the guest was powered off.
+	static bool eq_handler_added = false;
+	if (!eq_handler_added) {
+		gpio_add_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
+		eq_handler_added = true;
+	}
 	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
 	irq_set_priority(pio_clock.irq, 1);
 	irq_set_enabled(pio_clock.irq, true);
@@ -3624,10 +3637,10 @@ pio_shutdown()
 {
 	// --- Disable IRQs first (handlers reference DMA/PIO resources) ---
 
-	// GPIO Q edge IRQ (bus observer) + E-fall trace IRQ
-	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-	irq_set_enabled(pio_clock.irq, false);
-	gpio_remove_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
+	// GPIO Q edge IRQ (bus observer): nothing to do here.  Its enable, its
+	// NVIC enable and its handler registration are all per-core, and all three
+	// belong to Core 1, which has already been reset - so the IRQ cannot be
+	// taken.  The handler stays registered for the next launch; see main_core1.
 
 	// DMA read IRQ
 	dma_channel_set_irq0_enabled(piodma_read.data_channel, false);
@@ -3643,6 +3656,27 @@ pio_shutdown()
 	pio_set_irq0_source_enabled(rti_pio, pis_interrupt0, false);
 	irq_set_enabled(PIO1_IRQ_0, false);
 	irq_remove_handler(PIO1_IRQ_0, pio_rti_irq_handler);
+
+	// --- Bus trace pair (pio0 low half + pio2 high half) ---
+	// Everything the trace takes has to go back, or a second power-on cannot
+	// rebuild it: pio0 holds clock(4) + read(21) + bus_capture_lo(5) = 30 of
+	// its 32 words, so leaving the capture program resident leaves no room to
+	// add it again, and pio_add_program returns -1.  The state machines and
+	// the two fixed DMA channels leak the same way behind it.
+	MC6809.trace_stop();
+	dma_channel_abort(TRACE_LO_DMA);
+	dma_channel_abort(TRACE_HI_DMA);
+	dma_channel_unclaim(TRACE_LO_DMA);
+	dma_channel_unclaim(TRACE_HI_DMA);
+	bus_capture_hi_program_deinit(TRACE_HI_PIO, trace_hi_sm);
+	bus_capture_lo_program_deinit(TRACE_LO_PIO, trace_lo_sm);
+	pio_remove_program(TRACE_HI_PIO, &bus_capture_hi_program, static_cast<uint>(trace_hi_offset));
+	pio_remove_program(TRACE_LO_PIO, &bus_capture_lo_program, static_cast<uint>(trace_lo_offset));
+	// The offsets are the "trace hardware exists" guard for trace_hw_arm(),
+	// trace_hw_stop() and trace_hw_count(), so they go negative here.
+	trace_lo_offset = trace_hi_offset = -1;
+	trace_pending_start = false;
+	MC6809.set_trace_callbacks(nullptr, nullptr, nullptr);
 
 	// --- RTI detect (pio1) ---
 	rti_detect_program_deinit(rti_pio, rti_pio_sm);

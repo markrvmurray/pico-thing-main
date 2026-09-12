@@ -392,4 +392,20 @@ bus_capture_lo_program_trigger_now(PIO pio, uint sm, uint offset)
 	pio_sm_exec(pio, sm, pio_encode_jmp(offset + 1u));
 }
 
+// Both halves only sample, so there are no pin directions to hand back - the
+// state machine stops and the claim goes with it.
+static inline void
+bus_capture_lo_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	pio_sm_unclaim(pio, sm);
+}
+
+static inline void
+bus_capture_hi_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	pio_sm_unclaim(pio, sm);
+}
+
 %}
