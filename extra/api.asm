@@ -259,6 +259,22 @@ DatFlt	LDS	#DATRAM	stack descends through the fixed block, below the DAT
 	LDA	$6000	opcode and address patched by the Pico - the faulting access
 	SYNC		park; the NMI vector is aimed here
 
+* Fill a range with a value taken from each byte's own address - its low or
+* its high byte - plus a page number, so that every address line and every
+* physical page leaves values its neighbours do not.  Everything is patched
+* by the Pico: the start at offset 1, the add opcode at 5 ($CB ADDB for the
+* low byte, $8B ADDA for the high) with the page at 6, the store opcode at 7
+* ($E7 STB or $A7 STA to match), and the end at 10.  It needs no stack and
+* no RAM of its own, so it can fill any page, page zero included.
+	ORG	START
+RamFil	LDX	#$0000	start, patched
+F@0	TFR	X,D
+	ADDB	#$00	low byte + page; opcode and page patched
+	STB	,X+	store opcode patched to match
+	CMPX	#$2000	end, patched
+	BNE	F@0
+	SYNC
+
 	ORG	CHUNK
 	INCLUDEBIN	../chunk/dl.raw
 
@@ -602,6 +618,8 @@ S@0	LDB	,U+	the value staged for this register
 	FCC	"NMI_BLOCK_LAT"
 	FCB	' '
 	FCC	"DAT_FAULT"
+	FCB	' '
+	FCC	"RAM_FILL"
 	FCB	' '
 	FCC	"DOWNLOAD"
 	FCB	' '

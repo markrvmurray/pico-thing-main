@@ -39,6 +39,8 @@ typedef enum cmd_tag {
 	CMD_RTC_QUERY,
 	CMD_RTC_SET,
 	CMD_RTC_TO_PICO,
+	CMD_RAMTEST,
+	CMD_SYNCTEST,
 
 	CMD_FILL_ALL,
 	CMD_FILL_ALL_VALUE,
@@ -161,6 +163,11 @@ typedef struct parsed_cmd {
 		struct {
 			uint32_t index;
 		} run;
+
+		/* CMD_SYNCTEST */
+		struct {
+			uint32_t runs;
+		} synctest;
 
 		/* CMD_FREQ */
 		struct {

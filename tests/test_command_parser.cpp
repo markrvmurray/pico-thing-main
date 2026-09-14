@@ -835,6 +835,59 @@ TEST_CASE("rtc command", "[parser][rtc]")
 }
 
 // ============================================================
+//  ramtest
+// ============================================================
+TEST_CASE("ramtest command", "[parser][ramtest]")
+{
+	parsed_cmd_t cmd{};
+	SECTION("ramtest takes no arguments")
+	{
+		REQUIRE(parse("ramtest", &cmd));
+		CHECK(cmd.tag == CMD_RAMTEST);
+	}
+	SECTION("ramtest rejects an argument")
+	{
+		CHECK_FALSE(parse("ramtest 1", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+}
+
+// ============================================================
+//  synctest
+// ============================================================
+TEST_CASE("synctest command", "[parser][synctest]")
+{
+	parsed_cmd_t cmd{};
+	SECTION("synctest alone runs 1000 a phase")
+	{
+		REQUIRE(parse("synctest", &cmd));
+		CHECK(cmd.tag == CMD_SYNCTEST);
+		CHECK(cmd.synctest.runs == 1000u);
+	}
+	SECTION("the run count is decimal")
+	{
+		REQUIRE(parse("synctest 5000", &cmd));
+		CHECK(cmd.tag == CMD_SYNCTEST);
+		CHECK(cmd.synctest.runs == 5000u);
+	}
+	SECTION("zero runs is rejected")
+	{
+		CHECK_FALSE(parse("synctest 0", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+	SECTION("more than 100000 is rejected")
+	{
+		CHECK_FALSE(parse("synctest 100001", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+	SECTION("a hex count is rejected")
+	{
+		CHECK_FALSE(parse("synctest 1A", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+}
+
+// ============================================================
 //  trace
 // ============================================================
 

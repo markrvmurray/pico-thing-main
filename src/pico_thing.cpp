@@ -771,6 +771,12 @@ enum copy_type {
 	INWARDS
 };
 
+// Copies in after which the Pico's two views of SHARED disagreed: the read
+// buffer, filled by the write interrupt handler, and the write buffer, filled
+// directly by DMA as the processor writes.  Diagnostic - it says which side
+// of the Pico a bad byte came from.
+static uint32_t copy_buffer_disagreements = 0u;
+
 static bool
 copy(const copy_type direction, const uint16_t count, const uint16_t address, const uint8_t *data)
 {
@@ -804,6 +810,10 @@ copy(const copy_type direction, const uint16_t count, const uint16_t address, co
 				return false;
 			}
 			registers::copy_out(const_cast<uint8_t *>(data) + pos, REGISTER_BUFFER_OFFSET, len);
+			uint8_t written[REGISTER_BUFFER_LEN];
+			registers::copy_out_write(written, REGISTER_BUFFER_OFFSET, len);
+			if (std::memcmp(written, data + pos, len) != 0)
+				copy_buffer_disagreements++;
 		}
 		start += len;
 		pos += len;
@@ -1020,6 +1030,953 @@ rtc_read(uint8_t r[RTC_CLOCK_REGISTERS])
 	}
 	registers::copy_out(r, REGISTER_BUFFER_OFFSET, RTC_CLOCK_REGISTERS);
 	return true;
+}
+
+// The RAM and DAT test, for the ramtest command.
+//
+// Physical memory is 256 pages of 8kB, 64 to each chip select the RAM glue
+// decodes: RAM0 and RAM1 are the two chips on the board, RAM2 and RAM3 come
+// out on the expansion connector.  Pages $00-$FE are reached by remapping
+// task zero's slot 0; page $FF cannot be put in a slot - a slot holding it
+// faults - and is reached only through the fixed window at $E000-$FDFF.
+// Every fill and check runs from the Pico's own window, so nothing under
+// test is also holding the code or the stack doing the testing.
+//
+// The order matters.  Each chip select has its data lines proven first,
+// then its address lines, and only then its storage: a stuck data bit
+// otherwise passes itself off as one page holding another's data, and a
+// floating bus as a chip storing garbage.  Each stage reads only what the
+// stages before it have already made trustworthy.
+static constexpr uint8_t RAM_LAST_DAT_PAGE = 0xFEu;
+static constexpr uint8_t RAM_FIXED_PAGE = 0xFFu;
+static constexpr uint16_t RAM_WINDOW = 0x0000u;
+static constexpr uint16_t RAM_WINDOW_END = 0x2000u;
+static constexpr uint16_t RAM_FIXED_START = 0xE000u;
+static constexpr uint16_t RAM_FIXED_END = 0xFE00u;	// the DAT RAM follows
+static constexpr uint16_t RAM_DAT_BASE = 0xFE00u;
+static constexpr uint16_t RAM_DAT_ENTRIES = 256u;
+static constexpr uint8_t RAM_TASKS = 32u;
+static constexpr uint8_t RAM_SLOTS = 7u;		// slot 7 is the fixed window
+static constexpr uint16_t RAM_REPORT_LIMIT = 8u;
+static constexpr uint8_t RAM_ATTEMPTS = 3u;
+static constexpr uint8_t RAM_CONFIRM_READS = 3u;
+static constexpr uint8_t RAM_DATA_BITS = 8u;
+static constexpr uint8_t RAM_OFFSET_LINES = 13u;	// A0-A12, within a page
+static constexpr uint8_t RAM_PAGE_LINES = 6u;		// PA13-PA18, within a chip
+static constexpr uint8_t RAM_MARKER = 0xAAu;
+static constexpr uint8_t RAM_ANTI_MARKER = 0x55u;
+static constexpr uint64_t RAM_PROGRESS_US = 30u * 1000u * 1000u;
+
+// Patch points in the RAM_FILL snippet, and the opcodes that go in them.
+static constexpr uint16_t RAM_FILL_START = 1u;
+static constexpr uint16_t RAM_FILL_ADD = 5u;
+static constexpr uint16_t RAM_FILL_PAGE = 6u;
+static constexpr uint16_t RAM_FILL_STORE = 7u;
+static constexpr uint16_t RAM_FILL_END = 10u;
+static constexpr uint8_t OP_ADDA_IMM = 0x8Bu;
+static constexpr uint8_t OP_ADDB_IMM = 0xCBu;
+static constexpr uint8_t OP_STA_IDX = 0xA7u;
+static constexpr uint8_t OP_STB_IDX = 0xE7u;
+
+static constexpr struct ram_chip {
+	const char *name;
+	uint8_t first;
+	uint8_t last;
+	bool on_board;
+} ram_chips[] = {
+	{ "RAM0", 0x00u, 0x3Fu, true },
+	{ "RAM1", 0x40u, 0x7Fu, true },
+	{ "RAM2", 0x80u, 0xBFu, false },
+	{ "RAM3", 0xC0u, 0xFFu, false },	// includes page $FF, the fixed window
+};
+static constexpr uint8_t RAM_CHIPS = sizeof ram_chips / sizeof ram_chips[0];
+
+enum ram_page_state : uint8_t {
+	RAM_GOOD,
+	RAM_BAD,
+	RAM_ALIASED,	// holds exactly what was written to another page
+	RAM_SILENT,	// nothing answering
+	RAM_SKIPPED,	// its chip failed the data or address lines
+	RAM_STATES
+};
+
+enum ram_stage : uint8_t {
+	STAGE_GOOD,
+	STAGE_BAD,
+	STAGE_SILENT,
+	STAGE_NOT_RUN,
+};
+
+enum ram_fault_kind : uint8_t {
+	FAULT_DATA_READS_1,
+	FAULT_DATA_READS_0,
+	FAULT_DATA_SHORT,
+	FAULT_DATA_OTHER,
+	FAULT_ADDR_STUCK,		// the line's marker and the base share a cell
+	FAULT_ADDR_MAYBE_SHORTED,	// more than one did: they may be shorted instead
+	FAULT_ADDR_SHORT,
+};
+
+struct ram_fault {
+	ram_fault_kind kind;
+	uint8_t a;
+	uint8_t b;
+};
+
+struct ram_faults {
+	ram_fault list[16];
+	uint8_t count;
+};
+
+static uint16_t ram_retries;		// snippet runs that failed and were tried again
+static uint16_t ram_transients;		// mismatches that went away when read again
+static uint16_t ram_write_buffer_right;	// mismatches whose write buffer held the right value
+static uint16_t ram_recovered;		// checks that passed once the page was filled again
+static int16_t ram_window_page = -1;	// what slot 0 maps now, or -1 when not known
+static uint64_t ram_started_us;
+static uint64_t ram_progress_due_us;
+static uint8_t ram_sig_page[256];	// the page each signature belongs to
+
+// Run a snippet operation, trying again when the processor does not reach
+// SYNC.  A lost run says nothing about the memory, so it is counted and
+// reported rather than ending the test; only repeated failure ends it.
+template <typename F>
+static bool
+ram_try(F &&op)
+{
+	for (uint8_t attempt = 0u; attempt < RAM_ATTEMPTS; attempt++) {
+		if (op())
+			return true;
+		ram_retries++;
+	}
+	return false;
+}
+
+// A line every half minute or so while the long passes run, so the test is
+// seen to be alive without the console filling up.
+static void
+ram_progress(const char *doing, const unsigned page)
+{
+	const uint64_t now = time_us_64();
+	if (now < ram_progress_due_us)
+		return;
+	ram_progress_due_us = now + RAM_PROGRESS_US;
+	const unsigned secs = static_cast<unsigned>((now - ram_started_us) / 1000000u);
+	printf("    ... %s page %02X, %u:%02u in\n", doing, page, secs / 60u, secs % 60u);
+}
+
+// Each page's signature, added to the address byte by the storage passes: a
+// fixed scramble of the page number, a permutation because the multiplier is
+// odd.  With the plain page number, pages n and n+2^k differed by one bit in
+// every byte, so any fault forcing that bit read exactly like the other
+// page's data.
+static uint8_t
+ram_sig(const uint8_t page)
+{
+	return static_cast<uint8_t>(page * 0x9Du + 0x5Bu);
+}
+
+// The value a storage pass leaves at an address: its low or high byte, plus
+// the page's signature.
+static uint8_t
+ram_pattern(const uint32_t address, const bool high, const uint8_t page)
+{
+	return static_cast<uint8_t>((high ? (address >> 8) : address) + ram_sig(page));
+}
+
+// Map a page into slot 0 unless it is there already.
+static bool
+ram_select(const uint8_t page)
+{
+	if (ram_window_page == page)
+		return true;
+	ram_window_page = -1;
+	if (!ram_try([page] { return copy(OUTWARDS, 1u, RAM_DAT_BASE, &page); }))
+		return false;
+	ram_window_page = page;
+	return true;
+}
+
+static bool
+ram_poke(const uint8_t page, const uint16_t offset, const uint8_t value)
+{
+	return ram_select(page)
+	    && ram_try([&] { return copy(OUTWARDS, 1u, static_cast<uint16_t>(RAM_WINDOW + offset), &value); });
+}
+
+static bool
+ram_peek(const uint8_t page, const uint16_t offset, uint8_t &value)
+{
+	return ram_select(page)
+	    && ram_try([&] { return copy(INWARDS, 1u, static_cast<uint16_t>(RAM_WINDOW + offset), &value); });
+}
+
+static void
+ram_fault_add(ram_faults &f, const ram_fault_kind kind, const uint8_t a, const uint8_t b)
+{
+	for (uint8_t i = 0u; i < f.count; i++)
+		if (f.list[i].kind == kind
+		    && ((f.list[i].a == a && f.list[i].b == b) || (f.list[i].a == b && f.list[i].b == a)))
+			return;
+	if (f.count < sizeof f.list / sizeof f.list[0])
+		f.list[f.count++] = ram_fault{ kind, a, b };
+}
+
+// Address lines are numbered 0-18: A0-A12 within a page, then PA13-PA18.
+static void
+ram_fault_print(const ram_fault &f)
+{
+	const char *const line_a = f.a < RAM_OFFSET_LINES ? "A" : "PA";
+	const char *const line_b = f.b < RAM_OFFSET_LINES ? "A" : "PA";
+
+	switch (f.kind) {
+	case FAULT_DATA_READS_1:
+		printf("      D%u reads 1\n", f.a);
+		break;
+	case FAULT_DATA_READS_0:
+		printf("      D%u reads 0\n", f.a);
+		break;
+	case FAULT_DATA_SHORT:
+		printf("      D%u and D%u shorted together\n", f.a, f.b);
+		break;
+	case FAULT_DATA_OTHER:
+		printf("      wrote %02X, read %02X\n", f.a, f.b);
+		break;
+	case FAULT_ADDR_STUCK:
+		printf("      %s%u stuck or open\n", line_a, f.a);
+		break;
+	case FAULT_ADDR_MAYBE_SHORTED:
+		printf("      (the lines above may instead be shorted to one another)\n");
+		break;
+	case FAULT_ADDR_SHORT:
+		printf("      %s%u and %s%u shorted together\n", line_a, f.a, line_b, f.b);
+		break;
+	}
+}
+
+// Stage 1, the data lines: walking ones and walking zeros written to and read
+// back from one address, so nothing here depends on an address line.  Every
+// read returning the same value is nothing answering.  Otherwise a bit that
+// never changes is a line stuck at that level, and a walking bit that drags
+// another bit with it is a pair of lines shorted together.  False only when
+// the processor could not run a copy.
+static bool
+ram_test_data_lines(const ram_chip &c, ram_faults &faults, ram_stage &result)
+{
+	uint8_t wrote[2u * RAM_DATA_BITS];
+	uint8_t seen[2u * RAM_DATA_BITS];
+
+	for (uint8_t i = 0u; i < RAM_DATA_BITS; i++) {
+		wrote[i] = static_cast<uint8_t>(1u << i);
+		wrote[RAM_DATA_BITS + i] = static_cast<uint8_t>(~(1u << i));
+	}
+	bool one_value = true;
+	uint8_t always_set = 0xFFu;
+	uint8_t always_clear = 0xFFu;
+	for (uint8_t i = 0u; i < 2u * RAM_DATA_BITS; i++) {
+		if (!ram_poke(c.first, 0u, wrote[i]) || !ram_peek(c.first, 0u, seen[i]))
+			return false;
+		one_value = one_value && seen[i] == seen[0];
+		always_set &= seen[i];
+		always_clear &= static_cast<uint8_t>(~seen[i]);
+	}
+	if (one_value) {
+		result = STAGE_SILENT;
+		return true;
+	}
+
+	const uint8_t before = faults.count;
+	const uint8_t stuck = always_set | always_clear;
+	for (uint8_t bit = 0u; bit < RAM_DATA_BITS; bit++) {
+		if (always_set & (1u << bit))
+			ram_fault_add(faults, FAULT_DATA_READS_1, bit, 0u);
+		if (always_clear & (1u << bit))
+			ram_fault_add(faults, FAULT_DATA_READS_0, bit, 0u);
+	}
+	bool explained = true;
+	for (uint8_t i = 0u; i < 2u * RAM_DATA_BITS; i++) {
+		const uint8_t bit = static_cast<uint8_t>(i % RAM_DATA_BITS);
+		const uint8_t diff = static_cast<uint8_t>((seen[i] ^ wrote[i]) & ~stuck);
+		const uint8_t partners = static_cast<uint8_t>(diff & ~(1u << bit));
+		for (uint8_t other = 0u; other < RAM_DATA_BITS; other++)
+			if (partners & (1u << other))
+				ram_fault_add(faults, FAULT_DATA_SHORT, bit, other);
+		if (diff != 0u && partners == 0u)
+			explained = false;
+	}
+	if (!explained && faults.count == before)
+		for (uint8_t i = 0u; i < 2u * RAM_DATA_BITS; i++)
+			if (seen[i] != wrote[i]) {
+				ram_fault_add(faults, FAULT_DATA_OTHER, wrote[i], seen[i]);
+				break;
+			}
+	result = faults.count == before ? STAGE_GOOD : STAGE_BAD;
+	return true;
+}
+
+// Stage 2, the address lines, run once the data lines are good.  A marker
+// goes at offset 0 of the chip's first page, at each power-of-two offset in
+// that page - one for each of A0-A12 - and at the start of each power-of-two
+// page within the chip - one for each of PA13-PA18.
+//
+// The complement written at the base and turning up at a line's location
+// means the two share a cell: that line is stuck or open.  Which way it is
+// stuck cannot be told from here - forced high or forced low, the base and
+// the line's location land on the same cell either way - and it does not
+// matter for finding it.  Two lines pulled low by a short to each other both
+// land on the base too, so when more than one line does, a short is noted as
+// the other possibility.  Once no line shares the base, the complement
+// written at one line's location and turning up at another's means those two
+// lines are shorted, pulling each other high.  In the manner of Barr's
+// address-bus test.
+static bool
+ram_test_address_lines(const ram_chip &c, ram_faults &faults, ram_stage &result)
+{
+	struct {
+		uint8_t page;
+		uint16_t offset;
+	} loc[1u + RAM_OFFSET_LINES + RAM_PAGE_LINES];
+	static constexpr uint8_t locations = sizeof loc / sizeof loc[0];
+	uint8_t v = 0u;
+
+	loc[0] = { c.first, 0u };
+	for (uint8_t i = 0u; i < RAM_OFFSET_LINES; i++)
+		loc[1u + i] = { c.first, static_cast<uint16_t>(1u << i) };
+	for (uint8_t j = 0u; j < RAM_PAGE_LINES; j++)
+		loc[1u + RAM_OFFSET_LINES + j] = { static_cast<uint8_t>(c.first + (1u << j)), 0u };
+
+	const uint8_t before = faults.count;
+	for (const auto &l : loc)
+		if (!ram_poke(l.page, l.offset, RAM_MARKER))
+			return false;
+
+	if (!ram_poke(loc[0].page, loc[0].offset, RAM_ANTI_MARKER))
+		return false;
+	uint8_t sharing_base = 0u;
+	for (uint8_t k = 1u; k < locations; k++) {
+		if (!ram_peek(loc[k].page, loc[k].offset, v))
+			return false;
+		if (v == RAM_ANTI_MARKER) {
+			ram_fault_add(faults, FAULT_ADDR_STUCK, static_cast<uint8_t>(k - 1u), 0u);
+			sharing_base++;
+		}
+	}
+	if (sharing_base > 1u)
+		ram_fault_add(faults, FAULT_ADDR_MAYBE_SHORTED, 0u, 0u);
+	if (!ram_poke(loc[0].page, loc[0].offset, RAM_MARKER))
+		return false;
+
+	// A line sharing the base already moves every write that crosses it, so
+	// the pairwise checks would only restate it.
+	if (faults.count == before) {
+		for (uint8_t k = 1u; k < locations; k++) {
+			if (!ram_poke(loc[k].page, loc[k].offset, RAM_ANTI_MARKER))
+				return false;
+			for (uint8_t j = 1u; j < locations; j++) {
+				if (j == k)
+					continue;
+				if (!ram_peek(loc[j].page, loc[j].offset, v))
+					return false;
+				if (v != RAM_MARKER)
+					ram_fault_add(faults, FAULT_ADDR_SHORT,
+						      static_cast<uint8_t>(k - 1u), static_cast<uint8_t>(j - 1u));
+			}
+			if (!ram_poke(loc[k].page, loc[k].offset, RAM_MARKER))
+				return false;
+		}
+	}
+	result = faults.count == before ? STAGE_GOOD : STAGE_BAD;
+	return true;
+}
+
+static bool
+ram_fill(const uint16_t start, const uint16_t end, const bool high, const uint8_t page)
+{
+	return ram_try([=] {
+		snippet_copy(RAM_FILL);
+		reg[REGISTER_SNIPPET_OFFSET + RAM_FILL_START] = start;
+		reg[REGISTER_SNIPPET_OFFSET + RAM_FILL_ADD] = high ? OP_ADDA_IMM : OP_ADDB_IMM;
+		reg[REGISTER_SNIPPET_OFFSET + RAM_FILL_PAGE] = ram_sig(page);
+		reg[REGISTER_SNIPPET_OFFSET + RAM_FILL_STORE] = high ? OP_STA_IDX : OP_STB_IDX;
+		reg[REGISTER_SNIPPET_OFFSET + RAM_FILL_END] = end;
+		return MC6809.start_with_timeout(1000u);
+	});
+}
+
+struct ram_finding {
+	ram_page_state state;
+	uint16_t offset;	// the first wrong byte, from the start of the page
+	uint8_t wrote;
+	uint8_t seen;
+	uint8_t other_page;	// RAM_ALIASED: the page whose data it holds
+};
+
+// Check [start, end) against the pattern, sixteen bytes at a time, stopping
+// at the first block with a mismatch.  Only the low-byte pass can say more
+// than bad, since only its pattern changes from byte to byte.  A block that
+// reads one value throughout is nothing answering - the bus floating - even
+// when that value happens to equal one of the pattern's bytes; a working chip
+// cannot return a constant here.  A block wrong throughout by one constant
+// holds another page's pattern, and names it; wrong throughout any other way,
+// it matches no page at all.  False only when the processor could not run
+// the copy.
+static bool
+ram_check(const uint16_t start, const uint16_t end, const bool high, const uint8_t page,
+	  ram_finding &f)
+{
+	uint8_t buf[16];
+
+	f = ram_finding{ RAM_GOOD, 0u, 0u, 0u, 0u };
+	for (uint32_t a = start; a < end; a += sizeof buf) {
+		const uint16_t n = static_cast<uint16_t>(MIN(sizeof buf, end - a));
+		uint16_t wrong = 0u;
+		bool one_delta = true;
+		bool one_value = true;
+		uint8_t delta = 0u;
+		// A mismatch is read again before it is believed.  One that goes
+		// away was the read, not the memory, and is only counted - along
+		// with whether the Pico's write buffer, which DMA fills directly,
+		// had the right bytes all along.
+		for (uint8_t attempt = 0u; attempt < RAM_CONFIRM_READS; attempt++) {
+			if (!ram_try([&] { return copy(INWARDS, n, static_cast<uint16_t>(a), buf); }))
+				return false;
+			delta = static_cast<uint8_t>(buf[0] - ram_pattern(a, high, page));
+			wrong = 0u;
+			one_delta = true;
+			one_value = true;
+			bool write_buffer_right = true;
+			uint8_t written[16];
+			registers::copy_out_write(written, REGISTER_BUFFER_OFFSET, n);
+			for (uint16_t i = 0u; i < n; i++) {
+				const uint8_t want = ram_pattern(a + i, high, page);
+				one_delta = one_delta && static_cast<uint8_t>(buf[i] - want) == delta;
+				one_value = one_value && buf[i] == buf[0];
+				write_buffer_right = write_buffer_right && written[i] == want;
+				if (buf[i] != want && wrong++ == 0u) {
+					f.offset = static_cast<uint16_t>(a + i - start);
+					f.wrote = want;
+					f.seen = buf[i];
+				}
+			}
+			if (wrong == 0u) {
+				if (attempt != 0u)
+					ram_transients++;
+				break;
+			}
+			if (write_buffer_right)
+				ram_write_buffer_right++;
+		}
+		if (wrong == 0u)
+			continue;
+		f.state = RAM_BAD;
+		if (!high) {
+			if (one_value) {
+				f.state = RAM_SILENT;
+			} else if (wrong == n) {
+				if (one_delta) {
+					f.state = RAM_ALIASED;
+					f.other_page = ram_sig_page[static_cast<uint8_t>(ram_sig(page) + delta)];
+				} else {
+					f.state = RAM_SILENT;
+				}
+			}
+		}
+		return true;
+	}
+	return true;
+}
+
+// Consecutive pages that fail the same way, reported as one line.
+struct ram_run {
+	ram_page_state state;
+	uint16_t first;
+	uint16_t last;
+	uint8_t delta;		// RAM_ALIASED: the other page, less this one
+};
+
+static void
+ram_run_flush(ram_run &run)
+{
+	if (run.state == RAM_ALIASED || run.state == RAM_SILENT) {
+		const bool one = run.first == run.last;
+		if (one)
+			printf("    page %02X", run.first);
+		else
+			printf("    pages %02X-%02X", run.first, run.last);
+		if (run.state == RAM_SILENT)
+			printf(": nothing answering sensibly\n");
+		else if (one)
+			printf(": holds the data written to page %02X\n",
+			       static_cast<uint8_t>(run.first + run.delta));
+		else
+			printf(": hold the data written to pages %02X-%02X\n",
+			       static_cast<uint8_t>(run.first + run.delta),
+			       static_cast<uint8_t>(run.last + run.delta));
+	}
+	run.state = RAM_GOOD;
+}
+
+// Stage 3, one storage pass over every page whose chip passed stages 1 and 2.
+// Every page is written before any is read back, so a page answering at
+// another page's address shows up as that page's values rather than passing.
+// Pages already found wrong are left out; the high-byte pass exists for
+// A8-A12, which the low byte cannot see.
+static bool
+ram_pass(const bool high, ram_page_state state[256], uint16_t &reported)
+{
+	printf("  %s storage pass: each address's %s byte plus its page's signature\n",
+	       high ? "second" : "first", high ? "high" : "low");
+	for (uint16_t page = 0u; page <= RAM_LAST_DAT_PAGE; page++) {
+		if (state[page] != RAM_GOOD)
+			continue;
+		ram_progress("filling", page);
+		if (!ram_select(static_cast<uint8_t>(page))) {
+			printf("  aborted mapping page %02X for the fill\n", page);
+			return false;
+		}
+		if (!ram_fill(RAM_WINDOW, RAM_WINDOW_END, high, static_cast<uint8_t>(page))) {
+			printf("  aborted filling page %02X\n", page);
+			return false;
+		}
+	}
+	if (state[RAM_FIXED_PAGE] == RAM_GOOD
+	    && !ram_fill(RAM_FIXED_START, RAM_FIXED_END, high, RAM_FIXED_PAGE)) {
+		printf("  aborted filling the fixed window\n");
+		return false;
+	}
+
+	ram_run run{ RAM_GOOD, 0u, 0u, 0u };
+	for (uint16_t page = 0u; page <= RAM_FIXED_PAGE; page++) {
+		if (state[page] != RAM_GOOD)
+			continue;
+		ram_progress("checking", page);
+		const bool fixed = page == RAM_FIXED_PAGE;
+		if (!fixed && !ram_select(static_cast<uint8_t>(page))) {
+			ram_run_flush(run);
+			printf("  aborted mapping page %02X for the check\n", page);
+			return false;
+		}
+		ram_finding f{};
+		if (!ram_check(fixed ? RAM_FIXED_START : RAM_WINDOW, fixed ? RAM_FIXED_END : RAM_WINDOW_END,
+			       high, static_cast<uint8_t>(page), f)) {
+			ram_run_flush(run);
+			printf("  aborted checking page %02X\n", page);
+			return false;
+		}
+		state[page] = f.state;
+		if (f.state == RAM_ALIASED || f.state == RAM_SILENT) {
+			const uint8_t delta = static_cast<uint8_t>(f.other_page - page);
+			if (run.state == f.state && page == run.last + 1u
+			    && (f.state != RAM_ALIASED || delta == run.delta)) {
+				run.last = page;
+			} else {
+				ram_run_flush(run);
+				run = ram_run{ f.state, page, page, delta };
+			}
+			continue;
+		}
+		ram_run_flush(run);
+		if (f.state == RAM_BAD && reported++ < RAM_REPORT_LIMIT)
+			printf("    page %02X offset %04X: wrote %02X, read %02X\n",
+			       page, f.offset, f.wrote, f.seen);
+	}
+	ram_run_flush(run);
+
+	// Memory can be overwritten after the pass wrote it without the cell
+	// being faulty - by a lost snippet run, whose processor runs wild until
+	// the Pico resets it, or by stray writes while it is parked in SYNC with
+	// its buses released.  So each plain bad page is filled and checked once
+	// more on its own: an overwritten page passes, a faulty one fails again.
+	// Pages holding another page's data, or answering nothing, are not
+	// retried - a stray write does not produce those.
+	for (uint16_t page = 0u; page <= RAM_FIXED_PAGE; page++) {
+		if (state[page] != RAM_BAD)
+			continue;
+		const bool fixed = page == RAM_FIXED_PAGE;
+		const uint16_t start = fixed ? RAM_FIXED_START : RAM_WINDOW;
+		const uint16_t end = fixed ? RAM_FIXED_END : RAM_WINDOW_END;
+		if ((!fixed && !ram_select(static_cast<uint8_t>(page)))
+		    || !ram_fill(start, end, high, static_cast<uint8_t>(page))) {
+			printf("  aborted filling page %02X again\n", page);
+			return false;
+		}
+		ram_finding again{};
+		if (!ram_check(start, end, high, static_cast<uint8_t>(page), again)) {
+			printf("  aborted checking page %02X again\n", page);
+			return false;
+		}
+		if (again.state == RAM_GOOD) {
+			state[page] = RAM_GOOD;
+			ram_recovered++;
+			printf("    page %02X: good when filled and checked again\n", page);
+		}
+	}
+	return true;
+}
+
+// The DAT RAM itself, all 256 entries, written and read back in both
+// polarities.  Only slot 7's addresses are touched while it holds these,
+// so entries that would fault or map nothing are harmless - with one
+// exception, which sets the order.  A processor parked in SYNC floats its
+// address bus towards $0000, and the glue decodes that as a slot 0 access
+// through task zero's entry 0; left holding $FF, that entry would raise a
+// DAT fault on every park.  So the inverted pass goes first and the
+// straight pass last, leaving entry 0 mapping page 0.
+static bool
+ram_test_dat_storage(bool &good)
+{
+	uint8_t wrote[RAM_DAT_ENTRIES];
+	uint8_t seen[RAM_DAT_ENTRIES];
+	uint16_t reported = 0u;
+
+	good = true;
+	for (uint8_t pass = 0u; pass < 2u; pass++) {
+		const bool invert = pass == 0u;
+		for (uint16_t e = 0u; e < RAM_DAT_ENTRIES; e++)
+			wrote[e] = static_cast<uint8_t>(invert ? ~e : e);
+		if (!ram_try([&] { return copy(OUTWARDS, RAM_DAT_ENTRIES, RAM_DAT_BASE, wrote); })
+		    || !ram_try([&] { return copy(INWARDS, RAM_DAT_ENTRIES, RAM_DAT_BASE, seen); }))
+			return false;
+		for (uint16_t e = 0u; e < RAM_DAT_ENTRIES; e++) {
+			if (seen[e] == wrote[e])
+				continue;
+			good = false;
+			if (reported++ < RAM_REPORT_LIMIT)
+				printf("    DAT entry $%02X (task %u slot %u): wrote %02X, read %02X\n",
+				       e, e >> 3, e & 7u, wrote[e], seen[e]);
+		}
+	}
+	ram_window_page = -1;
+	return true;
+}
+
+// Translation through every task's row and every remappable slot.  Each
+// entry names a page that differs from the entry one DAT address line away -
+// bit 7 folds in $55 - and the second storage pass left each page's first
+// bytes holding its signature, so a read through the wrong entry, or with a
+// task or A13-A15 line wrong, reaches a page holding the wrong signature.
+// Uses only pages $00-$7F, the ones on the board.
+static bool
+ram_test_translation(bool &good)
+{
+	uint8_t map[RAM_DAT_ENTRIES];
+	uint8_t buf[16];
+	uint16_t reported = 0u;
+
+	for (uint16_t e = 0u; e < RAM_DAT_ENTRIES; e++)
+		map[e] = static_cast<uint8_t>((e & 0x7Fu) ^ ((e & 0x80u) ? 0x55u : 0x00u));
+	MC6809.stop();
+	task_pins_update(MC6809.task_change(0u));
+	ram_window_page = -1;
+	if (!ram_try([&] { return copy(OUTWARDS, RAM_DAT_ENTRIES, RAM_DAT_BASE, map); }))
+		return false;
+
+	good = true;
+	for (uint8_t task = 0u; task < RAM_TASKS; task++) {
+		MC6809.stop();
+		task_pins_update(MC6809.task_change(task));
+		for (uint8_t slot = 0u; slot < RAM_SLOTS; slot++) {
+			const uint8_t page = map[task * 8u + slot];
+			const uint8_t want = ram_sig(page);
+			int16_t wrong_value = -1;
+			// Read again before believing a mismatch, as the storage check does.
+			for (uint8_t attempt = 0u; attempt < RAM_CONFIRM_READS; attempt++) {
+				if (!ram_try([&] { return copy(INWARDS, sizeof buf, static_cast<uint16_t>(slot << 13), buf); }))
+					return false;
+				wrong_value = -1;
+				for (const uint8_t b : buf)
+					if (b != want) {
+						wrong_value = b;
+						break;
+					}
+				if (wrong_value < 0) {
+					if (attempt != 0u)
+						ram_transients++;
+					break;
+				}
+			}
+			if (wrong_value < 0)
+				continue;
+			// A runaway write may have trampled the page since the storage
+			// pass left its signature there.  Fill it again from task zero,
+			// put entry 0 back, and read it once more through this task's
+			// entry before believing the translation is wrong.
+			MC6809.stop();
+			task_pins_update(MC6809.task_change(0u));
+			ram_window_page = -1;
+			if (!ram_select(page) || !ram_fill(RAM_WINDOW, RAM_WINDOW_END, true, page)
+			    || !ram_try([&] { return copy(OUTWARDS, 1u, RAM_DAT_BASE, &map[0]); }))
+				return false;
+			ram_window_page = -1;
+			MC6809.stop();
+			task_pins_update(MC6809.task_change(task));
+			if (!ram_try([&] { return copy(INWARDS, sizeof buf, static_cast<uint16_t>(slot << 13), buf); }))
+				return false;
+			wrong_value = -1;
+			for (const uint8_t b : buf)
+				if (b != want) {
+					wrong_value = b;
+					break;
+				}
+			if (wrong_value < 0) {
+				ram_recovered++;
+				printf("    task %u slot %u: good once page %02X was filled again\n", task, slot, page);
+				continue;
+			}
+			good = false;
+			if (reported++ < RAM_REPORT_LIMIT)
+				printf("    task %u slot %u: expected page %02X, reached page %02X\n",
+				       task, slot, page, ram_sig_page[static_cast<uint8_t>(wrong_value)]);
+		}
+	}
+	MC6809.stop();
+	task_pins_update(MC6809.task_change(0u));
+	return true;
+}
+
+// Report each chip select's storage.  A chip that failed its data or address
+// lines was not given a storage test and is reported as such; the board's
+// two chips must be good throughout; an expansion chip may be good or absent,
+// but one answering for some pages and not others is broken.
+static bool
+ram_summary(const ram_page_state state[256], const ram_stage data[RAM_CHIPS],
+	    const ram_stage address[RAM_CHIPS], bool &on_board_good)
+{
+	bool good = true;
+
+	on_board_good = true;
+	for (uint8_t i = 0u; i < RAM_CHIPS; i++) {
+		const ram_chip &c = ram_chips[i];
+		printf("  %s pages %02X-%02X: ", c.name, c.first, c.last);
+		bool chip_good = true;
+		if (data[i] == STAGE_SILENT) {
+			printf("nothing answering%s\n", c.on_board ? "" : " - nothing fitted?");
+			chip_good = !c.on_board;
+		} else if (data[i] != STAGE_GOOD || address[i] != STAGE_GOOD) {
+			printf("%s lines faulty, storage not tested\n", data[i] != STAGE_GOOD ? "data" : "address");
+			chip_good = false;
+		} else {
+			uint16_t counts[RAM_STATES] = { 0u, 0u, 0u, 0u, 0u };
+			for (uint16_t page = c.first; page <= c.last; page++)
+				counts[state[page]]++;
+			const uint16_t pages = static_cast<uint16_t>(c.last - c.first + 1u);
+			if (counts[RAM_GOOD] == pages) {
+				printf("all %u good\n", pages);
+			} else {
+				printf("%u good, %u bad, %u holding another page's data, %u not answering\n",
+				       counts[RAM_GOOD], counts[RAM_BAD], counts[RAM_ALIASED], counts[RAM_SILENT]);
+				chip_good = false;
+			}
+		}
+		if (!chip_good) {
+			good = false;
+			if (c.on_board)
+				on_board_good = false;
+		}
+	}
+	return good;
+}
+
+static bool
+ram_test()
+{
+	static ram_page_state state[256];
+	ram_stage data[RAM_CHIPS];
+	ram_stage address[RAM_CHIPS];
+	uint16_t reported = 0u;
+	bool good = true;
+	bool part_good = true;
+
+	ram_started_us = time_us_64();
+	ram_progress_due_us = ram_started_us + RAM_PROGRESS_US;
+	ram_retries = 0u;
+	ram_transients = 0u;
+	ram_write_buffer_right = 0u;
+	ram_recovered = 0u;
+	copy_buffer_disagreements = 0u;
+	ram_window_page = -1;
+	for (uint16_t p = 0u; p < 256u; p++)
+		ram_sig_page[ram_sig(static_cast<uint8_t>(p))] = static_cast<uint8_t>(p);
+	MC6809.stop();
+	task_pins_update(MC6809.task_change(0u));
+
+	printf("  DAT RAM, all 256 entries both ways up\n");
+	if (!ram_test_dat_storage(part_good))
+		return false;
+	good = good && part_good;
+
+	// Stages 1 and 2 for each chip select, before any storage is trusted.
+	// A stage that finds a fault is run a second time, and only faults the
+	// second run finds too are believed.
+	printf("  data and address lines, chip select by chip select\n");
+	for (uint8_t i = 0u; i < RAM_CHIPS; i++) {
+		const ram_chip &c = ram_chips[i];
+		ram_faults faults{};
+		address[i] = STAGE_NOT_RUN;
+		if (!ram_test_data_lines(c, faults, data[i])) {
+			printf("  aborted testing %s's data lines\n", c.name);
+			return false;
+		}
+		if (data[i] == STAGE_BAD) {
+			ram_faults again{};
+			if (!ram_test_data_lines(c, again, data[i])) {
+				printf("  aborted testing %s's data lines\n", c.name);
+				return false;
+			}
+			if (data[i] != STAGE_BAD)
+				ram_transients++;
+			faults = again;
+		}
+		if (data[i] == STAGE_GOOD) {
+			if (!ram_test_address_lines(c, faults, address[i])) {
+				printf("  aborted testing %s's address lines\n", c.name);
+				return false;
+			}
+			if (address[i] == STAGE_BAD) {
+				ram_faults again{};
+				if (!ram_test_address_lines(c, again, address[i])) {
+					printf("  aborted testing %s's address lines\n", c.name);
+					return false;
+				}
+				if (address[i] != STAGE_BAD)
+					ram_transients++;
+				faults = again;
+			}
+		}
+		printf("  %s pages %02X-%02X: ", c.name, c.first, c.last);
+		if (data[i] == STAGE_SILENT)
+			printf("nothing answering%s\n", c.on_board ? "" : " - nothing fitted?");
+		else if (data[i] == STAGE_BAD)
+			printf("data lines faulty - address and storage tests skipped\n");
+		else if (address[i] == STAGE_BAD)
+			printf("data lines good, address lines faulty - storage test skipped\n");
+		else
+			printf("data lines good, address lines good\n");
+		for (uint8_t f = 0u; f < faults.count; f++)
+			ram_fault_print(faults.list[f]);
+
+		const ram_page_state initial = data[i] == STAGE_SILENT ? RAM_SILENT
+			: (data[i] == STAGE_GOOD && address[i] == STAGE_GOOD) ? RAM_GOOD : RAM_SKIPPED;
+		for (uint16_t page = c.first; page <= c.last; page++)
+			state[page] = initial;
+	}
+
+	// Stage 3.  A summary after each pass, so that a later abort cannot hide
+	// what the first pass had already found.
+	bool on_board_good = true;
+	for (uint8_t pass = 0u; pass < 2u; pass++) {
+		if (!ram_pass(pass == 1u, state, reported))
+			return false;
+		const bool summary_good = ram_summary(state, data, address, on_board_good);
+		if (pass == 1u)
+			good = summary_good && good;
+	}
+
+	if (on_board_good) {
+		printf("  DAT translation, %u tasks through %u slots each\n", RAM_TASKS, RAM_SLOTS);
+		if (!ram_test_translation(part_good))
+			return false;
+		good = good && part_good;
+	} else {
+		printf("  DAT translation not tested - it needs pages 00-7F good\n");
+		good = false;
+	}
+	return good;
+}
+
+// The synctest command: how often a snippet run fails to finish.  Three
+// phases of the same number of runs: the SYNC snippet alone, touching nothing
+// outside the Pico's window; sixteen-byte copies from on-board page $00; and
+// the same from expansion page $C0, when anything answers there.  A copy that
+// never reaches SYNC is counted apart from one that reaches it with the wrong
+// bytes, so the processor misreading its instructions can be told from it
+// misreading RAM.  A lost run may have trampled the bytes being copied, so
+// they are written again after one.
+static constexpr uint8_t SYNCTEST_ON_BOARD_PAGE = 0x00u;
+static constexpr uint8_t SYNCTEST_EXPANSION_PAGE = 0xC0u;
+
+static void
+synctest_report(const char *what, const uint32_t runs, const uint32_t lost, const uint32_t wrong)
+{
+	printf("  %-24s %" PRIu32 " runs: %" PRIu32 " did not finish, %" PRIu32 " finished with wrong bytes\n",
+	       what, runs, lost, wrong);
+}
+
+// One copy of sixteen bytes from the start of slot 0, quietly - copy() would
+// print on every failure, and failures are what is being counted.
+static bool
+synctest_copy_in(uint8_t buf[REGISTER_BUFFER_LEN])
+{
+	snippet_copy(COPY_IN);
+	reg[REGISTER_SNIPPET_OFFSET + 4u] = RAM_WINDOW;
+	reg[REGISTER_SNIPPET_OFFSET + 7u] = static_cast<uint8_t>(REGISTER_BUFFER_LEN);
+	if (!MC6809.start_with_timeout(4u))
+		return false;
+	registers::copy_out(buf, REGISTER_BUFFER_OFFSET, REGISTER_BUFFER_LEN);
+	return true;
+}
+
+static bool
+synctest_place(const uint8_t page, const uint8_t pattern[REGISTER_BUFFER_LEN])
+{
+	MC6809.stop();
+	task_pins_update(MC6809.task_change(0u));
+	return ram_try([&] { return copy(OUTWARDS, 1u, RAM_DAT_BASE, &page); })
+	    && ram_try([&] { return copy(OUTWARDS, REGISTER_BUFFER_LEN, RAM_WINDOW, pattern); });
+}
+
+static void
+synctest_copies(const char *what, const uint8_t page, const uint32_t runs,
+		const uint8_t pattern[REGISTER_BUFFER_LEN])
+{
+	uint8_t buf[REGISTER_BUFFER_LEN];
+
+	if (!synctest_place(page, pattern)) {
+		printf("  %-24s could not place the pattern - skipped\n", what);
+		return;
+	}
+	if (synctest_copy_in(buf) && std::memcmp(buf, pattern, sizeof buf) != 0) {
+		bool one_value = true;
+		for (const uint8_t b : buf)
+			one_value = one_value && b == buf[0];
+		printf("  %-24s %s - skipped\n", what,
+		       one_value ? "nothing answering" : "does not hold the pattern");
+		return;
+	}
+	uint32_t lost = 0u;
+	uint32_t wrong = 0u;
+	for (uint32_t n = 0u; n < runs; n++) {
+		if (!synctest_copy_in(buf)) {
+			lost++;
+			(void) synctest_place(page, pattern);
+		} else if (std::memcmp(buf, pattern, sizeof buf) != 0) {
+			wrong++;
+			(void) synctest_place(page, pattern);
+		}
+	}
+	synctest_report(what, runs, lost, wrong);
+}
+
+static void
+synctest(const uint32_t runs)
+{
+	uint8_t pattern[REGISTER_BUFFER_LEN];
+
+	// Each bit takes both values somewhere across the sixteen bytes.
+	for (uint8_t i = 0u; i < sizeof pattern; i++)
+		pattern[i] = static_cast<uint8_t>(0xA5u ^ (i * 0x11u));
+	printf("Snippet reliability at E = %.1f MHz, %" PRIu32 " runs a phase\n",
+	       static_cast<double>(MC6809.get_e_frequency()), runs);
+
+	uint32_t lost = 0u;
+	for (uint32_t n = 0u; n < runs; n++) {
+		snippet_copy(SYNC);
+		if (!MC6809.start_with_timeout(4u))
+			lost++;
+	}
+	synctest_report("SYNC snippet alone", runs, lost, 0u);
+	synctest_copies("copies from page 00", SYNCTEST_ON_BOARD_PAGE, runs, pattern);
+	synctest_copies("copies from page C0", SYNCTEST_EXPANSION_PAGE, runs, pattern);
 }
 
 /* cmd_parse() - glue between process_command() and the flex/bison parser */
@@ -1576,6 +2533,8 @@ process_command(char *buf)
 		"  vector [n]         (vc)  show or set the CPU vectors\n"
 		"  adcdump                  burst-sample both ADC channels under\n"
 		"                           three bus loads; dumps raw counts as CSV\n"
+		"  ramtest                  test every RAM page and the DAT (overwrites RAM)\n"
+		"  synctest [n]             count snippet runs that fail (n decimal, default 1000)\n"
 		"  snippet [n]        (sn)  list snippets, or copy n to $FFE0\n"
 		"\n--- Debug ---\n"
 		"  trace on|off       (tr)  arm or disarm the %u-cycle one-shot\n"
@@ -1791,6 +2750,49 @@ status_done:
 		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.loop.address;
 		MC6809.start();
 		break;
+
+	case CMD_SYNCTEST:
+		if (!MC6809.assert_stopped())
+			break;
+		synctest(cmd.synctest.runs);
+		// Leave task zero and an identity DAT behind, as ramtest does.
+		MC6809.stop();
+		task_pins_update(MC6809.task_change(0u));
+		snippet_copy(DAT_INIT);
+		if (!MC6809.start_with_timeout(4u))
+			printf("  restoring the identity DAT failed\n");
+		break;
+
+	case CMD_RAMTEST: {
+		if (!MC6809.assert_stopped())
+			break;
+		printf("RAM/DAT test - this overwrites all of RAM and takes several minutes\n");
+		const bool good = ram_test();
+		if (ram_retries != 0u)
+			printf("  %u snippet run%s failed and had to be repeated\n",
+			       ram_retries, ram_retries == 1u ? "" : "s");
+		if (ram_recovered != 0u)
+			printf("  %u check%s passed once the page was filled again - overwritten after the test wrote it, not a faulty cell\n",
+			       ram_recovered, ram_recovered == 1u ? "" : "s");
+		if (ram_transients != 0u)
+			printf("  %u mismatch%s went away when read again - not counted as faults\n",
+			       ram_transients, ram_transients == 1u ? "" : "es");
+		if (ram_write_buffer_right != 0u)
+			printf("  %u bad read%s had the right bytes in the Pico's write buffer\n",
+			       ram_write_buffer_right, ram_write_buffer_right == 1u ? "" : "s");
+		if (copy_buffer_disagreements != 0u)
+			printf("  %" PRIu32 " cop%s left the Pico's read and write buffers disagreeing\n",
+			       copy_buffer_disagreements, copy_buffer_disagreements == 1u ? "y" : "ies");
+		// Leave task zero and an identity DAT behind, whatever happened.
+		MC6809.stop();
+		task_pins_update(MC6809.task_change(0u));
+		snippet_copy(DAT_INIT);
+		if (!MC6809.start_with_timeout(4u))
+			printf("  restoring the identity DAT failed\n");
+		const unsigned secs = static_cast<unsigned>((time_us_64() - ram_started_us) / 1000000u);
+		printf("RAM/DAT test: %s (%u:%02u)\n", good ? "PASS" : "FAIL", secs / 60u, secs % 60u);
+		break;
+	}
 
 	case CMD_RTC_QUERY: {
 		uint8_t r[RTC_CLOCK_REGISTERS];

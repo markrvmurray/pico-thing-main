@@ -109,6 +109,8 @@ match_command_keyword(const char *text)
 		 * reaches this table.  See the note at the top of this file. */
 		{ "adcdump", NULL, TOK_ADC     },
 		{ "rtc",     NULL, TOK_RTC     },
+		{ "ramtest", NULL, TOK_RAMTEST },
+		{ "synctest", NULL, TOK_SYNCTEST },
 		{ NULL, NULL, 0 }
 	};
 

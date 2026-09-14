@@ -145,6 +145,8 @@ static int _t_count;
 %token TOK_NITROS9
 %token TOK_ADC
 %token TOK_RTC
+%token TOK_RAMTEST
+%token TOK_SYNCTEST
 
 /* Subcommand keywords */
 %token TOK_DAT
@@ -209,6 +211,8 @@ command:
 	| nitros9_cmd
 	| adc_cmd
 	| rtc_cmd
+	| ramtest_cmd
+	| synctest_cmd
 	| TOK_WORD        { printf("Unknown command \"%s\"\n", $1); YYERROR; }
 	;
 
@@ -282,6 +286,33 @@ rtc_cmd:
 			YYERROR;
 		}
 		result->tag = CMD_RTC_TO_PICO;
+	}
+	;
+
+/* -----------------------------------------------------------------------
+ * ramtest - test every RAM page and the DAT, overwriting all of RAM
+ * ----------------------------------------------------------------------- */
+ramtest_cmd:
+	TOK_RAMTEST { result->tag = CMD_RAMTEST; }
+	;
+
+/* -----------------------------------------------------------------------
+ * synctest [ <runs> ] - count snippet runs that fail to finish
+ * runs is decimal, 1-100000, default 1000
+ * ----------------------------------------------------------------------- */
+synctest_cmd:
+	  TOK_SYNCTEST {
+		result->tag           = CMD_SYNCTEST;
+		result->synctest.runs = 1000u;
+	}
+	| TOK_SYNCTEST TOK_NUMBER {
+		long v = parse_dec($2);
+		if (v == LONG_MIN || v < 1 || v > 100000) {
+			printf("Invalid run count '%s' (valid: 1-100000, decimal)\n", $2);
+			YYERROR;
+		}
+		result->tag           = CMD_SYNCTEST;
+		result->synctest.runs = (uint32_t)v;
 	}
 	;
 
