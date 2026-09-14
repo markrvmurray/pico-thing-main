@@ -777,6 +777,64 @@ TEST_CASE("adc", "[adc]")
 }
 
 // ============================================================
+//  rtc
+// ============================================================
+TEST_CASE("rtc command", "[parser][rtc]")
+{
+	parsed_cmd_t cmd{};
+	SECTION("rtc alone is a query")
+	{
+		REQUIRE(parse("rtc", &cmd));
+		CHECK(cmd.tag == CMD_RTC_QUERY);
+	}
+	SECTION("all six fields set it, decimal despite leading zeros")
+	{
+		REQUIRE(parse("rtc 2026 09 14 14 49 23", &cmd));
+		CHECK(cmd.tag         == CMD_RTC_SET);
+		CHECK(cmd.time.year   == 2026);
+		CHECK(cmd.time.month  == 8);   /* 0-based */
+		CHECK(cmd.time.day    == 14);
+		CHECK(cmd.time.hour   == 14);
+		CHECK(cmd.time.minute == 49);
+		CHECK(cmd.time.second == 23);
+		CHECK(cmd.time.count  == 6);
+	}
+	SECTION("fewer fields default as they do for time")
+	{
+		REQUIRE(parse("rtc 2026 9", &cmd));
+		CHECK(cmd.tag        == CMD_RTC_SET);
+		CHECK(cmd.time.month == 8);
+		CHECK(cmd.time.day   == 1);
+		CHECK(cmd.time.count == 2);
+	}
+	SECTION("the year range is time's")
+	{
+		CHECK_FALSE(parse("rtc 2024", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+	SECTION("hour 24 is rejected")
+	{
+		CHECK_FALSE(parse("rtc 2026 9 14 24 0 0", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+	SECTION("rtc set copies the RTC into the Pico clock")
+	{
+		REQUIRE(parse("rtc set", &cmd));
+		CHECK(cmd.tag == CMD_RTC_TO_PICO);
+	}
+	SECTION("rtc set is case-insensitive")
+	{
+		REQUIRE(parse("rtc SET", &cmd));
+		CHECK(cmd.tag == CMD_RTC_TO_PICO);
+	}
+	SECTION("any other word is rejected")
+	{
+		CHECK_FALSE(parse("rtc bogus", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+}
+
+// ============================================================
 //  trace
 // ============================================================
 

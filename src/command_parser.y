@@ -144,6 +144,7 @@ static int _t_count;
 %token TOK_USB
 %token TOK_NITROS9
 %token TOK_ADC
+%token TOK_RTC
 
 /* Subcommand keywords */
 %token TOK_DAT
@@ -207,6 +208,7 @@ command:
 	| srecord_cmd
 	| nitros9_cmd
 	| adc_cmd
+	| rtc_cmd
 	| TOK_WORD        { printf("Unknown command \"%s\"\n", $1); YYERROR; }
 	;
 
@@ -249,6 +251,38 @@ reset_cmd:
  * ----------------------------------------------------------------------- */
 adc_cmd:
 	TOK_ADC     { result->tag = CMD_ADC; }
+	;
+
+/* -----------------------------------------------------------------------
+ * rtc [ <Year> [ <Mon> [ <Day> [ <Hour> [ <Min> [ <Sec> ] ] ] ] ] ]
+ * rtc set
+ * The DS12885 real-time clock.  Alone, show its date and time; with
+ * arguments, set it.  The arguments are exactly those of time: decimal,
+ * with the month made 0-based.  "rtc set" sets the Pico's own clock from
+ * the RTC; it is a word rather than a keyword so that no other command
+ * loses "set".
+ * ----------------------------------------------------------------------- */
+rtc_cmd:
+	  TOK_RTC {
+		result->tag = CMD_RTC_QUERY;
+	}
+	| TOK_RTC time_args {
+		result->tag         = CMD_RTC_SET;
+		result->time.year   = _t_year;
+		result->time.month  = _t_month;
+		result->time.day    = _t_day;
+		result->time.hour   = _t_hour;
+		result->time.minute = _t_minute;
+		result->time.second = _t_second;
+		result->time.count  = _t_count;
+	}
+	| TOK_RTC TOK_WORD {
+		if (strcasecmp($2, "set") != 0) {
+			printf("Unknown rtc argument '%s' (expected set, or a date and time)\n", $2);
+			YYERROR;
+		}
+		result->tag = CMD_RTC_TO_PICO;
+	}
 	;
 
 /* -----------------------------------------------------------------------

@@ -15,6 +15,7 @@ CHUNK	EQU	$0130
 TASK	EQU	DEVICE+$00
 TRACE	EQU	DEVICE+$0B	Bus trace control: non-zero arms a one-shot
 DATFLT	EQU	DEVICE+$0C	DAT fault status; bit 7 is NMIBlock
+RTCADDR	EQU	$FF32	DS12885 index port; the data port is the next address
 
 UARTC	equ	$FFC4
 UARTS	equ	$FFC4
@@ -514,6 +515,59 @@ str.TK              fcn       "  TK = "
 
                     fill      $FF,$FE00-* pad to end of region
 
+* Read the DS12885's clock and control registers, $00-$0D, into SHARED.
+* Each register is selected and read in consecutive instructions, so
+* nothing comes between the index write and the data read.  The pass first
+* waits out an update - UIP set means one is due within 244us - and ends by
+* re-reading the seconds: if they have moved, an update landed during the
+* pass and it is taken again, so the Pico never sees a time that straddles
+* a tick.  A silent RTC leaves the bus floating high, which reads as UIP
+* set for ever; the Pico's timeout catches that.
+	ORG	CHUNK
+RtcRd	LDA	#$0A	register A
+R@0	STA	RTCADDR
+	LDB	RTCADDR+1
+	BMI	R@0	UIP: wait for the update to pass
+	CLR	RTCADDR	register 0, the seconds
+	LDB	RTCADDR+1
+	STB	RtcSec	kept to check the pass against
+	CLRA
+	LDU	#SHARED
+R@1	STA	RTCADDR	select the register
+	LDB	RTCADDR+1	and read it at once
+	STB	,U+
+	INCA
+	CMPA	#$0E	$00-$0D: the clock and all four control registers
+	BNE	R@1
+	CLR	RTCADDR	the seconds once more
+	LDB	RTCADDR+1
+	CMPB	RtcSec
+	BNE	RtcRd	they moved: an update landed mid-pass, so read again
+	SYNC
+RtcSec	FCB	0
+
+* Set the DS12885 from ten values the Pico stages in SHARED: registers
+* $00-$09 - the time, its three alarm bytes and the date - already binary.
+* SET holds updates off while they are written; register A then starts the
+* oscillator and register B clears SET, leaving binary 24-hour mode with
+* every interrupt off, so no alarm can fire.  STD writes the index and then
+* the value in consecutive cycles.
+	ORG	CHUNK
+RtcSet	LDD	#$0B86	register B: SET, binary, 24-hour
+	STD	RTCADDR
+	CLRA
+	LDU	#SHARED
+S@0	LDB	,U+	the value staged for this register
+	STD	RTCADDR
+	INCA
+	CMPA	#$0A	$00-$09
+	BNE	S@0
+	LDD	#$0A20	register A: oscillator on, divider counting
+	STD	RTCADDR
+	LDD	#$0B06	register B: SET clear, binary, 24-hour, interrupts off
+	STD	RTCADDR
+	SYNC
+
 	ORG	$0000
 	FCC	"DAT_INIT"
 	FCB	' '
@@ -556,3 +610,7 @@ str.TK              fcn       "  TK = "
 	FCC	"IRQ_TEST"
 	FCB	' '
 	FCC	"DBGMON"
+	FCB	' '
+	FCC	"RTC_READ"
+	FCB	' '
+	FCC	"RTC_SET"

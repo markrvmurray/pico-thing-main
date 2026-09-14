@@ -954,6 +954,74 @@ print_time()
 		printf("Unable to get calendar time\n");
 }
 
+// The DS12885's registers, for the rtc command.  The clock is kept in binary
+// and 24-hour mode.  The DS12885 has no century register - that is the
+// DS12C887's - so the year is two digits and taken to be 20xx.
+enum rtc_register : uint8_t {
+	RTC_SECONDS,
+	RTC_SECONDS_ALARM,
+	RTC_MINUTES,
+	RTC_MINUTES_ALARM,
+	RTC_HOURS,
+	RTC_HOURS_ALARM,
+	RTC_DAY,		// day of the week, 1 being Sunday
+	RTC_DATE,
+	RTC_MONTH,
+	RTC_YEAR,
+	RTC_A,			// the time, alarm and date registers are the ten below this
+	RTC_B,
+	RTC_C,
+	RTC_D,
+	RTC_CLOCK_REGISTERS	// $00-$0D, what RTC_READ fetches
+};
+static constexpr uint8_t RTC_A_DV_MASK = 0x70u;
+static constexpr uint8_t RTC_A_DV_RUN = 0x20u;	// 010, the only divider pattern that keeps time
+static constexpr uint8_t RTC_B_SET = 0x80u;
+static constexpr uint8_t RTC_B_MODE = 0x06u;	// DM set for binary, 24/12 set for 24-hour
+static constexpr uint8_t RTC_D_VRT = 0x80u;
+
+static const char *const rtc_day_name[] = {
+	"?", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+};
+
+// Month is 1-12.
+static int
+days_in_month(const int year, const int month)
+{
+	static constexpr int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+	const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+	return days[month - 1] + ((month == 2 && leap) ? 1 : 0);
+}
+
+// Day of the week as the DS12885 counts it, 1 being Sunday, by Sakamoto's
+// method.  Month is 1-12.
+static uint8_t
+rtc_day_of_week(const int year, const int month, const int day)
+{
+	static constexpr int offset[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+	const int y = year - (month < 3 ? 1 : 0);
+	return static_cast<uint8_t>((y + y/4 - y/100 + y/400 + offset[month - 1] + day) % 7 + 1);
+}
+
+// Fetch registers $00-$0D with RTC_READ, which waits out an update and
+// retakes any pass one lands in, so they are a single instant.  False, with
+// the reason printed, if the chunk cannot run or the RTC does not answer.
+static bool
+rtc_read(uint8_t r[RTC_CLOCK_REGISTERS])
+{
+	if (!MC6809.assert_stopped())
+		return false;
+	if (!copy(OUTWARDS, chunk_len[RTC_READ], CHUNK_ADDRESS, chunk_code[RTC_READ]))
+		return false;
+	reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
+	if (!MC6809.start_with_timeout(100u)) {
+		printf("RTC is not answering - its update-in-progress bit never cleared\n");
+		return false;
+	}
+	registers::copy_out(r, REGISTER_BUFFER_OFFSET, RTC_CLOCK_REGISTERS);
+	return true;
+}
+
 /* cmd_parse() - glue between process_command() and the flex/bison parser */
 bool
 cmd_parse(const char *input, parsed_cmd_t *out)
@@ -1528,6 +1596,8 @@ process_command(char *buf)
 		"  verbose            (vb)  toggle verbose output\n"
 		"\n--- Host ---\n"
 		"  time [y m d h m s] (ti)  show or set the clock\n"
+		"  rtc [y m d h m s]        show or set the DS12885 real-time clock\n"
+		"  rtc set                  set the Pico clock from the RTC\n"
 		"  usb [args]         (ub)  USB console control\n"
 		"  nitros9 [ide|drivewire]  (ni)  boot NitrOS-9; drivewire is also dw\n"
 		"  help               (h)   this text\n"
@@ -1721,6 +1791,104 @@ status_done:
 		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.loop.address;
 		MC6809.start();
 		break;
+
+	case CMD_RTC_QUERY: {
+		uint8_t r[RTC_CLOCK_REGISTERS];
+		if (!rtc_read(r))
+			break;
+		if ((r[RTC_B] & RTC_B_MODE) != RTC_B_MODE) {
+			printf("RTC has not been set - it is not in binary 24-hour mode (register B = %02X)\n",
+			       r[RTC_B]);
+			printf("Set it with rtc <year> <month> <day> <hour> <minute> <second>\n");
+		} else {
+			const uint8_t day = r[RTC_DAY];
+			printf("%04d-%02d-%02d %02d:%02d:%02d %s\n",
+			       2000 + r[RTC_YEAR], r[RTC_MONTH], r[RTC_DATE],
+			       r[RTC_HOURS], r[RTC_MINUTES], r[RTC_SECONDS],
+			       rtc_day_name[(day >= 1u && day <= 7u) ? day : 0u]);
+		}
+		if ((r[RTC_A] & RTC_A_DV_MASK) != RTC_A_DV_RUN || (r[RTC_B] & RTC_B_SET) != 0u)
+			printf("RTC clock is stopped (register A = %02X, B = %02X)\n", r[RTC_A], r[RTC_B]);
+		if ((r[RTC_D] & RTC_D_VRT) == 0u)
+			printf("RTC battery is absent or exhausted (VRT clear) - the time will not survive power off\n");
+		break;
+	}
+
+	case CMD_RTC_TO_PICO: {
+		// Set the Pico's own clock from the RTC.  Only a time this firmware
+		// could have set is trusted: binary 24-hour mode, a running clock,
+		// and every field possible.  A clear VRT is only a warning - the
+		// time is still right if the board has stayed powered since it was
+		// set.
+		uint8_t r[RTC_CLOCK_REGISTERS];
+		if (!rtc_read(r))
+			break;
+		if ((r[RTC_B] & RTC_B_MODE) != RTC_B_MODE) {
+			printf("RTC has not been set (not in binary 24-hour mode) - Pico clock unchanged\n");
+			break;
+		}
+		if ((r[RTC_A] & RTC_A_DV_MASK) != RTC_A_DV_RUN || (r[RTC_B] & RTC_B_SET) != 0u) {
+			printf("RTC clock is stopped, so its time is stale - Pico clock unchanged\n");
+			break;
+		}
+		const int year = 2000 + r[RTC_YEAR];
+		const int month = r[RTC_MONTH];
+		if (month < 1 || month > 12 || r[RTC_DATE] < 1 || r[RTC_DATE] > days_in_month(year, month)
+		    || r[RTC_HOURS] > 23 || r[RTC_MINUTES] > 59 || r[RTC_SECONDS] > 59) {
+			printf("RTC holds an impossible date or time - Pico clock unchanged\n");
+			break;
+		}
+		if ((r[RTC_D] & RTC_D_VRT) == 0u)
+			printf("RTC battery is absent or exhausted (VRT clear) - using its time anyway\n");
+		tm tm = {
+			.tm_sec   = r[RTC_SECONDS],
+			.tm_min   = r[RTC_MINUTES],
+			.tm_hour  = r[RTC_HOURS],
+			.tm_mday  = r[RTC_DATE],
+			.tm_mon   = month - 1,
+			.tm_year  = year - 1900,
+			.tm_isdst = 0,
+		};
+		aon_timer_set_time_calendar(&tm);
+		print_time();
+		break;
+	}
+
+	case CMD_RTC_SET: {
+		const int year = cmd.time.year;
+		const int month = cmd.time.month + 1;	// the grammar makes it 0-based, for tm
+		const int day = cmd.time.day;
+		if (day > days_in_month(year, month)) {
+			printf("Invalid day %d for %04d-%02d\n", day, year, month);
+			break;
+		}
+		// Registers $00-$09 in order.  The alarm bytes are zeroed, and
+		// RTC_SET leaves every interrupt disabled, so no alarm is armed.
+		const uint8_t values[RTC_A] = {
+			static_cast<uint8_t>(cmd.time.second), 0u,
+			static_cast<uint8_t>(cmd.time.minute), 0u,
+			static_cast<uint8_t>(cmd.time.hour), 0u,
+			rtc_day_of_week(year, month, day),
+			static_cast<uint8_t>(day),
+			static_cast<uint8_t>(month),
+			static_cast<uint8_t>(year % 100),
+		};
+		if (!MC6809.assert_stopped())
+			break;
+		if (!copy(OUTWARDS, chunk_len[RTC_SET], CHUNK_ADDRESS, chunk_code[RTC_SET]))
+			break;
+		// Staged after the copy, which moves the chunk through SHARED.
+		registers::copy_in(REGISTER_BUFFER_OFFSET, values, RTC_A);
+		reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
+		if (!MC6809.start_with_timeout(100u)) {
+			printf("RTC set did not finish - the CPU never reached SYNC\n");
+			break;
+		}
+		printf("RTC set to %04d-%02d-%02d %02d:%02d:%02d %s\n",
+		       year, month, day, cmd.time.hour, cmd.time.minute, cmd.time.second,
+		       rtc_day_name[rtc_day_of_week(year, month, day)]);
+		break;
+	}
 
 	case CMD_ADC: {
 		// Burst-sample both ADC channels under three bus conditions and dump

@@ -108,6 +108,7 @@ match_command_keyword(const char *text)
 		/* Not "adc": three hex digits, so it lexes as a number and never
 		 * reaches this table.  See the note at the top of this file. */
 		{ "adcdump", NULL, TOK_ADC     },
+		{ "rtc",     NULL, TOK_RTC     },
 		{ NULL, NULL, 0 }
 	};
 

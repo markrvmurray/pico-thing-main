@@ -36,6 +36,9 @@ typedef enum cmd_tag {
 
 	CMD_VECTOR,
 	CMD_ADC,
+	CMD_RTC_QUERY,
+	CMD_RTC_SET,
+	CMD_RTC_TO_PICO,
 
 	CMD_FILL_ALL,
 	CMD_FILL_ALL_VALUE,
@@ -121,7 +124,7 @@ typedef struct parsed_cmd {
 			uint8_t  value;
 		} fill;
 
-		/* CMD_TIME_SET */
+		/* CMD_TIME_SET, CMD_RTC_SET */
 		struct {
 			int year;
 			int month;
