@@ -18,6 +18,7 @@
 #include "pico/assert.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pico/util/queue.h"
 
 #include "hardware/clocks.h"
 #include "hardware/adc.h"
@@ -25,6 +26,7 @@
 #include "hardware/irq.h"
 #include "hardware/pio.h"
 #include "hardware/regs/sysinfo.h"
+#include "hardware/sync.h"
 #include "hardware/vreg.h"
 #include "bsp/board_api.h"
 
@@ -646,6 +648,98 @@ static volatile uint8_t write_ring_tail = 0u;    // read by for(;;) loop
 static uint32_t write_ring_overflow = 0u;
 #endif
 
+// Register-block writes from the console, for Core 1 to carry out as though
+// the guest had made them.  A queue rather than the write ring, whose one
+// producer has to be the write ISR: Core 1 takes these off with its interrupts
+// disabled and runs each through bus_write_followup(), so the two never
+// interleave.  Long enough for the largest modify, 255 bytes.
+static constexpr uint32_t CONSOLE_WRITE_QUEUE_LEN = 256u;
+static queue_t console_write_queue;
+static volatile uint32_t console_writes_done = 0u;	// counted by Core 1
+
+// Everything a write into the register block sets off, whoever made it: the
+// fast paths that must act before the guest's next instruction, then an entry
+// in the write ring for Core 1's loop to finish.  The DMA write ISR calls it
+// for guest writes; Core 1 calls it for console writes with its interrupts
+// off, so the two cannot interleave.  The byte is already in the write side.
+static void
+__time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
+{
+	// Special-case any writes that need to be handled before the next guest
+	// instruction picks up an incorrect read. I.e., these need to be _fast_.
+	if (wloc == SYSTEM_TASK) {
+		const uint8_t new_task = MC6809.task_change(wval);
+		reg[SYSTEM_TASK] = new_task;
+		task_pins_update(new_task);
+	}
+	else if (wloc == SYSTEM_RTI_SIGNAL)
+		MC6809.apply_rti();
+	// CONSOLE_CONTROL / AUX_CONTROL: full guest_control() is deferred
+	// to the write_ring so mode changes are sequenced after pending TX
+	// data.  But RTS must take effect immediately — otherwise
+	// has_interrupt() can stage another byte in the window between the
+	// 6809 deasserting RTS and the for(;;) loop processing the write.
+	else if (wloc == CONSOLE_CONTROL)
+		fast_serial.control_written_isr(wval);
+	else if (wloc == AUX_CONTROL)
+		aux_serial.control_written_isr(wval);
+	else if (wloc == CONSOLE_TX_DATA)
+		fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
+	else if (wloc == AUX_TX_DATA)
+		aux_serial.write_received();
+	else if (wloc == SYSTEM_TIMER_CONTROL_13)
+		system_tick.control(wval);
+	else if (wloc == SYSTEM_WATCHPOINT) {
+		// Arm/disarm deferred to write ring handler (needs snippet_code[])
+	}
+	else if (wloc == SYSTEM_TRACE) {
+		// USim TraceCtl convention: non-zero arms a one-shot bus trace, zero stops.
+		if (wval)
+			MC6809.trace_arm();
+		else
+			MC6809.trace_stop();
+	}
+	else if (wloc == SYSTEM_DAT_FAULT) {
+		// Bit 7 (NMIBlock) drives the hardware fault-NMI mask pin, and the
+		// guest reads its state back from the same bit.  This has to happen
+		// here rather than in the write ring, so that a guest masking faults
+		// is protected before its next instruction can fault.  Bits 0 and
+		// 1 (Fault and R/!W) are owned by the Q-rising sampler and are
+		// read-only, so writes leave them alone.
+		const bool block = (wval & DAT_FAULT_NMI_BLOCK) != 0u;
+		// An explicit write wins over a pending automatic assertion:
+		// leaving the countdown armed would raise the mask again a
+		// cycle or two after the guest had just cleared it.
+		dat_fault_block_countdown = 0u;
+		gpio_put(GPIO_NMI_BLOCK, block);
+		if (block)
+			reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
+		else
+			reg[SYSTEM_DAT_FAULT] &= static_cast<uint8_t>(~DAT_FAULT_NMI_BLOCK);
+	}
+	// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
+	// CPU is concerned. When watchpoint is armed, writes to snippet space ($FFE0-$FFEF) and
+	// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
+	// and the vectors it guards.
+	else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET)
+		watchpoint_nmi_pending = true;
+	else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
+		reg[wloc] = wval;
+	// Queue for the for(;;) loop to do full dispatch.
+	const uint8_t h = write_ring_head;
+	const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
+	if (next_h == write_ring_tail) {
+		// Ring full — drop oldest entry so the newest is never lost.
+		write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
+#ifdef DEBUG
+		write_ring_overflow++;
+#endif
+	}
+	write_ring[h].location = wloc;
+	write_ring[h].value = wval;
+	write_ring_head = next_h;
+}
+
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
@@ -657,79 +751,7 @@ __time_critical_func(dma_bus_write_irq_handler())
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
 		const uint8_t wloc = written_addr & registers::register_mask;
 		const uint8_t wval = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
-		// Special-case any writes that need to be handled before the next guest
-		// instruction picks up an incorrect read. I.e., these need to be _fast_.
-		if (wloc == SYSTEM_TASK) {
-			const uint8_t new_task = MC6809.task_change(wval);
-			reg[SYSTEM_TASK] = new_task;
-			task_pins_update(new_task);
-		}
-		else if (wloc == SYSTEM_RTI_SIGNAL)
-			MC6809.apply_rti();
-		// CONSOLE_CONTROL / AUX_CONTROL: full guest_control() is deferred
-		// to the write_ring so mode changes are sequenced after pending TX
-		// data.  But RTS must take effect immediately — otherwise
-		// has_interrupt() can stage another byte in the window between the
-		// 6809 deasserting RTS and the for(;;) loop processing the write.
-		else if (wloc == CONSOLE_CONTROL)
-			fast_serial.control_written_isr(wval);
-		else if (wloc == AUX_CONTROL)
-			aux_serial.control_written_isr(wval);
-		else if (wloc == CONSOLE_TX_DATA)
-			fast_serial.write_received();	// clear TDRE now; for(;;) restores it after guest_transmit()
-		else if (wloc == AUX_TX_DATA)
-			aux_serial.write_received();
-		else if (wloc == SYSTEM_TIMER_CONTROL_13)
-			system_tick.control(wval);
-		else if (wloc == SYSTEM_WATCHPOINT) {
-			// Arm/disarm deferred to write ring handler (needs snippet_code[])
-		}
-		else if (wloc == SYSTEM_TRACE) {
-			// USim TraceCtl convention: non-zero arms a one-shot bus trace, zero stops.
-			if (wval)
-				MC6809.trace_arm();
-			else
-				MC6809.trace_stop();
-		}
-		else if (wloc == SYSTEM_DAT_FAULT) {
-			// Bit 7 (NMIBlock) drives the hardware fault-NMI mask pin, and the
-			// guest reads its state back from the same bit.  This has to happen
-			// here rather than in the write ring, so that a guest masking faults
-			// is protected before its next instruction can fault.  Bits 0 and
-			// 1 (Fault and R/!W) are owned by the Q-rising sampler and are
-			// read-only, so writes leave them alone.
-			const bool block = (wval & DAT_FAULT_NMI_BLOCK) != 0u;
-			// An explicit write wins over a pending automatic assertion:
-			// leaving the countdown armed would raise the mask again a
-			// cycle or two after the guest had just cleared it.
-			dat_fault_block_countdown = 0u;
-			gpio_put(GPIO_NMI_BLOCK, block);
-			if (block)
-				reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
-			else
-				reg[SYSTEM_DAT_FAULT] &= static_cast<uint8_t>(~DAT_FAULT_NMI_BLOCK);
-		}
-		// The first 16 bytes of emulated registers are devices. The rest are RAM as far as the guest
-		// CPU is concerned. When watchpoint is armed, writes to snippet space ($FFE0-$FFEF) and
-		// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
-		// and the vectors it guards.
-		else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET)
-			watchpoint_nmi_pending = true;
-		else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
-			reg[wloc] = wval;
-		// Queue for the for(;;) loop to do full dispatch.
-		const uint8_t h = write_ring_head;
-		const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
-		if (next_h == write_ring_tail) {
-			// Ring full — drop oldest entry so the newest is never lost.
-			write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
-#ifdef DEBUG
-			write_ring_overflow++;
-#endif
-		}
-		write_ring[h].location = wloc;
-		write_ring[h].value = wval;
-		write_ring_head = next_h;
+		bus_write_followup(wloc, wval);
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_D, false); // scope timing
@@ -2689,7 +2711,17 @@ status_done:
 		const uint16_t display_end   = ((end - 1u) | 0x000Fu) + 1u;
 		absolute_time_t next_usb = get_absolute_time();
 		for (uint16_t loc = display_start; loc < display_end; loc += 16u) {
-			if (!copy(INWARDS, 16u, loc, buffer))
+			// Read only what was asked for.  The line is laid out on a
+			// 16-byte boundary, but reading all of it would touch registers
+			// either side of the range - and in I/O space a read is not free:
+			// it pops the IDE data register, clears RDRF, acknowledges the
+			// timer IRQ, clears a latched DAT fault.  So each line reads just
+			// its overlap with start..end.
+			const uint32_t line_end = static_cast<uint32_t>(loc) + 16u;
+			const uint16_t first = loc > start ? loc : start;
+			const uint16_t past = static_cast<uint16_t>(line_end < end ? line_end : end);
+			if (!copy(INWARDS, static_cast<uint16_t>(past - first), first,
+				  buffer + (first - loc)))
 				break;
 			printf("%04X:", loc);
 			for (uint16_t i = 0; i < 16u; i++) {
@@ -2734,22 +2766,41 @@ status_done:
 			} else
 				(void)copy(OUTWARDS, count, start, buffer);
 		} else {
-			printf("Modifying system registers, so provoking callbacks\n");
-			for (uint16_t i = 0u; i < count; i++) {
-				const uint8_t loc = (start + i) & registers::register_mask;
-				registers::write(loc) = buffer[i];
-				// Inject into the write ring so the for(;;) loop dispatches callbacks.
-				const uint8_t h = write_ring_head;
-				const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
-				if (next_h == write_ring_tail)
-					write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
-				write_ring[h].location = loc;
-				write_ring[h].value = buffer[i];
-				write_ring_head = next_h;
+			if (!MC6809.assert_powered())
+				break;
+			// Core 1 carries each write out as though the guest had made it,
+			// read side and device follow-ups included.  Both sides are shown
+			// once it has.
+			static constexpr uint32_t MODIFY_TIMEOUT_MS = 100u;
+			printf("Modifying system registers as the guest would\n");
+			const uint32_t done_before = console_writes_done;
+			uint16_t queued = 0u;
+			for (; queued < count; queued++) {
+				const write_entry w = {
+					static_cast<uint8_t>((start + queued) & registers::register_mask),
+					buffer[queued]
+				};
+				if (!queue_try_add(&console_write_queue, &w))
+					break;
+			}
+			if (queued < count)
+				printf("Console write queue full - %u of %u bytes queued\n", queued, count);
+			const absolute_time_t deadline = make_timeout_time_ms(MODIFY_TIMEOUT_MS);
+			while (console_writes_done - done_before < queued
+			       && absolute_time_diff_us(get_absolute_time(), deadline) > 0)
+				sleep_ms(1u);
+			if (console_writes_done - done_before < queued) {
+				printf("Core 1 did not carry out the writes within %" PRIu32 "ms\n",
+				       MODIFY_TIMEOUT_MS);
+				break;
+			}
+			sleep_ms(1u);	// the ring dispatch follows in the same Core 1 pass
+			for (uint16_t i = 0u; i < queued; i++) {
+				const uint8_t loc = static_cast<uint8_t>((start + i) & registers::register_mask);
 				printf("%04X: %02X %02X\n",
 				       static_cast<uint16_t>(start + i),
 				       static_cast<uint8_t>(registers::write(loc)),
-				       static_cast<uint8_t>(reg[start + i]));
+				       static_cast<uint8_t>(reg[loc]));
 			}
 		}
 		break;
@@ -4369,6 +4420,21 @@ __no_inline_not_in_flash_func(main_core1)()
 				(interrupt_refcount[INTERRUPT_IRQ]  > 0u ? PEND_IRQ  : 0u);
 		}
 
+		// Console writes into the register block, carried out as the guest's
+		// would be: the byte into the write side, then the write ISR's own
+		// follow-up, with interrupts off so the ISR cannot interleave.  The
+		// ring entries that queues are dispatched just below, in this pass.
+		{
+			write_entry w;
+			while (queue_try_remove(&console_write_queue, &w)) {
+				const uint32_t saved = save_and_disable_interrupts();
+				registers::write(w.location) = w.value;
+				bus_write_followup(w.location, w.value);
+				restore_interrupts(saved);
+				console_writes_done++;
+			}
+		}
+
 		while (write_ring_tail != write_ring_head) {
 			core1_write_ring_count++;
 			const uint8_t t = write_ring_tail;
@@ -5019,6 +5085,12 @@ set_power()
 	peripheral_clear(true);
 	printf("Core0 emulated RAM and devices initialised\n");
 
+	// A write queued for a Core 1 that has since been stopped must not act on
+	// this power-up.
+	write_entry stale;
+	while (queue_try_remove(&console_write_queue, &stale))
+		;
+
 	multicore_launch_core1(main_core1);
 	return true;
 }
@@ -5094,6 +5166,8 @@ main()
 	printf("Core0 supply monitor sampling every %" PRIu32 "ms\n", RAIL_MONITOR_MS);
 	usb_init();
 	printf("Core0 initialised USB\n");
+
+	queue_init(&console_write_queue, sizeof(write_entry), CONSOLE_WRITE_QUEUE_LEN);
 
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);
