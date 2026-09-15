@@ -43,6 +43,11 @@ struct status_snapshot_t {
 	bool power, reset, halt, nmi, firq, irq;
 	uint16_t voltage, temperature;   // raw counts; voltage is 0 on version 1
 
+	// Pico silicon
+	uint8_t chip_revision;           // CHIP_ID.REVISION, raw
+	uint8_t rom_version;             // bootrom version byte: 2 A2, 3 A3, 4 A4
+	bool    qfn60;                   // PACKAGE_SEL: RP2350A (QFN-60), else RP2350B (QFN-80)
+
 #ifdef DEBUG
 	uint32_t lic_count;
 	uint32_t rti_count;

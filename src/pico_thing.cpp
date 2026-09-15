@@ -24,6 +24,7 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
+#include "hardware/regs/sysinfo.h"
 #include "hardware/vreg.h"
 #include "bsp/board_api.h"
 
@@ -2213,6 +2214,15 @@ status_gather(status_snapshot_t *s)
 	s->voltage = 0u;           // no bus voltage divider on version 1
 #endif
 	s->temperature = die_raw;
+
+	// The raw revision rather than rp2350_chip_version(), whose numbering
+	// does not follow the stepping names and which asserts on a foreign ID.
+	const uint32_t chip_id = *static_cast<io_ro_32 *>(reinterpret_cast<void *>(SYSINFO_BASE + SYSINFO_CHIP_ID_OFFSET));
+	s->chip_revision = static_cast<uint8_t>((chip_id & SYSINFO_CHIP_ID_REVISION_BITS) >> SYSINFO_CHIP_ID_REVISION_LSB);
+	s->rom_version = rp2350_rom_version();
+	const uint32_t package_sel = *static_cast<io_ro_32 *>(reinterpret_cast<void *>(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET));
+	s->qfn60 = (package_sel & SYSINFO_PACKAGE_SEL_BITS) != 0u;
+
 	s->reset = RESET_IS_ASSERTED;
 	s->halt = HALT_IS_ASSERTED;
 	s->nmi = NMI_IS_ASSERTED;
@@ -2298,6 +2308,32 @@ status_print_regs(const char *label, const uint8_t *regs)
 	}
 }
 
+// The RP2350 steppings, named by bootrom version.  CHIP_ID.REVISION cannot
+// name them on its own: A4 changed only the bootrom, and although the
+// datasheet gives its revision as 0x8, an A4 (bootrom 4) on the replacement
+// version 2 board reads 0x3, the same as an A3.  The revision is kept here as
+// the datasheet's figure, so a chip that disagrees with it shows its own.
+struct chip_stepping_t {
+	uint8_t rom_version;
+	uint8_t revision;
+	const char *name;
+};
+
+// nullptr for a bootrom version the datasheet does not list.
+static const chip_stepping_t *
+chip_stepping(const uint8_t rom_version)
+{
+	static constexpr chip_stepping_t steppings[] = {
+		{ 2u, 0x2u, "A2" },
+		{ 3u, 0x3u, "A3" },
+		{ 4u, 0x8u, "A4" },
+	};
+	for (const auto &s : steppings)
+		if (s.rom_version == rom_version)
+			return &s;
+	return nullptr;
+}
+
 void
 status_print(const status_snapshot_t *s)
 {
@@ -2313,6 +2349,17 @@ status_print(const status_snapshot_t *s)
 #endif
 	printf("PICO TEMPERATURE: %.1fC (%u counts)\n",
 	       adc_die_celsius(s->temperature), s->temperature);
+	const char part = s->qfn60 ? 'A' : 'B';
+	if (const chip_stepping_t *stepping = chip_stepping(s->rom_version)) {
+		if (stepping->revision == s->chip_revision)
+			printf("PICO CHIP: RP2350%c %s (bootrom %u)\n",
+			       part, stepping->name, s->rom_version);
+		else
+			printf("PICO CHIP: RP2350%c %s (bootrom %u, CHIP_ID revision %X)\n",
+			       part, stepping->name, s->rom_version, s->chip_revision);
+	} else
+		printf("PICO CHIP: RP2350%c, unknown bootrom %u (CHIP_ID revision %X)\n",
+		       part, s->rom_version, s->chip_revision);
 	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
 	       s->nmi ? "OUTPUT LOW" : "hi-z",
 	       s->firq ? "OUTPUT LOW" : "hi-z",
@@ -2438,6 +2485,12 @@ status_json(const status_snapshot_t *s)
 #endif
 	printf(R"json(,"temperature":%.1f,"temperature_raw":%u)json",
 	       adc_die_celsius(s->temperature), s->temperature);
+	if (const chip_stepping_t *stepping = chip_stepping(s->rom_version))
+		printf(R"json(,"chip_stepping":"%s")json", stepping->name);
+	else
+		printf(R"json(,"chip_stepping":null)json");
+	printf(R"json(,"chip_revision":%u,"rom_version":%u,"chip_package":"%s")json",
+	       s->chip_revision, s->rom_version, s->qfn60 ? "QFN-60" : "QFN-80");
 #ifdef DEBUG
 	printf(",\"lic_count\":%" PRIu32 ",\"rti_count\":%" PRIu32 ",\"lic_stalled\":%s",
 	       s->lic_count, s->rti_count, s->lic_stalled ? "true" : "false");
