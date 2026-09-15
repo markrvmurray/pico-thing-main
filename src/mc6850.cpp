@@ -17,6 +17,31 @@
 #include "mc6809.h"
 #include "mc6850.h"
 
+// Core 1's loop-side calls share this ACIA's flags, and the status register
+// they fold into, with the bus ISRs' fast paths: write_received(),
+// control_written_isr() and rx_read_fast_path().  sync_status() builds the
+// status byte and then writes it, so a fast path landing between the two would
+// be overwritten with a stale byte - RDRF set again for a byte the guest has
+// already read.  Loop-side calls hold this for their few instructions.  The
+// ISR-side calls need not: both DMA handlers share a priority, so neither
+// preempts the other.
+class bus_isrs_excluded {
+	uint32_t saved = 0u;
+public:
+	bus_isrs_excluded()
+	{
+		if (mc6850::exclusion.enter)
+			saved = mc6850::exclusion.enter();
+	}
+	~bus_isrs_excluded()
+	{
+		if (mc6850::exclusion.leave)
+			mc6850::exclusion.leave(saved);
+	}
+	bus_isrs_excluded(const bus_isrs_excluded &) = delete;
+	bus_isrs_excluded &operator=(const bus_isrs_excluded &) = delete;
+};
+
 mc6850::mc6850(uint16_t ctl_off, uint16_t data_off) :
 	ctl_offset(ctl_off),
 	data_offset(data_off),
@@ -60,6 +85,8 @@ mc6850::reset()
 // (rx_read_fast_path) can preempt and clear RDRF between our read
 // and write, causing us to clobber the ISR's update.
 // Skips the register write if the byte hasn't changed.
+// Building the byte and writing it are still two steps, so loop-side callers
+// hold bus_isrs_excluded around this; see above.
 inline void
 mc6850::sync_status()
 {
@@ -121,6 +148,7 @@ mc6850::control_written_isr(uint8_t val)
 void
 mc6850::guest_control(uint8_t val)
 {
+	const bus_isrs_excluded excluded;
 	mc6850_control cr = {val};
 	if (cr.divide_select == 0b11u) {
 		reset();
@@ -143,6 +171,7 @@ mc6850::guest_control(uint8_t val)
 void
 mc6850::guest_transmit(uint8_t data)
 {
+	const bus_isrs_excluded excluded;
 	tx_write_pending = false;		// acknowledge: for(;;) loop has taken ownership
 	if (loopback_close) {
 		// Close loopback: TX byte goes directly into the RX register,
@@ -181,6 +210,7 @@ mc6850::rx_read_fast_path()
 void
 mc6850::guest_receive()
 {
+	const bus_isrs_excluded excluded;
 	// If RTS is deasserted (6809 ring buffer full) do not stage the next byte;
 	// leave it in the rx queue so it is delivered once RTS is re-asserted.
 	if (rts_deasserted) {
@@ -208,6 +238,7 @@ mc6850::has_interrupt()
 	// the cached result without recomputing anything.
 	if (!irq_dirty)
 		return cached_irq_result;
+	const bus_isrs_excluded excluded;
 	irq_dirty = false;
 
 	// Absorb TX queue state refresh (formerly update_task/sync_transmit).

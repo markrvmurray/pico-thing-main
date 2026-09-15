@@ -80,6 +80,16 @@ union mc6850_status {
 class mc6850 {
 public:
 	static constexpr uint CTS_THRESHOLD = 800u;  // out of CONSOLE_QUEUE_LEN=1024
+
+	// Held by Core 1's loop-side calls while they fold the flags into the
+	// status register, to keep the bus ISRs' fast paths out.  enter() returns
+	// what leave() needs to put things back.  The firmware sets it once to
+	// mask the DMA interrupts; unset, as on the host, nothing is held.
+	struct isr_exclusion {
+		uint32_t (*enter)();
+		void (*leave)(uint32_t);
+	};
+	static inline isr_exclusion exclusion = { nullptr, nullptr };
 private:
 	const uint16_t ctl_offset;	// control (write) / status (read) register offset
 	const uint16_t data_offset;	// TX data (write) / RX data (read) register offset
@@ -115,7 +125,9 @@ public:
 	uint receive_level() { return tx.get_level(); }
 	bool host_transmit_avail() { return !tx.is_empty(); }
 	bool host_receive_avail() { return !tx.is_empty(); }
-	uint8_t host_receive() { return tx.get(); }
+	// Draining can bring the queue back under CTS_THRESHOLD, so it marks the
+	// state dirty: has_interrupt() has usually cached CTS already.
+	uint8_t host_receive() { const uint8_t ch = tx.get(); irq_dirty = true; return ch; }
 	void host_transmit(const uint8_t ch) { rx.put(ch); irq_dirty = true; }
 
 	[[nodiscard]] uint8_t interrupt_status() const

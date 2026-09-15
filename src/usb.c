@@ -132,6 +132,20 @@ usb_cdc_flush_n(uint8_t itf)
 		tud_cdc_n_write_flush(itf);
 }
 
+/* TinyUSB counts a port as connected while the host holds DTR. */
+bool
+usb_cdc_connected_n(uint8_t itf)
+{
+	return tud_cdc_n_connected(itf);
+}
+
+/* Line state bit 1 is the host's RTS: clear, it cannot take more data. */
+bool
+usb_cdc_host_rts_n(uint8_t itf)
+{
+	return (tud_cdc_n_get_line_state(itf) & 0x02u) != 0u;
+}
+
 /* Called when device mounted (enumerated) */
 void
 tud_mount_cb(void)
@@ -207,8 +221,6 @@ void
 usb_poll(void)
 {
 	tud_task();
-	// Keep cranking the USB handle I'm waiting for DTR and RTS.
-	//connected = (tud_cdc_get_line_state() & 0x03u) == 0x03u;
 #ifdef USB_DEBUG
 	cdc_loopback();
 	vendor_maybe_originate();

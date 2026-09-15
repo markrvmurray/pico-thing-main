@@ -74,6 +74,7 @@ add_executable(pico-thing
 		src/mc6809.cpp
 		src/srec.cpp
 		src/mc6850.cpp
+		src/uart_pump.cpp
 		src/tick_timer.cpp
 		src/usb_descriptors.c
 		src/usb.c

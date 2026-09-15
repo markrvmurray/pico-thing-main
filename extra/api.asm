@@ -16,6 +16,7 @@ TASK	EQU	DEVICE+$00
 TRACE	EQU	DEVICE+$0B	Bus trace control: non-zero arms a one-shot
 DATFLT	EQU	DEVICE+$0C	DAT fault status; bit 7 is NMIBlock
 RTCADDR	EQU	$FF32	DS12885 index port; the data port is the next address
+ACIA	EQU	DEVICE+$04	Console MC6850: status (read) and control, then data
 
 UARTC	equ	$FFC4
 UARTS	equ	$FFC4
@@ -584,6 +585,28 @@ S@0	LDB	,U+	the value staged for this register
 	STD	RTCADDR
 	SYNC
 
+* Time how long the console ACIA takes to report TDRE again after each byte
+* sent, as a polled OUTCH sees it.  Sixteen bytes; SHARED gets how many status
+* polls each needed.  A poll pass - INCB, BEQ, LDA extended, BITA, BEQ - is 15
+* E cycles, so a count of 1 means TDRE was back by the first status read, a
+* dozen cycles after the write, and $FF means it was not back after 255.
+	ORG	CHUNK
+AciaTm	LDX	#SHARED
+T@0	LDA	#'*'
+	STA	ACIA+1	send a byte: TDRE drops until the Pico takes it
+	CLRB
+T@1	INCB		one more poll
+	BEQ	T@3	255 polls without TDRE: give up on this byte
+	LDA	ACIA	status
+	BITA	#$02	TDRE
+	BEQ	T@1
+T@2	STB	,X+	polls this byte took
+	CMPX	#SHARED+16
+	BNE	T@0
+	SYNC
+T@3	DECB		$FF: never came back
+	BRA	T@2
+
 	ORG	$0000
 	FCC	"DAT_INIT"
 	FCB	' '
@@ -632,3 +655,5 @@ S@0	LDB	,U+	the value staged for this register
 	FCC	"RTC_READ"
 	FCB	' '
 	FCC	"RTC_SET"
+	FCB	' '
+	FCC	"ACIA_TDRE"

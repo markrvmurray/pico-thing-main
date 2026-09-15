@@ -143,3 +143,20 @@ target_include_directories(test_sysreq PRIVATE
 target_compile_features(test_sysreq PRIVATE cxx_std_17)
 target_link_libraries(test_sysreq PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_sysreq)
+
+# ---------------------------------------------------------------------------
+# test_uart_pump: the ACIA <-> USB CDC pump, with a real mc6850 and a fake
+# port, using the same fake/ stubs as test_mc6850.
+# ---------------------------------------------------------------------------
+add_executable(test_uart_pump
+    test_uart_pump.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/uart_pump.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mc6850.cpp
+)
+target_include_directories(test_uart_pump PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake   # fake Pico/registers stubs (first!)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_features(test_uart_pump PRIVATE cxx_std_17)
+target_link_libraries(test_uart_pump PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_uart_pump)

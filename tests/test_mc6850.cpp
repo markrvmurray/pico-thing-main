@@ -293,6 +293,26 @@ TEST_CASE("TDRE recovers after draining below CTS threshold") {
 	CHECK(status().cts  == 0);
 }
 
+// In the firmware has_interrupt() runs on every Q-rising edge, so CTS is
+// cached and irq_dirty clear by the time the host drains the queue.  Draining
+// has to mark the state dirty, or TDRE stays down for good.
+TEST_CASE("TDRE recovers after draining, even once has_interrupt() has run") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	for (uint i = 0; i < mc6850::CTS_THRESHOLD + 1; i++)
+		uart_write(uart, static_cast<uint8_t>(i));
+	(void)uart.has_interrupt();
+	REQUIRE(status().tdre == 0);
+
+	uart.host_receive();
+	uart.host_receive();
+	(void)uart.has_interrupt();
+
+	CHECK(status().tdre == 1);
+	CHECK(status().cts  == 0);
+}
+
 // -----------------------------------------------------------------------
 // Close loopback (tx_irq=0b11, BREAK mode repurposed)
 // -----------------------------------------------------------------------
@@ -771,4 +791,75 @@ TEST_CASE("close loopback takes priority over queue loopback") {
 	CHECK(status().rdrf == 1);
 	CHECK(registers::peek(CONSOLE_RX_DATA) == 'P');
 	CHECK_FALSE(uart.host_receive_avail());
+}
+
+// -----------------------------------------------------------------------
+// Bus ISR exclusion
+//
+// sync_status() builds the status byte from the flags, then writes it.  The
+// bus ISRs' fast paths change those flags and write the status too, so one
+// landing between the two steps would be overwritten with a stale byte.
+// Core 1's loop-side calls therefore hold mc6850::exclusion.  A host test
+// cannot preempt, so these check that each loop-side call takes the exclusion
+// once and gives it back, and that the ISR-side calls and the clean
+// has_interrupt() path - both hot - do not take it at all.
+// -----------------------------------------------------------------------
+
+static uint32_t exclusion_entries = 0u;
+static int exclusion_depth = 0;
+
+static uint32_t counting_enter()
+{
+	exclusion_entries++;
+	return static_cast<uint32_t>(exclusion_depth++);
+}
+
+static void counting_leave(const uint32_t saved)
+{
+	exclusion_depth = static_cast<int>(saved);
+}
+
+// How many times f takes the exclusion; it must leave it balanced.
+template <typename F>
+static uint32_t exclusions_taken(F f)
+{
+	const uint32_t before = exclusion_entries;
+	f();
+	CHECK(exclusion_depth == 0);
+	return exclusion_entries - before;
+}
+
+TEST_CASE("loop-side calls exclude the bus ISRs") {
+	registers::clear();
+	mc6850::exclusion = { counting_enter, counting_leave };
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	CHECK(exclusions_taken([&] { uart.guest_control(0x15u); }) == 1u);
+
+	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('A');
+	uart.write_received();
+	CHECK(exclusions_taken([&] { uart.guest_transmit('A'); }) == 1u);
+
+	uart.host_transmit('B');	// gives has_interrupt() real work
+	CHECK(exclusions_taken([&] { (void)uart.has_interrupt(); }) == 1u);
+
+	uart.rx_read_fast_path();
+	CHECK(exclusions_taken([&] { uart.guest_receive(); }) == 1u);
+
+	mc6850::exclusion = { nullptr, nullptr };
+}
+
+TEST_CASE("ISR-side calls and a clean has_interrupt() leave the bus ISRs alone") {
+	registers::clear();
+	mc6850::exclusion = { counting_enter, counting_leave };
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+
+	CHECK(exclusions_taken([&] { uart.write_received(); }) == 0u);
+	CHECK(exclusions_taken([&] { uart.control_written_isr(0x15u); }) == 0u);
+	CHECK(exclusions_taken([&] { uart.rx_read_fast_path(); }) == 0u);
+
+	(void)uart.has_interrupt();	// settles: nothing is dirty after this
+	CHECK(exclusions_taken([&] { (void)uart.has_interrupt(); }) == 0u);
+
+	mc6850::exclusion = { nullptr, nullptr };
 }

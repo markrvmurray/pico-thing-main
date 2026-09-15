@@ -21,6 +21,7 @@
 #include "pico_thing.h"
 #include "mc6809.h"
 #include "mc6850.h"
+#include "uart_pump.h"
 
 const char *bus_state_string[] = {
 	foreach_busstate(enum_list_strings)
@@ -339,62 +340,34 @@ mc6809::tick_rti_countdown()
 	}
 }
 
-#define USB_BUFFER_SIZE 512
-
-struct uart_port_state {
-	uint8_t rx_buf[USB_BUFFER_SIZE];
-	uint8_t tx_buf[USB_BUFFER_SIZE];
-	uint16_t rx_count = 0, rx_index = 0;
-	uint16_t tx_count = 0, tx_index = 0;
-};
-
 static uart_port_state port_state[2];
 
-// Debug counters for aux ACIA (CDC port 1) diagnostics
-static void
-uart_port_pump(mc6850 &serial, uint8_t cdc_port, uart_port_state &st, bool suppress_read)
-{
-	// READ USB -> Guest (only if 6809 has asserted RTS)
-	if (!serial.is_rts_deasserted() && !suppress_read) {
-		if (st.rx_count == 0u) {
-			st.rx_count = usb_cdc_read_n(cdc_port, st.rx_buf, USB_BUFFER_SIZE);
-			st.rx_index = 0u;
-		}
-		uint uart_level_avail = serial.host_transmit_level_avail();
-		uint transmit_amount = MIN(uart_level_avail, st.rx_count - st.rx_index);
-		for (uint i = 0u; i < transmit_amount; i++)
-			serial.host_transmit(st.rx_buf[st.rx_index + i]);
-		st.rx_index += transmit_amount;
-		if (st.rx_index >= st.rx_count)
-			st.rx_count = 0u;
-	}
-	// WRITE Guest -> USB
-	if (st.tx_count == 0u) {
-		while (serial.host_receive_avail() && st.tx_count < USB_BUFFER_SIZE)
-			st.tx_buf[st.tx_count++] = serial.host_receive();
-		st.tx_index = 0u;
-	}
-	uint16_t written = usb_cdc_write_n(cdc_port, st.tx_buf + st.tx_index, st.tx_count - st.tx_index);
-	st.tx_index += written;
-	if (st.tx_index >= st.tx_count)
-		st.tx_count = 0u;
-	// Feed USB host readiness back to CTS
-	bool cts = st.tx_count > 0u && st.tx_index < st.tx_count;
-	serial.set_host_cts(cts);
-}
+// The pump's view of the TinyUSB CDC ports.
+static constexpr cdc_port_io usb_ports = {
+	usb_cdc_connected_n, usb_cdc_host_rts_n, usb_cdc_read_n, usb_cdc_write_n
+};
 
 void
 mc6809::uart_task(bool suppress_cdc_read)
 {
-	if (MC6809.run_state >= RS_RUNNING) {
-		uart_port_pump(fast_serial, 0, port_state[0], suppress_cdc_read);
-		uart_port_pump(aux_serial, 1, port_state[1], false);
-		usb_cdc_flush_n(0);
-		usb_cdc_flush_n(1);
-	} else if (MC6809.run_state == RS_RESET) {
-		port_state[0] = {};
-		port_state[1] = {};
-	}
+	if (MC6809.run_state == RS_UNPOWERED)
+		return;
+	// Guest to host whenever the guest is powered, not only while it runs.  A
+	// run that reaches SYNC is put straight back into reset, and the next start
+	// resets the ACIAs and empties their queues, so gating this on running lost
+	// everything a short run sent.
+	//
+	// Host to guest only while it runs.  CDC 0 is also the command console, so
+	// a guest in reset must not take what is typed at the prompt; any input
+	// already staged for it is dropped instead.
+	const bool running = MC6809.run_state >= RS_RUNNING;
+	uart_port_pump(fast_serial, 0, port_state[0], suppress_cdc_read || !running, usb_ports);
+	uart_port_pump(aux_serial, 1, port_state[1], !running, usb_ports);
+	usb_cdc_flush_n(0);
+	usb_cdc_flush_n(1);
+	if (!running)
+		for (uart_port_state &st : port_state)
+			st.rx_count = st.rx_index = 0u;
 }
 
 void

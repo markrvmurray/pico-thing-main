@@ -86,7 +86,7 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 - `assert_receive_irq` — `receive_irq && receive_buffer_full`
 - `cts_deasserted` — TX queue level > `CTS_THRESHOLD` (800) OR USB host can't accept data
 - `rts_deasserted` — 6809 is signaling its ring buffer is full
-- `host_cts_deasserted` (volatile) — set by Core 0 when USB CDC write returns short (host buffer full)
+- `host_cts_deasserted` (volatile) — set by Core 0 when a USB CDC write returns short (host buffer full) or the host has dropped RTS
 - `loopback_close` — TX→RX register directly (no queues)
 - `loopback_queue` — TX→RX queue (full staging pipeline)
 - `tx_write_pending` (volatile) — set by DMA write ISR, cleared by `guest_transmit()`
@@ -173,6 +173,8 @@ Every state-changing method sets `irq_dirty = true`. This ensures the next `has_
 **RTS flow control (6809 → host):** When `rts_deasserted=true`, neither `has_interrupt()` nor `guest_receive()` will stage bytes from the RX queue. Bytes accumulate in the queue until the 6809 re-asserts RTS (writes a control register value with `tx_irq != 0b10`). Core 0's `uart_port_pump()` uses `is_rts_deasserted()` to skip USB CDC reads when the 6809 isn't ready.
 
 **CTS flow control (host → 6809):** CTS deasserts (blocking 6809 TX) when either condition is true: (1) the TX queue level exceeds `CTS_THRESHOLD` (800/1024), or (2) the USB host can't accept data (`host_cts_deasserted=true`). Core 0's `uart_port_pump()` calls `set_host_cts(true)` when a USB CDC write returns short (partial write — host buffer full), and `set_host_cts(false)` when the buffer drains. This provides true end-to-end backpressure: the 6809's OUTCH poll stalls on TDRE=0 until the USB host is ready. CTS deasserted also inhibits TX IRQ assertion.
+
+**Host line state:** the host counts as able to take data only while it holds RTS; with RTS down the pump holds the output and sets `host_cts_deasserted`, as for a short write. With no terminal on the port, or one that has not raised DTR, there is nobody to hold the output for, so the pump discards it and leaves CTS alone, as a real UART with nothing plugged in would. Host input is only read from an open port.
 
 ### `rx_read_fast_path()` and PEND_IRQ Clearing
 
