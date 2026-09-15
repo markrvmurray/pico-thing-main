@@ -882,7 +882,7 @@ sysreq_process()
 	if (reg[SYSTEM_REQUEST_RESPONSE] == RESPONSE_BUSY) {
 		switch (static_cast<uint8_t>(reg[SYSTEM_REQUEST])) {
 		default:
-			// TODO: MarkM - Bad Juju - investigate/report
+			reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNKNOWN;
 			break;
 		case REQUEST_TIME: {
 			tm tm{};
@@ -940,11 +940,6 @@ sysreq_process()
 				reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
 			break;
 		}
-		case REQUEST_MOUNT:
-		case REQUEST_UNMOUNT:
-			// Neither is implemented yet
-			reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_UNAVAILABLE;
-			break;
 		}
 	}
 }
@@ -4417,49 +4412,15 @@ __no_inline_not_in_flash_func(main_core1)()
 					reg[SYSTEM_REQUEST_STATUS] = registers::write(SYSTEM_REQUEST);
 					reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_BUSY;
 					break;
-				case REQUEST_FLOAT:
-					switch (registers::write(SYSTEM_SUBREQUEST)) {
-					default:
-						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_UNKNOWN;
-						reg[SYSTEM_REQUEST_RESPONSE] = RESPONSE_NULL;
-						break;
-					case FLOAT_ADD: {
-						float a = reg[REGISTER_BUFFER_OFFSET + 0];
-						float b = reg[REGISTER_BUFFER_OFFSET + 4];
-						float c = a + b;
-						reg[REGISTER_BUFFER_OFFSET + 0] = c;
-						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
-						break;
-					}
-					case FLOAT_SUBTRACT: {
-						float a = reg[REGISTER_BUFFER_OFFSET + 0];
-						float b = reg[REGISTER_BUFFER_OFFSET + 4];
-						float c = a - b;
-						reg[REGISTER_BUFFER_OFFSET + 0] = c;
-						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
-						break;
-					}
-					case FLOAT_MULTIPLY: {
-						float a = reg[REGISTER_BUFFER_OFFSET + 0];
-						float b = reg[REGISTER_BUFFER_OFFSET + 4];
-						float c = a*b;
-						reg[REGISTER_BUFFER_OFFSET + 0] = c;
-						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
-						break;
-					}
-					case FLOAT_DIVIDE: {
-						float a = reg[REGISTER_BUFFER_OFFSET + 0];
-						float b = reg[REGISTER_BUFFER_OFFSET + 4];
-						float c = a/b;
-						reg[SYSTEM_REQUEST_STATUS] = RESPONSE_DONE;
-						reg[SYSTEM_REQUEST_RESPONSE] = static_cast<uint8_t>(c < 0.0f ? 0b1000 : (c == 0.0f ? 0b0100 : 0b0000));
-						break;
-					}
-					}
+				case REQUEST_FLOAT: {
+					// Operands and result are 4-byte big-endian floats in
+					// SHARED; sysreq_float() is host-tested.
+					const sysreq_float_result result =
+						sysreq_float(registers::write(SYSTEM_SUBREQUEST), REGISTER_BUFFER_OFFSET);
+					reg[SYSTEM_REQUEST_STATUS] = result.status;
+					reg[SYSTEM_REQUEST_RESPONSE] = result.response;
 					break;
+				}
 				}
 				break;
 

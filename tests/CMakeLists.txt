@@ -125,3 +125,21 @@ target_include_directories(test_tick_timer PRIVATE
 target_compile_features(test_tick_timer PRIVATE cxx_std_17)
 target_link_libraries(test_tick_timer PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test_tick_timer)
+
+# ---------------------------------------------------------------------------
+# test_sysreq: the floating-point system request, against the REAL registers.h.
+#
+# include/ comes first so registers.h is the firmware's own: its float
+# conversions are part of what is under test, and fake/registers.h has none.
+# fake/ follows only to supply pico.h.
+# ---------------------------------------------------------------------------
+add_executable(test_sysreq
+    test_sysreq.cpp
+)
+target_include_directories(test_sysreq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include   # real registers.h (first!)
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake         # pico.h stub only
+)
+target_compile_features(test_sysreq PRIVATE cxx_std_17)
+target_link_libraries(test_sysreq PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_sysreq)

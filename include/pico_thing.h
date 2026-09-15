@@ -290,23 +290,5 @@ union high_bus_pins {
 #define DAT_FAULT_LOC_TASK_SHIFT uint8_t(3)
 #define DAT_FAULT_LOC_TASK_MASK	 uint8_t(TASK_PINS_MASK << DAT_FAULT_LOC_TASK_SHIFT)
 
-// System request opcodes
-#define	REQUEST_NULL		uint8_t(0x00u)
-#define REQUEST_TIME		uint8_t('T')
-#define REQUEST_SET_TIME	uint8_t('t')
-#define REQUEST_MOUNT		uint8_t('M')
-#define REQUEST_UNMOUNT		uint8_t('m')
-#define REQUEST_FLOAT		uint8_t('R')
-
-// System status values
-#define	RESPONSE_NULL		uint8_t(0x00u)
-#define	RESPONSE_DONE		uint8_t(0x01u)
-#define	RESPONSE_BUSY		uint8_t(0x7Fu)
-#define RESPONSE_UNKNOWN	uint8_t(0xFFu)
-#define	RESPONSE_UNAVAILABLE	uint8_t(0xFDu)
-
-// Floating-point requests
-#define FLOAT_ADD		uint8_t('+')
-#define FLOAT_SUBTRACT		uint8_t('-')
-#define FLOAT_MULTIPLY		uint8_t('*')
-#define FLOAT_DIVIDE		uint8_t('/')
+// System requests, their responses, and floating-point requests
+#include "sysreq.h"
