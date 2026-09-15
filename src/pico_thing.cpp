@@ -2023,7 +2023,7 @@ console_has_interrupt()
 // reference reading low inflates every voltage and deflates every
 // temperature, which is exactly the pair of symptoms a board shows when this
 // is left at its nominal value.  Measure ADC_AVDD and set it here.
-static constexpr float ADC_VREF_VOLTS = 3.2464f;	// TP607 on A601, replacement version 2 board
+static constexpr float ADC_VREF_VOLTS = 3.2464f;	// A101 pin 53 (no test point), replacement version 2 board
 
 // What the divider feeding GPIO 46 actually divides the 5V line by.  It is a
 // per-board figure: the first version 2 board measured 1.9407, the replacement
@@ -2124,24 +2124,27 @@ static volatile uint64_t rail_settle_until = 0u;	// us since boot; no judging be
 static volatile bool rail_sampled = false;	// at least one pass has run
 static volatile bool rail_collapsed = false;	// set here, acted on by the console loop
 
-// TODO: take a median of several samples per channel rather than one.
+// These readings are only true while the Pico is not serving the bus.
 //
-// adcdump measured the spread on this board.  Standing still both channels
-// sit within about two counts, but with the bus busy the die sensor reaches
-// 17 counts of standard deviation and, in a loop that faults every pass, the
-// supply divider reaches 84 - about 0.13V at the rail.  The means barely
-// move across those conditions, 0.074V on the supply and nine degrees on the
-// die, so this is scatter rather than a shifted reading and a median of
-// enough samples removes most of it.
+// adcdump on the replacement version 2 board (September 2026) found both
+// channels right, to within a count or two, with the guest halted or
+// unpowered: 3158 counts on the supply, where the metered 5.0033V rail
+// predicts 3158, and 865 on the die, 39C.  Whenever the Pico answers bus
+// reads - the guest held in reset, running, or faulting - both read high:
+// the supply by 350 to 420 counts, 0.55 to 0.67V at the rail, and the die by
+// about 125 counts, which reads nearly 60 degrees colder than it is.  The
+// reference was metered at the same time and had not moved.
 //
-// Nine samples would cost about 40us of the 20ms tick and take the die
-// channel from roughly plus or minus 19 degrees to plus or minus 6, and the
-// supply from 0.13V to about 0.045V.  Median rather than mean because the
-// disturbance looks impulsive.
+// That is a shift, not scatter, so the median of several samples once planned
+// here would not remove it.  Nor is it one converter offset: the channels move
+// by different amounts, and by how much depends on how closely the samples
+// follow one another.  It behaves like interference from serving the bus,
+// some of it reaching the converter inside the chip, and it grew as parts
+// were fitted.  The cause is not yet found.
 //
-// Not urgent for the supply: the 4.0V cutout is seven standard deviations
-// below the mean even under fault load, and three consecutive samples are
-// needed to act.  It is the die reading that is unusable sample by sample.
+// For the cutout this errs in the unsafe direction.  A high reading cannot
+// trip it falsely, but it can hide a real sag: while the bus is being served,
+// the rail may fall to about 3.4V before the reading drops below 4.0V.
 static bool
 power_rail_monitor(repeating_timer *)
 {
@@ -2584,8 +2587,9 @@ process_command(char *buf)
 		"  fill <s> <e> [v]   (fi)  fill s..e with v (default 00)\n"
 		"  fill all [v]       (fi)  fill $0000-$FDFF\n"
 		"  vector [n]         (vc)  show or set the CPU vectors\n"
-		"  adcdump                  burst-sample both ADC channels under\n"
-		"                           three bus loads; dumps raw counts as CSV\n"
+		"  adcdump                  burst-sample both ADC channels in reset,\n"
+		"                           running, faulting, halted and unpowered;\n"
+		"                           dumps raw counts as CSV (power-cycles guest)\n"
 		"  ramtest                  test every RAM page and the DAT (overwrites RAM)\n"
 		"  synctest [n]             count snippet runs that fail (n decimal, default 1000)\n"
 		"  snippet [n]        (sn)  list snippets, or copy n to $FFE0\n"
@@ -2946,12 +2950,19 @@ status_done:
 	}
 
 	case CMD_ADC: {
-		// Burst-sample both ADC channels under three bus conditions and dump
+		// Burst-sample both ADC channels under five guest conditions and dump
 		// every reading.  The die temperature has been seen to swing far more
 		// than the supply divider while the bus is busy - more than a shared
 		// reference error could explain - and one sample per condition cannot
 		// tell a noisy channel from a shifted one.  This prints the raw counts
 		// and leaves the judgement to whoever reads them.
+		//
+		// The last two conditions are the quiet ones, there to tell a steady
+		// offset from bus activity: halted, the processor has let go of the
+		// bus and the Pico answers no reads; unpowered, nothing on the board
+		// switches at all.  Unpowering power-cycles the guest, so its RAM is
+		// lost.  Readings are buffered and printed at the end, because powering
+		// down and back up prints progress that would otherwise split the CSV.
 #if PICO_THING_BOARD_VERSION < 2
 		// Version 1 has the power enable on GPIO 46, not a supply divider,
 		// so there is no second channel to compare the die sensor against
@@ -2962,53 +2973,97 @@ status_done:
 			break;
 		static constexpr uint32_t ADC_BURST = 64u;
 		static constexpr uint8_t ADC_BURST_PAGE = 1u;	// the page condition 2 unmaps
+		static constexpr uint32_t ADC_HALT_TIMEOUT_MS = 100u;
+		enum : uint8_t {
+			ADC_RESET,		// guest held in reset
+			ADC_LOOP,		// LOOP_RW reading a mapped page
+			ADC_FAULTING,		// LOOP_RW reading an unmapped page
+			ADC_HALTED,		// LOOP_RW halted, bus released
+			ADC_UNPOWERED,		// guest rail off
+			ADC_CONDITIONS
+		};
+		static uint16_t adc_samples[ADC_CONDITIONS][ADC_BURST][2];
+
+		printf("ADC burst, %" PRIu32 " samples per condition - power-cycles the guest, losing its RAM\n",
+		       ADC_BURST);
 
 		// Take the converter off the supply monitor for the duration: there is
 		// one input mux, and the two would otherwise fight over it.
 		cancel_repeating_timer(&rail_timer);
 
-		printf("ADC burst, raw counts, %" PRIu32 " samples per condition\n", ADC_BURST);
-		printf("cond 0 = guest in reset, 1 = LOOP_RW running, 2 = faulting loop\n");
-		printf("cond,n,bus,die\n");
+		const uint16_t dat_entry = static_cast<uint16_t>(0xFE00u + ADC_BURST_PAGE);
+		uint8_t dat_saved = 0u;
+		bool dat_read = false;
 
-		for (uint8_t cond = 0u; cond < 3u; cond++) {
-			MC6809.stop();
-			sleep_ms(1u);
-			if (cond == 2u) {
-				// Unmap the page the loop is about to read, from task zero,
-				// which is the only task the GAL lets write DAT RAM.
-				task_pins_update(MC6809.task_change(0u));
-				const uint8_t unavailable = 0xFFu;
-				(void) copy(OUTWARDS, 1u,
-					    static_cast<uint16_t>(0xFE00u + ADC_BURST_PAGE),
-					    &unavailable);
+		for (uint8_t cond = 0u; cond < ADC_CONDITIONS; cond++) {
+			if (cond == ADC_UNPOWERED) {
+				reset_power();
+			} else {
 				MC6809.stop();
 				sleep_ms(1u);
-			}
-			if (cond != 0u) {
-				snippet_copy(LOOP_RW);
-				reg[REGISTER_SNIPPET_OFFSET + 0u] = static_cast<uint8_t>(0xB6u);	// LDA extended
-				reg[REGISTER_SNIPPET_OFFSET + 1u] =
-					static_cast<uint8_t>(ADC_BURST_PAGE << 5);
-				MC6809.start();
-				sleep_ms(2u);	// let the loop get going before sampling
+				if (cond == ADC_FAULTING || cond == ADC_HALTED) {
+					// DAT RAM is written from task zero, the only task
+					// the GAL lets write it.  Unmap the page the loop is
+					// about to read for the faulting loop, keeping its
+					// entry, and put it back for the halted one, which
+					// has to run before it can halt.
+					task_pins_update(MC6809.task_change(0u));
+					if (cond == ADC_FAULTING) {
+						dat_read = copy(INWARDS, 1u, dat_entry, &dat_saved);
+						const uint8_t unavailable = 0xFFu;
+						(void) copy(OUTWARDS, 1u, dat_entry, &unavailable);
+					} else if (dat_read)
+						(void) copy(OUTWARDS, 1u, dat_entry, &dat_saved);
+					MC6809.stop();
+					sleep_ms(1u);
+				}
+				if (cond != ADC_RESET) {
+					snippet_copy(LOOP_RW);
+					reg[REGISTER_SNIPPET_OFFSET + 0u] = static_cast<uint8_t>(0xB6u);	// LDA extended
+					reg[REGISTER_SNIPPET_OFFSET + 1u] =
+						static_cast<uint8_t>(ADC_BURST_PAGE << 5);
+					MC6809.start();
+					sleep_ms(2u);	// let the loop get going before sampling
+				}
+				if (cond == ADC_HALTED) {
+					MC6809.halt();
+					for (uint32_t ms = 0u; !MC6809.is_halted() && ms < ADC_HALT_TIMEOUT_MS; ms++)
+						sleep_ms(1u);
+					if (!MC6809.is_halted())
+						printf("Guest did not halt within %" PRIu32 "ms - sampled anyway\n",
+						       ADC_HALT_TIMEOUT_MS);
+				}
 			}
 
 			for (uint32_t n = 0u; n < ADC_BURST; n++) {
 				adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
 				(void) adc_read();
-				const uint16_t bus_raw = static_cast<uint16_t>(adc_read());
+				adc_samples[cond][n][0] = static_cast<uint16_t>(adc_read());
 				adc_select_input(NUM_ADC_CHANNELS - 1);
 				(void) adc_read();
-				const uint16_t die_raw = static_cast<uint16_t>(adc_read());
-				printf("%u,%" PRIu32 ",%u,%u\n", cond, n, bus_raw, die_raw);
+				adc_samples[cond][n][1] = static_cast<uint16_t>(adc_read());
+			}
+
+			if (cond == ADC_HALTED) {
+				MC6809.stop();
+				MC6809.release();
+				sleep_ms(1u);
 			}
 		}
 
-		MC6809.stop();
-		sleep_ms(1u);
-		task_pins_update(MC6809.task_change(0u));
+		// Back on as 'power on' would do it, with the supply monitor running
+		// first: the rail check that gates the switch judges its reading.
 		power_rail_monitor_start();
+		sleep_ms(3u * RAIL_MONITOR_MS);
+		if (!set_power())
+			printf("Guest not powered back on - use 'power on'\n");
+
+		printf("cond 0 = guest in reset, 1 = LOOP_RW running, 2 = faulting loop, 3 = halted, 4 = unpowered\n");
+		printf("cond,n,bus,die\n");
+		for (uint8_t cond = 0u; cond < ADC_CONDITIONS; cond++)
+			for (uint32_t n = 0u; n < ADC_BURST; n++)
+				printf("%u,%" PRIu32 ",%u,%u\n", cond, n,
+				       adc_samples[cond][n][0], adc_samples[cond][n][1]);
 		printf("end\n\n");
 #endif
 		break;
@@ -3829,7 +3884,7 @@ status_done:
 		printf("NMI break -> %04X\n", REGISTER_SNIPPET);
 		console_set_interrupt(INTERRUPT_NMI);
 		// Wait for the full 6809 register set to be stacked.
-		// TODO: MarkM: this is exactly what I wanted BS_IRQ to help with.
+		// TODO	: MarkM: this is exactly what I wanted BS_IRQ to help with.
 		while ((reg[REGISTER_BUFFER + 10] | reg[REGISTER_BUFFER + 11]) == static_cast<uint8_t>(0x00)) { sleep_us(1); if (++timeout > 1000000u) break; }
 		console_set_interrupt(INTERRUPT_NONE);
 		if (timeout > 1000000u)

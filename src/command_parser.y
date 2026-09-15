@@ -251,7 +251,7 @@ reset_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * adc   - burst-sample both ADC channels under three bus conditions
+ * adc   - burst-sample both ADC channels under five guest conditions
  * ----------------------------------------------------------------------- */
 adc_cmd:
 	TOK_ADC     { result->tag = CMD_ADC; }
