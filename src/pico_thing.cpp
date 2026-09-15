@@ -4607,6 +4607,39 @@ clock_pio_init()
 	printf("Core0 E/Q clocks pio%d sm%d configured\n", PIO_NUM(BUS_CLOCK_PIO), pio_clock.sm);
 }
 
+// RP2350 pads come out of reset with their pull-downs enabled, and nothing
+// here turned them off.  The 6809 releases its address bus, data bus and
+// R/!W while parked in SYNC or HALT, and a pull-down drags a released R/!W low
+// - which, with E still running, is a write strobe: stray writes land wherever
+// the draining address decodes.  So with the guest powered these pads pull up
+// instead, R/!W holds at read, and the address lines seen here drift high
+// rather than towards $0000.  !CS pulls up too, so an undriven select reads
+// as not selected: without it, a missing or unprogrammed decoder left the
+// Pico answering at every address, which looks like a working board.  At
+// power-down every pull comes off, so none feeds the unpowered guest logic.
+static void
+bus_pin_pulls(const bool powered)
+{
+	static constexpr struct {
+		uint8_t base;
+		uint8_t count;
+	} groups[] = {
+		{ GPIO_RW, 1u },
+		{ GPIO_CS, 1u },
+		{ GPIO_A_BASE, 6u },		// A0-A5
+		{ GPIO_D_BASE, 8u },		// D0-D7
+		{ GPIO_A_HI_BASE, 3u },		// A13-A15
+	};
+	for (const auto &g : groups)
+		for (uint8_t i = 0u; i < g.count; i++) {
+			const uint8_t pin = static_cast<uint8_t>(g.base + i);
+			if (powered)
+				gpio_set_pulls(pin, true, false);
+			else
+				gpio_disable_pulls(pin);
+		}
+}
+
 static void
 bus_pio_dma_init()
 {
@@ -4638,6 +4671,8 @@ bus_pio_dma_init()
 	// the page within the task that faulted.
 	init_pins_range(GPIO_A_HI_BASE, 3);
 	gpio_set_dir_in_masked64(0b111LLu << GPIO_A_HI_BASE);
+
+	bus_pin_pulls(true);
 
 	// Fault NMI mask output, active high, driven from SYSTEM_DAT_FAULT bit 7.
 	// Starts low (faults reach the guest) to match the cleared register.
@@ -4941,6 +4976,9 @@ pio_shutdown()
 	// --- Fault NMI mask to hi-Z, so it does not drive unpowered logic ---
 	gpio_put(GPIO_NMI_BLOCK, false);
 	gpio_set_dir(GPIO_NMI_BLOCK, GPIO_IN);
+
+	// --- Bus pull-ups off, so they do not feed unpowered logic either ---
+	bus_pin_pulls(false);
 }
 
 // How much external 5V has to be there before the load switch is closed.

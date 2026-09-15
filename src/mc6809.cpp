@@ -152,6 +152,15 @@ mc6809::init()
 	gpio_set_drive_strength(GPIO_IRQ, GPIO_DRIVE_STRENGTH_8MA);
 	DEASSERT_IRQ;
 
+	// RP2350 pads come out of reset with their pull-downs enabled.  The
+	// interrupt lines deassert by being released, and a released line with a
+	// pull-down works against the pull-up meant to hold it inactive; !HALT is
+	// released at power-down too.  Pull up instead - driving low to assert
+	// still wins.
+	static constexpr uint8_t released_pins[] = { GPIO_HALT, GPIO_NMI, GPIO_FIRQ, GPIO_IRQ };
+	for (const uint8_t pin : released_pins)
+		gpio_set_pulls(pin, true, false);
+
 	setup(RS_RESET);
 	task_initialise();
 }
@@ -178,6 +187,12 @@ mc6809::deinit()
 	DEASSERT_FIRQ;
 	gpio_put(GPIO_IRQ, false);
 	DEASSERT_IRQ;
+
+	// No pull either, so the pull-ups set by init() do not feed the guest
+	// logic once its rail is gone.
+	static constexpr uint8_t released_pins[] = { GPIO_HALT, GPIO_NMI, GPIO_FIRQ, GPIO_IRQ };
+	for (const uint8_t pin : released_pins)
+		gpio_disable_pulls(pin);
 
 	// The caller drops the 5V rail once every pin is released.
 	old_bus_state = BUS_RUNNING;
