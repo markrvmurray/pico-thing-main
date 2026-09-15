@@ -132,6 +132,12 @@ static uint16_t watchpoint_saved_nmi_vector = 0u;
 // A separate flag also avoids racing the read-modify-write on pending_interrupts.
 static volatile bool watchpoint_nmi_pending = false;
 
+// Set by the Q-rising EQ handler as it raises the watchpoint's NMI, so the
+// console reports only a real hit.  SHARED also carries copies and system
+// requests, so bytes left there are no sign that BREAK has run; the handler
+// clears the PC slot as it raises the NMI, leaving only BREAK's copy to fill it.
+static volatile bool watchpoint_fired = false;
+
 // Take the watchpoint down and clear the evidence that it fired.  The BREAK
 // snippet leaves the stacked PC in SHARED[10:11], and anything that finds it
 // non-zero while the watchpoint is armed reads it as a fresh hit - so a report
@@ -146,6 +152,7 @@ watchpoint_disarm()
 		watchpoint_armed = false;
 	}
 	watchpoint_nmi_pending = false;
+	watchpoint_fired = false;
 	reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
 	reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
 }
@@ -447,6 +454,11 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		{
 			const uint8_t pend = pending_interrupts;
 			if ((pend & PEND_NMI) || watchpoint_nmi_pending) {
+				if (watchpoint_nmi_pending) {
+					reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
+					reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
+					watchpoint_fired = true;
+				}
 				ASSERT_NMI;
 				pending_interrupts = pend & ~PEND_NMI;
 				watchpoint_nmi_pending = false;
@@ -4256,28 +4268,37 @@ poll_console()
 		}
 		mc6809::uart_task(idx > 0);
 
-		// Check for watchpoint hit — BREAK snippet writes stack to SHARED and spins.
-		// PC at SHARED[10:11]; non-zero means the watchpoint fired.
-		if (watchpoint_armed) {
-			const uint8_t pc_hi = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 10]);
-			const uint8_t pc_lo = static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 11]);
-			if (pc_hi != 0u || pc_lo != 0u) {
-				const uint16_t wp_pc = (pc_hi << 8) | pc_lo;
-				printf("\n*** WATCHPOINT HIT ***\n");
-				printf("  CC=%02X A=%02X B=%02X DP=%02X X=%04X Y=%04X U=%04X PC=%04X\n",
-				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 0]),
-				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 1]),
-				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 2]),
-				       static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 3]),
-				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 4]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 5]),
-				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 6]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 7]),
-				       (static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 8]) << 8) | static_cast<uint8_t>(reg[REGISTER_BUFFER_OFFSET + 9]),
-				       wp_pc);
-				printf("  Write to vector area at PC=$%04X\n", wp_pc);
-				watchpoint_disarm();
-				MC6809.stop();
-				prompted = false;
+		// Check for a watchpoint hit.  Once the NMI has been raised, the BREAK
+		// snippet copies the stacked registers into SHARED a byte at a time, CC
+		// first and PC last, then spins.  Report from a settled copy - the PC
+		// set, and two readings a millisecond apart that agree - or the PC can
+		// be caught with only its high byte copied.
+		if (watchpoint_armed && watchpoint_fired) {
+			static constexpr uint32_t WATCHPOINT_SETTLE_MS = 50u;
+			uint8_t frame[12];
+			uint8_t previous[sizeof frame];
+			registers::copy_out(previous, REGISTER_BUFFER_OFFSET, sizeof previous);
+			bool settled = false;
+			for (uint32_t ms = 0u; ms < WATCHPOINT_SETTLE_MS && !settled; ms++) {
+				sleep_ms(1u);
+				registers::copy_out(frame, REGISTER_BUFFER_OFFSET, sizeof frame);
+				settled = (frame[10] != 0u || frame[11] != 0u)
+					  && memcmp(frame, previous, sizeof frame) == 0;
+				memcpy(previous, frame, sizeof frame);
 			}
+			const uint16_t wp_pc = static_cast<uint16_t>((frame[10] << 8) | frame[11]);
+			printf("\n*** WATCHPOINT HIT ***\n");
+			printf("  CC=%02X A=%02X B=%02X DP=%02X X=%04X Y=%04X U=%04X PC=%04X\n",
+			       frame[0], frame[1], frame[2], frame[3],
+			       (frame[4] << 8) | frame[5], (frame[6] << 8) | frame[7],
+			       (frame[8] << 8) | frame[9], wp_pc);
+			if (!settled)
+				printf("  (registers still changing after %" PRIu32 "ms - may be incomplete)\n",
+				       WATCHPOINT_SETTLE_MS);
+			printf("  Write to vector area at PC=$%04X\n", wp_pc);
+			watchpoint_disarm();
+			MC6809.stop();
+			prompted = false;
 		}
 	}
 }
@@ -4491,6 +4512,7 @@ __no_inline_not_in_flash_func(main_core1)()
 					watchpoint_saved_nmi_vector = static_cast<uint16_t>(reg[REGISTER_VECTOR_NMI_OFFSET]);
 					snippet_copy(BREAK);
 					reg[REGISTER_VECTOR_NMI_OFFSET] = REGISTER_SNIPPET;
+					watchpoint_fired = false;
 					watchpoint_armed = true;
 				} else if (written_byte == 0u && watchpoint_armed) {
 					// Disarm: restore original NMI vector
@@ -5063,6 +5085,7 @@ set_power()
 		aux_serial.reset();
 		watchpoint_armed = false;
 		watchpoint_nmi_pending = false;
+		watchpoint_fired = false;
 		// Lower the DAT fault mask.  A fault raises it and only a guest
 		// write to SYSTEM_DAT_FAULT lowers it again, so a guest that
 		// faulted and did not clear it - one that was killed by the fault,
