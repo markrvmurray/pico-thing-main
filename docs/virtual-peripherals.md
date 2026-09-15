@@ -92,7 +92,7 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 - `tx_write_pending` (volatile) — set by DMA write ISR, cleared by `guest_transmit()`
 
 **Caching state:**
-- `cached_status_byte` — last value written to `reg[CONSOLE_STATUS]` by `sync_status()`. When the recomputed status byte matches, the register write is skipped.
+- (no cached copy) — `sync_status()` compares the rebuilt byte with the status register itself; an ISR can change the register after a store, so a remembered copy could let a needed store be skipped.
 - `cached_irq_result` — last return value of `has_interrupt()`. Returned immediately when `irq_dirty` is false.
 - `irq_dirty` (volatile) — set by any state-changing method (`write_received()`, `guest_control()`, `guest_transmit()`, `rx_read_fast_path()`, `guest_receive()`, `host_transmit()`, `reset()`). Cleared by `has_interrupt()` after recomputation. When clean, `has_interrupt()` returns `cached_irq_result` in ~2–4 cycles, avoiding ~30–50 cycles of full status recomputation.
 
@@ -124,7 +124,7 @@ CTS  = cts_deasserted
 IRQ  = assert_receive_irq || assert_transmit_irq
 ```
 
-**Optimization:** The computed status byte is compared against `cached_status_byte`. If unchanged, the register write is skipped entirely. This is the common case during idle periods.
+**Store:** The rebuilt status byte is compared with the register's current value and stored only if it differs. The store is exclusive (`mc6850::store`: LDREXB/STREXB/CLREX on the device). A bus ISR fast path that lands between the build and the store cancels the exclusive access, the store fails, and the byte is rebuilt from the updated flags, so the fast path's update is never overwritten. Nothing is masked: masking the DMA interrupts instead lost bus reads, because two DMA completions while masked are served as one.
 
 ### TX Data Flow (6809 → Host)
 

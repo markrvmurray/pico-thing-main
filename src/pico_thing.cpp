@@ -5122,28 +5122,6 @@ reset_power()
 	printf("Core0 5V rail off\n");
 }
 
-// mc6850::exclusion for this firmware.  The ACIAs' loop-side calls mask the two
-// DMA interrupts, whose handlers run the ACIA fast paths, and nothing else: the
-// Q-edge handler has to keep its timing, or the fault sampler could miss its
-// window.  irq_set_enabled() acts on the calling core's NVIC, which is Core 1's,
-// where both the loop-side calls and the DMA handlers run.
-static uint32_t
-dma_irqs_mask()
-{
-	const uint32_t was = (irq_is_enabled(piodma_read.irq) ? 1u : 0u)
-			   | (irq_is_enabled(piodma_write.irq) ? 2u : 0u);
-	irq_set_enabled(piodma_read.irq, false);
-	irq_set_enabled(piodma_write.irq, false);
-	return was;
-}
-
-static void
-dma_irqs_restore(const uint32_t was)
-{
-	irq_set_enabled(piodma_read.irq, (was & 1u) != 0u);
-	irq_set_enabled(piodma_write.irq, (was & 2u) != 0u);
-}
-
 int
 main()
 {
@@ -5190,7 +5168,6 @@ main()
 	printf("Core0 initialised USB\n");
 
 	queue_init(&console_write_queue, sizeof(write_entry), CONSOLE_WRITE_QUEUE_LEN);
-	mc6850::exclusion = { dma_irqs_mask, dma_irqs_restore };
 
 	// Enable external electronics' power
 	gpio_init(GPIO_POWER);

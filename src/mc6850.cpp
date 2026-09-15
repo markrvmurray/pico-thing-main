@@ -11,36 +11,78 @@
 #include "pico/stdlib.h"
 
 #include "hardware/pio.h"
+#include "hardware/sync.h"
 
 #include "registers.h"
 #include "pico_thing.h"
 #include "mc6809.h"
 #include "mc6850.h"
 
-// Core 1's loop-side calls share this ACIA's flags, and the status register
-// they fold into, with the bus ISRs' fast paths: write_received(),
-// control_written_isr() and rx_read_fast_path().  sync_status() builds the
-// status byte and then writes it, so a fast path landing between the two would
-// be overwritten with a stale byte - RDRF set again for a byte the guest has
-// already read.  Loop-side calls hold this for their few instructions.  The
-// ISR-side calls need not: both DMA handlers share a priority, so neither
-// preempts the other.
-class bus_isrs_excluded {
-	uint32_t saved = 0u;
-public:
-	bus_isrs_excluded()
-	{
-		if (mc6850::exclusion.enter)
-			saved = mc6850::exclusion.enter();
-	}
-	~bus_isrs_excluded()
-	{
-		if (mc6850::exclusion.leave)
-			mc6850::exclusion.leave(saved);
-	}
-	bus_isrs_excluded(const bus_isrs_excluded &) = delete;
-	bus_isrs_excluded &operator=(const bus_isrs_excluded &) = delete;
-};
+// The status register is built from flags that the bus ISRs' fast paths -
+// write_received(), control_written_isr() and rx_read_fast_path() - change and
+// then store themselves.  Core 1's loop builds and stores it too, so a fast
+// path landing between the loop's build and store would be overwritten with a
+// stale byte: RDRF set again for a byte the guest has already read.
+//
+// Two earlier attempts at keeping them apart failed on this bus.  Masking the
+// DMA interrupts around the loop's ACIA work lost bus reads, because two
+// completions while masked are served as one, which misaligned DriveWire.  An
+// exclusive store (LDREXB/STREXB, retried when an exception cancelled it) lost
+// no reads but could not finish under load: with a Q-edge interrupt twice per E
+// cycle and a DMA interrupt for every guest access, an interrupt landed between
+// the load and the store every time, and Core 1's thread mode starved.
+//
+// So the store simply holds interrupts off for the compare and the store - a
+// few tens of nanoseconds, against an E cycle of a microsecond.  Nothing can
+// come between; no interrupt is lost, only delayed well inside one bus cycle;
+// and there is nothing to retry, so it cannot spin.  Only Core 1 gets here (its
+// loop and its own ISRs), so one saved interrupt state is enough.
+#if PICO_ON_DEVICE
+static uint32_t interrupts_held;
+
+static uint8_t
+held_open(volatile uint8_t *status)
+{
+	interrupts_held = save_and_disable_interrupts();
+	return *status;
+}
+
+static bool
+held_commit(volatile uint8_t *status, const uint8_t value)
+{
+	*status = value;
+	restore_interrupts(interrupts_held);
+	return true;
+}
+
+static void
+held_abandon()
+{
+	restore_interrupts(interrupts_held);
+}
+const mc6850::status_store mc6850::native_store = { held_open, held_commit, held_abandon };
+#else
+// On the host nothing can come between, so a plain store never fails.
+static uint8_t
+plain_open(volatile uint8_t *status)
+{
+	return *status;
+}
+
+static bool
+plain_commit(volatile uint8_t *status, const uint8_t value)
+{
+	*status = value;
+	return true;
+}
+
+static void
+plain_abandon()
+{
+}
+const mc6850::status_store mc6850::native_store = { plain_open, plain_commit, plain_abandon };
+#endif
+mc6850::status_store mc6850::store = mc6850::native_store;
 
 mc6850::mc6850(uint16_t ctl_off, uint16_t data_off) :
 	ctl_offset(ctl_off),
@@ -49,7 +91,6 @@ mc6850::mc6850(uint16_t ctl_off, uint16_t data_off) :
 {
 	registers::write(ctl_offset) = CONSOLE_NONE;
 	reg[ctl_offset] = reset_status.byte;
-	cached_status_byte = reset_status.byte;
 	registers::write(data_offset) = static_cast<uint8_t>(0x00);
 	reg[data_offset] = static_cast<uint8_t>(0x00);
 }
@@ -77,27 +118,60 @@ mc6850::reset()
 	tx.reset();
 	rx.reset();
 	reg[ctl_offset] = reset_status.byte;
-	cached_status_byte = reset_status.byte;
 }
 
-// Derive the full status register from internal state variables.
-// Must NOT read-modify-write reg[ctl_offset] — the read ISR
-// (rx_read_fast_path) can preempt and clear RDRF between our read
-// and write, causing us to clobber the ISR's update.
-// Skips the register write if the byte hasn't changed.
-// Building the byte and writing it are still two steps, so loop-side callers
-// hold bus_isrs_excluded around this; see above.
-inline void
-mc6850::sync_status()
+// Derive the full status register from internal state variables and store it,
+// through the exclusive store described above.  The byte is compared with the
+// register itself, not a remembered copy: an ISR can change the register after
+// this stores it, and a copy would then let a later identical byte go unstored.
+// The status byte as the internal flags currently describe it.  Pulled out so
+// that the cheap pre-check below and the guarded rebuild inside the loop
+// cannot drift apart.
+inline uint8_t
+mc6850::status_byte() const
 {
 	mc6850_status sr = {};
 	sr.rdrf = receive_buffer_full ? 1u : 0u;
 	sr.tdre = (transmit_buffer_empty && !cts_deasserted && !tx_write_pending) ? 1u : 0u;
 	sr.cts  = cts_deasserted ? 1u : 0u;
 	sr.irq  = (assert_receive_irq || assert_transmit_irq) ? 1u : 0u;
-	if (sr.byte != cached_status_byte) {
-		cached_status_byte = sr.byte;
-		reg[ctl_offset] = sr.byte;
+	return sr.byte;
+}
+
+inline void
+mc6850::sync_status()
+{
+	const auto status = reinterpret_cast<volatile uint8_t *>(registers::read_address() + ctl_offset);
+
+	// Look before holding interrupts off.  Under load the usual answer is
+	// that nothing moved - irq_dirty is set by queue activity that often
+	// does not touch TDRE, RDRF, CTS or IRQ - and then there is nothing to
+	// protect, so the CPSID/CPSIE pair is pure cost.  This is called twice
+	// per E cycle per ACIA from Core 1's loop.
+	//
+	// Safe because this path NEVER STORES.  Both races are benign:
+	//   - a flag changes right after the compare: the ISR that changed it
+	//     sets irq_dirty, so the next pass recomputes and stores;
+	//   - the register changes right after the read: our value was stale,
+	//     but we are not writing, so there is nothing to clobber.
+	// What it must not do is skip a store that was needed, and an equal
+	// comparison means no store was needed.
+	if (status_byte() == *status)
+		return;
+
+	for (;;) {
+		const uint8_t current = store.open(status);
+		// Rebuilt inside the critical section, not reused from above: a
+		// fast path may have moved the flags since, and its value is the
+		// newer one.  This is the race that took three attempts in
+		// September - see the note at the top of this file.
+		const uint8_t want = status_byte();
+		if (want == current) {
+			store.abandon();
+			return;
+		}
+		if (store.commit(status, want))
+			return;
 	}
 }
 
@@ -148,7 +222,6 @@ mc6850::control_written_isr(uint8_t val)
 void
 mc6850::guest_control(uint8_t val)
 {
-	const bus_isrs_excluded excluded;
 	mc6850_control cr = {val};
 	if (cr.divide_select == 0b11u) {
 		reset();
@@ -171,7 +244,6 @@ mc6850::guest_control(uint8_t val)
 void
 mc6850::guest_transmit(uint8_t data)
 {
-	const bus_isrs_excluded excluded;
 	tx_write_pending = false;		// acknowledge: for(;;) loop has taken ownership
 	if (loopback_close) {
 		// Close loopback: TX byte goes directly into the RX register,
@@ -210,7 +282,6 @@ mc6850::rx_read_fast_path()
 void
 mc6850::guest_receive()
 {
-	const bus_isrs_excluded excluded;
 	// If RTS is deasserted (6809 ring buffer full) do not stage the next byte;
 	// leave it in the rx queue so it is delivered once RTS is re-asserted.
 	if (rts_deasserted) {
@@ -238,7 +309,6 @@ mc6850::has_interrupt()
 	// the cached result without recomputing anything.
 	if (!irq_dirty)
 		return cached_irq_result;
-	const bus_isrs_excluded excluded;
 	irq_dirty = false;
 
 	// Absorb TX queue state refresh (formerly update_task/sync_transmit).

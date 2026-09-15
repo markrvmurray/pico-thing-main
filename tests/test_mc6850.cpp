@@ -794,72 +794,179 @@ TEST_CASE("close loopback takes priority over queue loopback") {
 }
 
 // -----------------------------------------------------------------------
-// Bus ISR exclusion
+// Status register store
 //
-// sync_status() builds the status byte from the flags, then writes it.  The
-// bus ISRs' fast paths change those flags and write the status too, so one
-// landing between the two steps would be overwritten with a stale byte.
-// Core 1's loop-side calls therefore hold mc6850::exclusion.  A host test
-// cannot preempt, so these check that each loop-side call takes the exclusion
-// once and gives it back, and that the ISR-side calls and the clean
-// has_interrupt() path - both hot - do not take it at all.
+// sync_status() builds the status byte from the flags and then stores it.  A
+// bus ISR fast path landing between the two changes the flags and stores its
+// own byte, so the store has to fail, or the fast path's update is overwritten.
+// Any other exception cancels the store too - the Q-edge handler, the tick
+// timer - and then nothing else has stored the loop's update, so a failed store
+// has to be retried.  On the device the failure comes from STREXB after an
+// exception; here a fake store fails once, running the fast path in between if
+// asked, as the interrupt would.
 // -----------------------------------------------------------------------
 
-static uint32_t exclusion_entries = 0u;
-static int exclusion_depth = 0;
+static mc6850 *store_uart = nullptr;
+static uint32_t store_commits = 0u;
+static uint32_t store_opens = 0u;	// entries into the interrupts-off section
+static bool fail_next_commit = false;		// an exception lands before the store
+static bool fast_path_in_failure = false;	// ... and it is the read ISR's fast path
 
-static uint32_t counting_enter()
+static uint8_t fake_open(volatile uint8_t *status)
 {
-	exclusion_entries++;
-	return static_cast<uint32_t>(exclusion_depth++);
+	store_opens++;
+	return *status;
 }
 
-static void counting_leave(const uint32_t saved)
+static bool fake_commit(volatile uint8_t *status, const uint8_t value)
 {
-	exclusion_depth = static_cast<int>(saved);
+	store_commits++;
+	if (fail_next_commit) {
+		fail_next_commit = false;
+		if (fast_path_in_failure) {
+			fast_path_in_failure = false;
+			store_uart->rx_read_fast_path();	// the guest reads RX data: the read ISR
+		}
+		return false;
+	}
+	*status = value;
+	return true;
 }
 
-// How many times f takes the exclusion; it must leave it balanced.
-template <typename F>
-static uint32_t exclusions_taken(F f)
+static void fake_abandon()
 {
-	const uint32_t before = exclusion_entries;
-	f();
-	CHECK(exclusion_depth == 0);
-	return exclusion_entries - before;
 }
 
-TEST_CASE("loop-side calls exclude the bus ISRs") {
+TEST_CASE("a fast path between building and storing the status is not overwritten") {
 	registers::clear();
-	mc6850::exclusion = { counting_enter, counting_leave };
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	store_uart = &uart;
+	mc6850::store = { fake_open, fake_commit, fake_abandon };
 
-	CHECK(exclusions_taken([&] { uart.guest_control(0x15u); }) == 1u);
+	uart.host_transmit('Z');
+	(void)uart.has_interrupt();		// stages 'Z': RDRF=1
+	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('A');
+	uart.write_received();			// TDRE=0 until the loop takes the byte
+	REQUIRE(status().rdrf == 1);
+	REQUIRE(status().tdre == 0);
+
+	// The loop builds TDRE=1 with RDRF still 1; the read ISR lands before the
+	// store and clears RDRF.
+	fail_next_commit = true;
+	fast_path_in_failure = true;
+	uart.guest_transmit('A');
+
+	CHECK(status().rdrf == 0);
+	CHECK(status().tdre == 1);
+
+	mc6850::store = mc6850::native_store;
+}
+
+TEST_CASE("a status store cancelled by an unrelated exception is retried") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	store_uart = &uart;
+	mc6850::store = { fake_open, fake_commit, fake_abandon };
 
 	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('A');
-	uart.write_received();
-	CHECK(exclusions_taken([&] { uart.guest_transmit('A'); }) == 1u);
+	uart.write_received();			// TDRE=0 until the loop takes the byte
+	REQUIRE(status().tdre == 0);
 
-	uart.host_transmit('B');	// gives has_interrupt() real work
-	CHECK(exclusions_taken([&] { (void)uart.has_interrupt(); }) == 1u);
+	// The loop builds TDRE=1; a Q-edge interrupt lands before the store.
+	// Nothing else stores the update, so without a retry TDRE stays at 0.
+	fail_next_commit = true;
+	uart.guest_transmit('A');
 
-	uart.rx_read_fast_path();
-	CHECK(exclusions_taken([&] { uart.guest_receive(); }) == 1u);
+	CHECK(status().tdre == 1);
 
-	mc6850::exclusion = { nullptr, nullptr };
+	mc6850::store = mc6850::native_store;
 }
 
-TEST_CASE("ISR-side calls and a clean has_interrupt() leave the bus ISRs alone") {
+TEST_CASE("an unchanged status is not stored") {
 	registers::clear();
-	mc6850::exclusion = { counting_enter, counting_leave };
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	mc6850::store = { fake_open, fake_commit, fake_abandon };
 
-	CHECK(exclusions_taken([&] { uart.write_received(); }) == 0u);
-	CHECK(exclusions_taken([&] { uart.control_written_isr(0x15u); }) == 0u);
-	CHECK(exclusions_taken([&] { uart.rx_read_fast_path(); }) == 0u);
+	uart.guest_receive();
+	const uint32_t before = store_commits;
+	uart.guest_receive();			// nothing has changed
 
-	(void)uart.has_interrupt();	// settles: nothing is dirty after this
-	CHECK(exclusions_taken([&] { (void)uart.has_interrupt(); }) == 0u);
+	CHECK(store_commits == before);
 
-	mc6850::exclusion = { nullptr, nullptr };
+	mc6850::store = mc6850::native_store;
+}
+
+// The point of the pre-check: when nothing moved, interrupts are never held
+// off at all.  sync_status() runs twice per E cycle per ACIA from Core 1's
+// loop, so the common case has to be free of the CPSID/CPSIE pair.
+TEST_CASE("an unchanged status does not enter the critical section") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	mc6850::store = { fake_open, fake_commit, fake_abandon };
+
+	uart.guest_receive();			// settles the register
+	const uint32_t opens = store_opens;
+	const uint32_t commits = store_commits;
+
+	for (int i = 0; i < 20; i++)
+		uart.guest_receive();		// nothing changes, 20 times over
+
+	CHECK(store_opens == opens);		// never opened
+	CHECK(store_commits == commits);	// and so never stored
+
+	mc6850::store = mc6850::native_store;
+}
+
+// ... and the converse, so the test above cannot pass by the section never
+// being entered at all.
+TEST_CASE("a changed status does enter the critical section") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	mc6850::store = { fake_open, fake_commit, fake_abandon };
+
+	uart.guest_receive();
+	const uint32_t opens = store_opens;
+
+	uart.host_transmit('Q');
+	(void)uart.has_interrupt();		// stages 'Q': RDRF goes 0 -> 1
+
+	CHECK(store_opens > opens);
+	CHECK(status().rdrf == 1);
+
+	mc6850::store = mc6850::native_store;
+}
+
+// The pre-check compares against the REGISTER, not a remembered byte, so a
+// register someone else corrupted is still corrected - and that correction
+// must go through the critical section like any other store.
+TEST_CASE("a corrupted register is corrected through the critical section") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	mc6850::store = { fake_open, fake_commit, fake_abandon };
+
+	uart.guest_receive();
+	REQUIRE(status().tdre == 1);
+	const uint32_t opens = store_opens;
+
+	registers::poke(CONSOLE_STATUS, 0x00u);	// behind the ACIA's back
+	uart.guest_receive();
+
+	CHECK(status().tdre == 1);		// put right
+	CHECK(store_opens > opens);		// and properly guarded
+
+	mc6850::store = mc6850::native_store;
+}
+
+// The byte is compared with the register, not with what was last stored: a
+// register changed behind the ACIA's back is put right at the next update.
+TEST_CASE("a status register changed behind the ACIA's back is corrected") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart.guest_receive();
+	REQUIRE(status().tdre == 1);
+
+	registers::poke(CONSOLE_STATUS, 0x00u);
+	uart.guest_receive();
+
+	CHECK(status().tdre == 1);
 }

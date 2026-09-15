@@ -81,15 +81,20 @@ class mc6850 {
 public:
 	static constexpr uint CTS_THRESHOLD = 800u;  // out of CONSOLE_QUEUE_LEN=1024
 
-	// Held by Core 1's loop-side calls while they fold the flags into the
-	// status register, to keep the bus ISRs' fast paths out.  enter() returns
-	// what leave() needs to put things back.  The firmware sets it once to
-	// mask the DMA interrupts; unset, as on the host, nothing is held.
-	struct isr_exclusion {
-		uint32_t (*enter)();
-		void (*leave)(uint32_t);
+	// How sync_status() stores the status register.  open() returns the
+	// register's current value and starts an exclusive access; commit() stores
+	// a new value and returns false if anything intervened since open(), and
+	// abandon() ends an access with nothing to store.  native_store uses
+	// LDREXB, STREXB and CLREX on the device, where exception entry cancels
+	// the access, and plain reads and stores that never fail on the host.
+	// store is what sync_status() uses; a test may replace it.
+	struct status_store {
+		uint8_t (*open)(volatile uint8_t *status);
+		bool (*commit)(volatile uint8_t *status, uint8_t value);
+		void (*abandon)();
 	};
-	static inline isr_exclusion exclusion = { nullptr, nullptr };
+	static const status_store native_store;
+	static status_store store;
 private:
 	const uint16_t ctl_offset;	// control (write) / status (read) register offset
 	const uint16_t data_offset;	// TX data (write) / RX data (read) register offset
@@ -97,7 +102,6 @@ private:
 	SpscQueue rx;
 	registers &reg;
 	const mc6850_status reset_status = { .tdre = 1 };
-	uint8_t cached_status_byte = 0;
 	interrupt cached_irq_result = INTERRUPT_NONE;
 	bool transmit_buffer_empty = true;
 	bool receive_buffer_full = false;
@@ -112,6 +116,7 @@ private:
 	volatile bool tx_write_pending = false;	// set by write ISR, cleared by guest_transmit()
 	volatile bool irq_dirty = true;		// set by any state change, cleared by has_interrupt()
 	volatile bool host_cts_deasserted = false;  // set by Core 0 when USB host can't accept data
+	[[nodiscard]] uint8_t status_byte() const;
 	void sync_status();
 	void sync_transmit();
 public:
