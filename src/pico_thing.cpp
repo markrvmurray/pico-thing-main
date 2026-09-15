@@ -462,16 +462,14 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
 		q_falling_edge = true;
 		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
-		// RTI detection is now handled by the rti_detect PIO program
-		// which samples D[7:0] at E-fall (when data bus is valid for
-		// both register-space and RAM reads).
-		// BUSY/LIC/AVMA are captured at Q-rising (the latest valid point for the current
-		// cycle). By Q-falling the 6809 has already updated them for the next cycle, so
-		// we do NOT capture them here.
+		// BUSY/LIC/AVMA are captured at Q-rising, the latest point that still
+		// describes this cycle; by Q-falling the 6809 has moved them on to the
+		// next, so they are not read here.  RTI detection belongs to the
+		// rti_detect PIO program, which samples D[7:0] at E-fall, and the bus
+		// trace is captured by PIO and DMA, so neither costs this handler
+		// anything.
 
-		// The fault sampler needs the high GPIO bank.  The bus trace no longer
-		// reads anything here — two PIO state machines capture it straight into
-		// memory via DMA, so tracing now costs the ISR nothing at all.
+		// The fault sampler needs the high GPIO bank.
 		high_bus_pins high_pins{};
 		high_pins.word = sio_hw->gpio_hi_in;
 
@@ -489,7 +487,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// describe the same cycle.
 		//
 		// The fault pin, the task pins, A13-A15 and the NMIBlock readback all
-		// share the high input register, and it was read above for the trace.
+		// share the high input register, read once above.
 		// First fault wins.  Latching also asserts NMIBlock, which masks the
 		// NMI for every subsequent fault, so a storm cannot overwrite the
 		// record of the one that started it.  The NMI for THIS fault has
@@ -580,7 +578,6 @@ __time_critical_func(dma_bus_read_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
-	//if (dma_channel_get_irq0_status(piodma_read.data_channel)) {
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
 	if (MC6809.run_state >= RS_RUNNING && MC6809.get_vma()) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
@@ -620,7 +617,6 @@ __time_critical_func(dma_bus_read_irq_handler())
 			read_irq_received = true;
 		}
 	}
-	//}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, false); // scope timing
 #endif
@@ -656,7 +652,6 @@ __time_critical_func(dma_bus_write_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_D, true); // scope timing
 #endif
-	// if (dma_channel_get_irq1_status(piodma_write.data_channel)) {
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
 	if (MC6809.run_state >= RS_RUNNING) {
 		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
@@ -736,7 +731,6 @@ __time_critical_func(dma_bus_write_irq_handler())
 		write_ring[h].value = wval;
 		write_ring_head = next_h;
 	}
-	// }
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_D, false); // scope timing
 #endif
@@ -4356,7 +4350,6 @@ __no_inline_not_in_flash_func(main_core1)()
 
 			uint32_t interrupt_refcount[NUM_INTERRUPTS] = {};
 			interrupt eirq;
-			// FOR_EACH interrupt_source:
 			eirq = console_has_interrupt();
 			interrupt_refcount[eirq]++;
 			eirq = system_tick.has_interrupt();
@@ -4374,12 +4367,10 @@ __no_inline_not_in_flash_func(main_core1)()
 				(interrupt_refcount[INTERRUPT_NMI]  > 0u ? PEND_NMI  : 0u) |
 				(interrupt_refcount[INTERRUPT_FIRQ] > 0u ? PEND_FIRQ : 0u) |
 				(interrupt_refcount[INTERRUPT_IRQ]  > 0u ? PEND_IRQ  : 0u);
-			// END FOR_EACH
 		}
 
 		while (write_ring_tail != write_ring_head) {
 			core1_write_ring_count++;
-			//gpio_put(GPIO_TRACE_CORE1, true);
 			const uint8_t t = write_ring_tail;
 			const uint8_t written_location = write_ring[t].location;
 			const uint8_t written_byte = write_ring[t].value;
@@ -4484,59 +4475,10 @@ __no_inline_not_in_flash_func(main_core1)()
 				aux_serial.guest_transmit(written_byte);
 				break;
 
-			// Tick timer writes are handled directly in the DMA write ISR.
-
-			// Everything else is RAM. See the write ISR
-			case REGISTER_BUFFER_OFFSET + 0x00:
-			case REGISTER_BUFFER_OFFSET + 0x01:
-			case REGISTER_BUFFER_OFFSET + 0x02:
-			case REGISTER_BUFFER_OFFSET + 0x03:
-			case REGISTER_BUFFER_OFFSET + 0x04:
-			case REGISTER_BUFFER_OFFSET + 0x05:
-			case REGISTER_BUFFER_OFFSET + 0x06:
-			case REGISTER_BUFFER_OFFSET + 0x07:
-			case REGISTER_BUFFER_OFFSET + 0x08:
-			case REGISTER_BUFFER_OFFSET + 0x09:
-			case REGISTER_BUFFER_OFFSET + 0x0A:
-			case REGISTER_BUFFER_OFFSET + 0x0B:
-			case REGISTER_BUFFER_OFFSET + 0x0C:
-			case REGISTER_BUFFER_OFFSET + 0x0D:
-			case REGISTER_BUFFER_OFFSET + 0x0E:
-			case REGISTER_BUFFER_OFFSET + 0x0F:
-			case REGISTER_SNIPPET_OFFSET + 0x00:
-			case REGISTER_SNIPPET_OFFSET + 0x01:
-			case REGISTER_SNIPPET_OFFSET + 0x02:
-			case REGISTER_SNIPPET_OFFSET + 0x03:
-			case REGISTER_SNIPPET_OFFSET + 0x04:
-			case REGISTER_SNIPPET_OFFSET + 0x05:
-			case REGISTER_SNIPPET_OFFSET + 0x06:
-			case REGISTER_SNIPPET_OFFSET + 0x07:
-			case REGISTER_SNIPPET_OFFSET + 0x08:
-			case REGISTER_SNIPPET_OFFSET + 0x09:
-			case REGISTER_SNIPPET_OFFSET + 0x0A:
-			case REGISTER_SNIPPET_OFFSET + 0x0B:
-			case REGISTER_SNIPPET_OFFSET + 0x0C:
-			case REGISTER_SNIPPET_OFFSET + 0x0D:
-			case REGISTER_SNIPPET_OFFSET + 0x0E:
-			case REGISTER_SNIPPET_OFFSET + 0x0F:
-			case REGISTER_VECTORS_OFFSET + 0x01:
-			case REGISTER_VECTORS_OFFSET + 0x02:
-			case REGISTER_VECTORS_OFFSET + 0x03:
-			case REGISTER_VECTORS_OFFSET + 0x04:
-			case REGISTER_VECTORS_OFFSET + 0x05:
-			case REGISTER_VECTORS_OFFSET + 0x06:
-			case REGISTER_VECTORS_OFFSET + 0x07:
-			case REGISTER_VECTORS_OFFSET + 0x08:
-			case REGISTER_VECTORS_OFFSET + 0x09:
-			case REGISTER_VECTORS_OFFSET + 0x0A:
-			case REGISTER_VECTORS_OFFSET + 0x0B:
-			case REGISTER_VECTORS_OFFSET + 0x0C:
-			case REGISTER_VECTORS_OFFSET + 0x0D:
-			case REGISTER_VECTORS_OFFSET + 0x0E:
-			case REGISTER_VECTORS_OFFSET + 0x0F:
-				break;
+			// Tick timer writes are handled directly in the DMA write ISR, and
+			// SHARED, the snippet area and the vectors are plain storage that
+			// needs nothing here, so they take the default.
 			}
-			//gpio_put(GPIO_TRACE_CORE1, false);
 		} // while (write_ring not empty)
 
 		// Drain the CONSOLE_RX_DATA counter before checking the shared slot.
@@ -4558,7 +4500,6 @@ __no_inline_not_in_flash_func(main_core1)()
 
 		if (read_irq_received) {
 			core1_read_irq_count++;
-			//gpio_put(GPIO_TRACE_CORE1, true);
 			read_irq_received = false;
 			core1_last_read_loc = read_location;
 			switch (read_location) {
@@ -4599,7 +4540,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			// Tick timer status read is handled directly in the DMA read ISR.
 
 			}
-			//gpio_put(GPIO_TRACE_CORE1, false);
 		} // if (read_irq_received)
 	} // for(;;)
 }
