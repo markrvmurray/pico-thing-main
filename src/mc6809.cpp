@@ -23,6 +23,12 @@
 #include "mc6850.h"
 #include "uart_pump.h"
 
+// Set from CMake with -DPICO_THING_RTI_TASK_RESTORE=1 to have the Pico put the
+// interrupted task back after an RTI.  Off by default: see apply_rti().
+#ifndef PICO_THING_RTI_TASK_RESTORE
+#define PICO_THING_RTI_TASK_RESTORE 0
+#endif
+
 const char *bus_state_string[] = {
 	foreach_busstate(enum_list_strings)
 };
@@ -304,10 +310,18 @@ mc6809::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
 		DEASSERT_IRQ;
 }
 
-// The PIO RTI detector has spotted an RTI opcode fetch.
-// The RTI hasn't executed yet — set up a countdown to defer the
-// task restore until the RTI instruction completes (15 E-cycles
-// for a full frame, 6 for FIRQ; we use 15 to be safe for both).
+// The PIO RTI detector has spotted an RTI opcode fetch.  The RTI has not
+// executed yet, so the interrupt is unwound here - nesting depth and task
+// stack - but any task restore has to wait out the instruction: 15 E cycles
+// for a full frame, 6 for FIRQ, so 15 covers both.
+//
+// With PICO_THING_RTI_TASK_RESTORE off, which is the default, no restore is
+// armed and the task register stays where the handler left it.  Putting the
+// interrupted task back suits an interrupt that resumes what it interrupted,
+// but not a handler that does not: a DAT fault cannot be retried, so its
+// handler kills the faulting process, and an automatic restore would force the
+// dead task back under it about 15 E cycles after its RTI - too late to
+// pre-empt by writing the task register first, and racing it afterwards.
 void
 mc6809::apply_rti()
 {
@@ -317,8 +331,14 @@ mc6809::apply_rti()
 	if (nesting_depth > 0u) {
 		nesting_depth--;
 		if (task_stack_ptr > 0u) {
-			rti_pending_task = task_stack[task_stack_ptr.fetch_sub(1u, std::memory_order_relaxed) - 1u];
+			const uint8_t interrupted_task =
+				task_stack[task_stack_ptr.fetch_sub(1u, std::memory_order_relaxed) - 1u];
+#if PICO_THING_RTI_TASK_RESTORE
+			rti_pending_task = interrupted_task;
 			rti_task_countdown = 15u;
+#else
+			(void) interrupted_task;	// the guest owns the task register
+#endif
 		}
 		if (nesting_depth == 0u && rti_task_countdown == 0u)
 			run_state = RS_RUNNING;
@@ -326,7 +346,9 @@ mc6809::apply_rti()
 }
 
 // Called once per Q-rising from the ISR. When the countdown expires,
-// restore the previous task and update task pins.
+// restore the previous task and update task pins.  With
+// PICO_THING_RTI_TASK_RESTORE off the countdown is never armed, so this is one
+// test and nothing else.
 void
 mc6809::tick_rti_countdown()
 {

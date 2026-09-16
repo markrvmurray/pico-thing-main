@@ -235,6 +235,17 @@ set(PICO_THING_DAT_FAULT_BLOCK_DELAY 32 CACHE STRING
 message(STATUS "Pico-Thing DAT fault auto-block ${PICO_THING_DAT_FAULT_AUTO_BLOCK}, "
 	"block delay ${PICO_THING_DAT_FAULT_BLOCK_DELAY} cycles")
 
+# Whether the Pico restores the interrupted task itself, about 15 E cycles after
+# it sees an RTI.  That is right for an interrupt which resumes what it
+# interrupted and wrong for one which does not: a DAT fault handler that kills
+# the faulting process finds the dead task forced back under it a moment after
+# its RTI.  Off by default, so the task register belongs to the guest.  The task
+# stack and the nesting depth are maintained either way, and the DAT fault's own
+# switch to task 0 at the NMI vector fetch is separate and always happens.
+set(PICO_THING_RTI_TASK_RESTORE 0 CACHE STRING
+	"Restore the interrupted task ~15 E cycles after an RTI (0 = the guest owns the task register)")
+message(STATUS "Pico-Thing RTI task restore ${PICO_THING_RTI_TASK_RESTORE}")
+
 # The ADC calibration - reference voltage, divider ratio and converter zero
 # error - is deliberately not settable here.  Those three are measurements of
 # one physical board, not choices about how to build it, and as cache
@@ -252,6 +263,7 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_POWER_RAIL_SETTLE_MS=${PICO_THING_POWER_RAIL_SETTLE_MS}u
 	PICO_THING_DAT_FAULT_AUTO_BLOCK=${PICO_THING_DAT_FAULT_AUTO_BLOCK}
 	PICO_THING_DAT_FAULT_BLOCK_DELAY=${PICO_THING_DAT_FAULT_BLOCK_DELAY}u
+	PICO_THING_RTI_TASK_RESTORE=${PICO_THING_RTI_TASK_RESTORE}
 )
 
 target_link_libraries(pico-thing

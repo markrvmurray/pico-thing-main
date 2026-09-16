@@ -685,6 +685,10 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		task_pins_update(new_task);
 	}
 	else if (wloc == SYSTEM_RTI_SIGNAL)
+		// For a guest that signals its own RTIs instead of being watched; see
+		// pico_thing.h.  The rti_detect PIO program catches every RTI opcode
+		// fetch by itself, so a guest that does both has each RTI counted
+		// twice.  Nothing in this tree writes it.
 		MC6809.apply_rti();
 	// CONSOLE_CONTROL / AUX_CONTROL: full guest_control() is deferred
 	// to the write_ring so mode changes are sequenced after pending TX
@@ -4594,15 +4598,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			default:
 				// The MC6809 got whatever byte was here. By default, do nothing else.
 				break;
-			case REGISTER_SNIPPET_OFFSET + 0x0F:
-				// Last instruction in the snippet block.
-				// If it is RTI (0x3B), then we need to be switching things
-				// around in the task scheduling.
-				if (MC6809.get_lic())
-					if (reg[read_location] == static_cast<uint8_t>(0x3B))
-						MC6809.apply_rti();
-				break;
-
 			case SYSTEM_TASK:
 				// Will be set by writing to this address
 				break;

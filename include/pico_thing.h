@@ -209,7 +209,15 @@ union high_bus_pins {
 
 // System registers relative to REGISTER_DEVICES
 #define SYSTEM_TASK		uint16_t(0x00u)
-#define SYSTEM_RTI_SIGNAL	uint16_t(0x01u) // Write-only: guest signals RTI
+// Write-only: a guest tells the Pico it is executing an RTI, so the task stack
+// can be unwound and the interrupted task restored.  This is an ALTERNATIVE to
+// the rti_detect PIO program, which spots every RTI opcode fetch on the bus
+// unaided - never both.  Two sources count one RTI twice: harmless while a
+// single interrupt is outstanding, since the unwind is skipped once the nesting
+// depth reaches zero, but with interrupts nested two deep it pops the task
+// stack twice and restores the wrong task.  Nothing in this tree writes it; the
+// detector does the work, including inside snippets.
+#define SYSTEM_RTI_SIGNAL	uint16_t(0x01u)
 
 #define SYSTEM_REQUEST		uint16_t(0x02u) // Write-only
 #define SYSTEM_REQUEST_STATUS	uint16_t(0x02u) // Read-only
