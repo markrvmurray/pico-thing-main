@@ -2253,6 +2253,17 @@ status_gather(status_snapshot_t *s)
 	const uint32_t package_sel = *static_cast<io_ro_32 *>(reinterpret_cast<void *>(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET));
 	s->qfn60 = (package_sel & SYSINFO_PACKAGE_SEL_BITS) != 0u;
 
+	// Measured with the frequency counter rather than asked of the SDK:
+	// clock_get_hz() returns what the SDK believes, which is exactly what is
+	// wrong when something has moved a PLL under it.  Taken here, in the
+	// status snapshot, rather than at boot, so it always reports the tree
+	// actually running - a boot-time print cannot survive someone adding a
+	// clock change after it.  About a millisecond each.
+	s->clk_sys_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS);
+	s->clk_peri_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_PERI);
+	s->clk_usb_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_USB);
+	s->clk_adc_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_ADC);
+
 	s->reset = RESET_IS_ASSERTED;
 	s->halt = HALT_IS_ASSERTED;
 	s->nmi = NMI_IS_ASSERTED;
@@ -2390,6 +2401,12 @@ status_print(const status_snapshot_t *s)
 	} else
 		printf("PICO CHIP: RP2350%c, unknown bootrom %u (CHIP_ID revision %X)\n",
 		       part, s->rom_version, s->chip_revision);
+	// clk_adc is the one with a silent failure: away from 48 MHz the sample
+	// capacitor does not finish charging and every conversion reads low, with
+	// nothing to say so.  clk_peri carries the console's baud rate.
+	printf("CLOCKS: sys %" PRIu32 "  peri %" PRIu32 "  usb %" PRIu32 "  adc %" PRIu32 " kHz%s\n",
+	       s->clk_sys_khz, s->clk_peri_khz, s->clk_usb_khz, s->clk_adc_khz,
+	       s->clk_adc_khz == 48000u ? "" : "   <- adc is not 48000!");
 	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
 	       s->nmi ? "OUTPUT LOW" : "hi-z",
 	       s->firq ? "OUTPUT LOW" : "hi-z",
@@ -2521,6 +2538,9 @@ status_json(const status_snapshot_t *s)
 		printf(R"json(,"chip_stepping":null)json");
 	printf(R"json(,"chip_revision":%u,"rom_version":%u,"chip_package":"%s")json",
 	       s->chip_revision, s->rom_version, s->qfn60 ? "QFN-60" : "QFN-80");
+	printf(R"(,"clk_sys_khz":%)" PRIu32 R"(,"clk_peri_khz":%)" PRIu32
+	       R"(,"clk_usb_khz":%)" PRIu32 R"(,"clk_adc_khz":%)" PRIu32,
+	       s->clk_sys_khz, s->clk_peri_khz, s->clk_usb_khz, s->clk_adc_khz);
 #ifdef DEBUG
 	printf(",\"lic_count\":%" PRIu32 ",\"rti_count\":%" PRIu32 ",\"lic_stalled\":%s",
 	       s->lic_count, s->rti_count, s->lic_stalled ? "true" : "false");
@@ -4902,35 +4922,6 @@ bus_pio_dma_init()
 	       TRACE_LO_DMA, TRACE_HI_DMA);
 }
 
-#define MEASURE_FREQS
-#ifdef MEASURE_FREQS
-static void
-measure_freqs()
-{
-	uint32_t f_pll_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_SYS_CLKSRC_PRIMARY)/1000;
-	uint32_t f_pll_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY)/1000;
-	uint32_t f_rosc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_ROSC_CLKSRC);
-	uint32_t f_clk_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS)/1000;
-	uint32_t f_clk_peri = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_PERI)/1000;
-	uint32_t f_clk_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_USB)/1000;
-	uint32_t f_clk_adc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_ADC)/1000;
-#ifdef CLOCKS_FC0_SRC_VALUE_CLK_RTC
-	uint32_t f_clk_rtc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_RTC);
-#endif
-	printf("pll_sys  = %d MHz\n", f_pll_sys);
-	printf("pll_usb  = %d MHz\n", f_pll_usb);
-	printf("rosc     = %d kHz\n", f_rosc);
-	printf("clk_sys  = %d MHz\n", f_clk_sys);
-	printf("clk_peri = %d MHz\n", f_clk_peri);
-	printf("clk_usb  = %d MHz\n", f_clk_usb);
-	printf("clk_adc  = %d MHz\n", f_clk_adc);
-#ifdef CLOCKS_FC0_SRC_VALUE_CLK_RTC
-	printf("clk_rtc  = %d kHz\n", f_clk_rtc);
-#endif
-// Can't measure clk_ref/xosc as it is the ref
-}
-#endif
-
 static void
 pio_shutdown()
 {
@@ -5143,7 +5134,11 @@ reset_power()
 int
 main()
 {
-	vreg_set_voltage(VREG_VOLTAGE_2_00);
+	// VREG_VOLTAGE_MAX is 1.30V, and the regulator's own limit holds anything
+	// above it there unless vreg_disable_voltage_limit() lifts it - which is
+	// deliberately not called.  Asking for more than this only made the line
+	// read as something it was not: 320 MHz has been reliable at 1.30V.
+	vreg_set_voltage(VREG_VOLTAGE_1_30);
 	sleep_ms(5);
 
 	gpio_set_function(GPIO_UART_TX, UART_FUNCSEL_NUM(uart0, GPIO_UART_TX));
@@ -5162,9 +5157,6 @@ main()
 	printf("Core0 build with DEBUG defined\n");
 #endif
 
-#ifdef MEASURE_FREQS
-	measure_freqs();
-#endif
 	printf("Core0 raising sys_clock to %d MHz ... ", SYS_CLK_DEFAULT/1000000);
 	if (!set_sys_clock_hz(SYS_CLK_DEFAULT, false)) {
 		printf("unsuccessful! Reverting to %d MHz ... ", SYS_CLK_HZ/1000000);

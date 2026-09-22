@@ -48,6 +48,9 @@ struct status_snapshot_t {
 	uint8_t rom_version;             // bootrom version byte: 2 A2, 3 A3, 4 A4
 	bool    qfn60;                   // PACKAGE_SEL: RP2350A (QFN-60), else RP2350B (QFN-80)
 
+	// Clock tree as measured, in kHz
+	uint32_t clk_sys_khz, clk_peri_khz, clk_usb_khz, clk_adc_khz;
+
 #ifdef DEBUG
 	uint32_t lic_count;
 	uint32_t rti_count;
