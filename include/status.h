@@ -19,6 +19,11 @@ struct acia_status_t {
 	uint8_t  interrupt_status;
 	uint16_t tx_level;
 	uint16_t rx_level;
+	// This ACIA's CDC port, as the pump sees it.  dtr: the host has the port
+	// open.  host_rts: the host says it can take data.  honour_host_rts:
+	// whether this port believes that.  held: output is waiting because it
+	// cannot be written yet - the guest is stalled behind CTS.
+	bool     dtr, host_rts, honour_host_rts, held;
 #ifdef DEBUG
 	unsigned control_count;
 	unsigned tx_data_count;

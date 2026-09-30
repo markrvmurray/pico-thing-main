@@ -1121,6 +1121,59 @@ TEST_CASE("srecord command", "[parser][srecord]")
 }
 
 // ============================================================
+//  flow
+// ============================================================
+
+TEST_CASE("flow command", "[parser][flow]")
+{
+	parsed_cmd_t cmd;
+
+	SECTION("flow (no arguments) -> CMD_FLOW")
+	{
+		REQUIRE(parse("flow", &cmd));
+		CHECK(cmd.tag == CMD_FLOW);
+	}
+	SECTION("fl (mnemonic) -> CMD_FLOW")
+	{
+		REQUIRE(parse("fl", &cmd));
+		CHECK(cmd.tag == CMD_FLOW);
+	}
+	SECTION("flow 1 on -> honour the console port's host RTS")
+	{
+		REQUIRE(parse("flow 1 on", &cmd));
+		CHECK(cmd.tag == CMD_FLOW_RTS);
+		CHECK(cmd.flow.port == 1u);
+		CHECK(cmd.flow.honour_host_rts);
+	}
+	SECTION("flow 2 off -> ignore the aux port's host RTS")
+	{
+		REQUIRE(parse("flow 2 off", &cmd));
+		CHECK(cmd.tag == CMD_FLOW_RTS);
+		CHECK(cmd.flow.port == 2u);
+		CHECK_FALSE(cmd.flow.honour_host_rts);
+	}
+	SECTION("case is not significant")
+	{
+		REQUIRE(parse("FLOW 2 OFF", &cmd));
+		CHECK(cmd.tag == CMD_FLOW_RTS);
+		CHECK(cmd.flow.port == 2u);
+		CHECK_FALSE(cmd.flow.honour_host_rts);
+	}
+	SECTION("port 0 is rejected")
+	{
+		CHECK_FALSE(parse("flow 0 on", &cmd));
+	}
+	SECTION("port 3 is rejected")
+	{
+		CHECK_FALSE(parse("flow 3 on", &cmd));
+	}
+	SECTION("a port with no on or off is rejected")
+	{
+		CHECK_FALSE(parse("flow 1", &cmd));
+	}
+}
+
+// ============================================================
 //  break
 // ============================================================
 

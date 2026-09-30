@@ -162,6 +162,74 @@ TEST_CASE("pump: a host with RTS down holds the output and stalls the guest") {
 	CHECK(status().cts == 0);
 }
 
+TEST_CASE("pump: a port told to ignore RTS writes to a host that never raises it") {
+	registers::clear();
+	port = fake_port{};
+	port.rts = false;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_port_state st{};
+	st.honour_host_rts = false;
+
+	guest_send(uart, 'Y');
+	pump(uart, st);
+	(void)uart.has_interrupt();
+
+	// This is the DriveWire server that does no flow control of its own: with
+	// RTS honoured the byte would sit here for ever and the guest would stall.
+	CHECK(port.to_host == "Y");
+	CHECK(status().tdre == 1);
+	CHECK(status().cts == 0);
+}
+
+TEST_CASE("pump: ignoring RTS still loses nothing when the USB buffer is full") {
+	registers::clear();
+	port = fake_port{};
+	port.rts = false;
+	port.write_room = 1u;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_port_state st{};
+	st.honour_host_rts = false;
+
+	guest_send(uart, 'a');
+	guest_send(uart, 'b');
+	pump(uart, st);
+	(void)uart.has_interrupt();
+
+	// Ignoring RTS removes one brake, not the other: the FIFO takes what it
+	// can and CTS stalls the guest for the rest, so 'b' is held, not dropped.
+	CHECK(port.to_host == "a");
+	CHECK(status().tdre == 0);
+
+	port.write_room = 0xFFFFu;
+	pump(uart, st);
+	(void)uart.has_interrupt();
+
+	CHECK(port.to_host == "ab");
+	CHECK(status().tdre == 1);
+}
+
+TEST_CASE("pump: a port still honouring RTS is unaffected by the other's switch") {
+	registers::clear();
+	port = fake_port{};
+	port.rts = false;
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_port_state honouring{};
+	uart_port_state ignoring{};
+	ignoring.honour_host_rts = false;
+
+	// The switch lives in the per-port state, so one port's choice cannot
+	// leak into the other's.
+	CHECK(honouring.honour_host_rts);
+	CHECK_FALSE(ignoring.honour_host_rts);
+
+	guest_send(uart, 'Z');
+	pump(uart, honouring);
+	(void)uart.has_interrupt();
+
+	CHECK(port.to_host.empty());
+	CHECK(status().cts == 1);
+}
+
 TEST_CASE("pump: a full USB buffer holds the rest and stalls the guest until it drains") {
 	registers::clear();
 	port = fake_port{};

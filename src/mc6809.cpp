@@ -364,6 +364,12 @@ mc6809::tick_rti_countdown()
 
 static uart_port_state port_state[2];
 
+uart_port_state &
+uart_port_get(const uint8_t port)
+{
+	return port_state[port & 1u];
+}
+
 // The pump's view of the TinyUSB CDC ports.
 static constexpr cdc_port_io usb_ports = {
 	usb_cdc_connected_n, usb_cdc_host_rts_n, usb_cdc_read_n, usb_cdc_write_n
@@ -379,9 +385,21 @@ mc6809::uart_task(bool suppress_cdc_read)
 	// resets the ACIAs and empties their queues, so gating this on running lost
 	// everything a short run sent.
 	//
-	// Host to guest only while it runs.  CDC 0 is also the command console, so
-	// a guest in reset must not take what is typed at the prompt; any input
-	// already staged for it is dropped instead.
+	// Host to guest only while it runs, and anything already staged for a
+	// guest that is not running is DISCARDED - deliberately, on both ports.
+	//
+	// For CDC 0 that is obvious: it is also the command console, so a guest in
+	// reset must not take what was typed at the prompt.
+	//
+	// For CDC 1 it is a protocol decision rather than an obvious one, and it
+	// was taken explicitly (the user, 2026-10-01) rather than left to fall out
+	// of sharing this code with CDC 0.  A guest that has stopped has no live
+	// DriveWire transaction, so bytes the server sent meanwhile belong to a
+	// conversation that no longer exists; handing them to the guest when it
+	// restarts would prefix a fresh session with stale data and desynchronise
+	// it.  Losing them is the lesser fault, and the server retries.
+	//
+	// So this is not an oversight to be tidied up into "keep CDC 1's input".
 	const bool running = MC6809.run_state >= RS_RUNNING;
 	uart_port_pump(fast_serial, 0, port_state[0], suppress_cdc_read || !running, usb_ports);
 	uart_port_pump(aux_serial, 1, port_state[1], !running, usb_ports);

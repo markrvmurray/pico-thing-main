@@ -81,6 +81,9 @@ typedef enum cmd_tag {
 	CMD_BREAK_ADDR,
 	CMD_BREAK_RETURN,
 
+	CMD_FLOW,
+	CMD_FLOW_RTS,
+
 	CMD_SRECORD,
 
 	CMD_NITROS9,
@@ -183,6 +186,12 @@ typedef struct parsed_cmd {
 		struct {
 			uint16_t address;
 		} brk;
+
+		/* CMD_FLOW_RTS */
+		struct {
+			uint8_t port;		/* 1 = console, 2 = aux */
+			bool honour_host_rts;
+		} flow;
 
 		/* CMD_SRECORD */
 		struct {

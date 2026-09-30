@@ -35,6 +35,7 @@
 #include "registers.h"
 #include "pico_thing.h"
 #include "mc6809.h"
+#include "uart_pump.h"
 #include "srec.h"
 #include "mc6850.h"
 #include "tick_timer.h"
@@ -2306,6 +2307,38 @@ power_rail_monitor_start()
 		tight_loop_contents();
 }
 
+// The flow-control state of one ACIA's CDC port.  The UART console has no
+// flow control at all and needs none: it is a terminal, and a dropped
+// character costs a smudged display.  The CDC ports carry a guest's real
+// output and DriveWire's disk traffic, so the rule there is that either the
+// port is not in use, or nothing is lost.
+static void
+status_gather_flow(acia_status_t *a, const uint8_t port)
+{
+	const uart_port_state &st = uart_port_get(port);
+
+	a->dtr = usb_cdc_connected_n(port);
+	a->host_rts = usb_cdc_host_rts_n(port);
+	a->honour_host_rts = st.honour_host_rts;
+	a->held = st.tx_count > 0u && st.tx_index < st.tx_count;
+}
+
+static void
+status_print_flow(const char *name, const acia_status_t *a)
+{
+	printf("    %-7s port: %s", name, a->dtr ? "open" : "CLOSED - output discarded");
+	if (a->dtr) {
+		printf(", host RTS %s", a->host_rts ? "high" : "LOW");
+		if (!a->honour_host_rts)
+			printf(" (ignored)");
+		else if (!a->host_rts)
+			printf(" - output held, guest stalled");
+		if (a->held)
+			printf(", bytes waiting");
+	}
+	printf("\n");
+}
+
 void
 status_gather(status_snapshot_t *s)
 {
@@ -2398,6 +2431,7 @@ status_gather(status_snapshot_t *s)
 	s->console_acia.interrupt_status = fast_serial.interrupt_status();
 	s->console_acia.tx_level = fast_serial.receive_level();
 	s->console_acia.rx_level = fast_serial.transmit_level();
+	status_gather_flow(&s->console_acia, 0u);
 #ifdef DEBUG
 	s->console_acia.control_count = ACIA_CONTROL_COUNT;
 	s->console_acia.tx_data_count = ACIA_TX_DATA_COUNT;
@@ -2408,6 +2442,7 @@ status_gather(status_snapshot_t *s)
 	s->aux_acia.interrupt_status = aux_serial.interrupt_status();
 	s->aux_acia.tx_level = aux_serial.receive_level();
 	s->aux_acia.rx_level = aux_serial.transmit_level();
+	status_gather_flow(&s->aux_acia, 1u);
 #ifdef DEBUG
 	s->aux_acia.control_count = AUX_ACIA_CONTROL_COUNT;
 	s->aux_acia.tx_data_count = AUX_ACIA_TX_DATA_COUNT;
@@ -2557,19 +2592,23 @@ status_print(const status_snapshot_t *s)
 	       s->console_acia.tx_level, s->console_acia.rx_level,
 	       s->console_acia.control_count, s->console_acia.tx_data_count,
 	       s->console_acia.status_count, s->console_acia.rx_data_count);
+	status_print_flow("Console", &s->console_acia);
 	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
 	       s->aux_acia.interrupt_status,
 	       s->aux_acia.tx_level, s->aux_acia.rx_level,
 	       s->aux_acia.control_count, s->aux_acia.tx_data_count,
 	       s->aux_acia.status_count, s->aux_acia.rx_data_count);
+	status_print_flow("Aux", &s->aux_acia);
 #else
 	printf("ACIA:        IRQ  Tx Lvl  Rx Lvl\n");
 	printf("  Console     %02X  %6u  %6u\n",
 	       s->console_acia.interrupt_status,
 	       s->console_acia.tx_level, s->console_acia.rx_level);
+	status_print_flow("Console", &s->console_acia);
 	printf("  Aux         %02X  %6u  %6u\n",
 	       s->aux_acia.interrupt_status,
 	       s->aux_acia.tx_level, s->aux_acia.rx_level);
+	status_print_flow("Aux", &s->aux_acia);
 #endif
 }
 
@@ -2755,6 +2794,8 @@ process_command(char *buf)
 		"  rtc [y m d h m s]        show or set the DS12885 real-time clock\n"
 		"  rtc set                  set the Pico clock from the RTC\n"
 		"  usb [args]         (ub)  USB console control\n"
+		"  flow               (fl)  show both CDC ports' flow control\n"
+		"  flow <1|2> on|off        honour that port's host RTS, or ignore it\n"
 		"  nitros9 [ide|drivewire]  (ni)  boot NitrOS-9; drivewire is also dw\n"
 		"  help               (h)   this text\n"
 		"\nAn S-record pasted at the prompt is loaded directly.\n\n",
@@ -4158,6 +4199,26 @@ status_done:
 			usb_cdc_write_n(itf, buffer, strlen(reinterpret_cast<char *>(buffer)));
 		}
 		usb_cdc_flush_n(itf);
+		break;
+	}
+
+	case CMD_FLOW: {
+		acia_status_t console{}, aux{};
+		status_gather_flow(&console, 0u);
+		status_gather_flow(&aux, 1u);
+		printf("Flow control (the UART console has none and needs none):\n");
+		status_print_flow("Console", &console);
+		status_print_flow("Aux", &aux);
+		break;
+	}
+
+	case CMD_FLOW_RTS: {
+		const uint8_t port = static_cast<uint8_t>(cmd.flow.port - 1u);
+		uart_port_get(port).honour_host_rts = cmd.flow.honour_host_rts;
+		printf("Port %u: host RTS %s\n", cmd.flow.port,
+		       cmd.flow.honour_host_rts
+			       ? "honoured - output waits for a host that says it can take it"
+			       : "ignored - output is written whatever RTS says");
 		break;
 	}
 

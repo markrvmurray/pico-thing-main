@@ -53,8 +53,10 @@ uart_port_pump(mc6850 &serial, const uint8_t cdc_port, uart_port_state &st,
 		st.tx_index = 0u;
 	}
 	// A host that drops RTS cannot take more: hold the output, and let CTS
-	// stall the guest until RTS is raised again.
-	if (io.host_ready(cdc_port) && st.tx_index < st.tx_count) {
+	// stall the guest until RTS is raised again.  Unless this port has been
+	// told not to believe its RTS, in which case write regardless and let the
+	// CDC FIFO and CTS do the throttling - see uart_port_state.
+	if ((!st.honour_host_rts || io.host_ready(cdc_port)) && st.tx_index < st.tx_count) {
 		st.tx_index += io.write(cdc_port, st.tx_buf + st.tx_index,
 					static_cast<uint16_t>(st.tx_count - st.tx_index));
 		if (st.tx_index >= st.tx_count)

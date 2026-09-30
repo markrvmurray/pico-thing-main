@@ -32,6 +32,7 @@ all: $(ASSIST09_TARGETS) \
      get.s19 get.bin put.s19 put.bin loop.s19 loop.bin dl.s19 dl.bin dl.raw \
      test_echo.s19 test_echo.bin test_echo_fast.s19 test_echo_fast.bin \
      test_send.s19 test_send.bin \
+     flowtest.s19 flowtest.bin \
      acia_torture.s19 acia_torture.bin tick_torture.s19 tick_torture.bin \
      hello.srec hello.raw disk_test.srec disk_test.raw \
      disk_write_test.srec disk_write_test.raw \

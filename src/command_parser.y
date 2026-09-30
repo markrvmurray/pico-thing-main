@@ -158,6 +158,7 @@ static int _t_count;
 %token TOK_DRIVEWIRE
 %token TOK_ON
 %token TOK_OFF
+%token TOK_FLOW
 
 /* Loop access types */
 %token TOK_r
@@ -206,6 +207,7 @@ command:
 	| stop_cmd
 	| freq_cmd
 	| break_cmd
+	| flow_cmd
 	| usb_cmd
 	| srecord_cmd
 	| nitros9_cmd
@@ -800,6 +802,36 @@ freq_cmd:
 /* -----------------------------------------------------------------------
  * break [ <address> ]
  * ----------------------------------------------------------------------- */
+/*
+ * flow                 - report both CDC ports' flow control
+ * flow <port> on|off   - honour that port's host RTS, or ignore it
+ */
+flow_cmd:
+	  TOK_FLOW {
+		result->tag = CMD_FLOW;
+	}
+	| TOK_FLOW TOK_NUMBER TOK_ON {
+		uint32_t v = parse_hex($2);
+		if (v != 1u && v != 2u) {
+			printf("Invalid port '%s' (valid: 1, 2)\n", $2);
+			YYERROR;
+		}
+		result->tag       = CMD_FLOW_RTS;
+		result->flow.port = (uint8_t)v;
+		result->flow.honour_host_rts = true;
+	}
+	| TOK_FLOW TOK_NUMBER TOK_OFF {
+		uint32_t v = parse_hex($2);
+		if (v != 1u && v != 2u) {
+			printf("Invalid port '%s' (valid: 1, 2)\n", $2);
+			YYERROR;
+		}
+		result->tag       = CMD_FLOW_RTS;
+		result->flow.port = (uint8_t)v;
+		result->flow.honour_host_rts = false;
+	}
+	;
+
 break_cmd:
 	  TOK_BREAK {
 		result->tag = CMD_BREAK;
