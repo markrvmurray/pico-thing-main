@@ -714,6 +714,28 @@ static uint32_t write_ring_overflow = 0u;
 // producer has to be the write ISR: Core 1 takes these off with its interrupts
 // disabled and runs each through bus_write_followup(), so the two never
 // interleave.  Long enough for the largest modify, 255 bytes.
+// A guest write to SYSTEM_TASK that no OS should be making: from a non-zero
+// task, to a DIFFERENT non-zero task - a user process moving itself into
+// someone else's mapping.  This counts rather than blocks, deliberately.
+//
+// The obvious rule, "only task 0 may write $FFC0", is wrong for this platform.
+// The NitrOS-9 Level 2 kernel runs in the fixed $E000-$FDFF window that is
+// mapped into every task, so it writes $FFC0 with the INTERRUPTED task still
+// in force on every IRQ, FIRQ and NMI entry, and twice on every system call
+// from user state (krn.asm KrnFasterClrXxxx, MapT0, SWICall).  A task-0 guard
+// would reject all of those and break the boot.  Nor can a bad write be
+// refused once identified: no kernel site reads $FFC0 back to check it took,
+// so a dropped entry write leaves the handler running with the user's block 0
+// as its direct page, and a dropped return write resumes the user in task 0's
+// map - the "guest runs wild" failure of the 2026-09-16 bring-up.
+//
+// What every legitimate write has in common is its value: 0, or the task
+// already in force.  Anything else is the guest doing something no kernel path
+// does, so it is worth seeing - `st` reports the count and the last one.
+static volatile uint32_t task_write_odd_count = 0u;
+static volatile uint8_t task_write_odd_from = 0u;
+static volatile uint8_t task_write_odd_to = 0u;
+
 static constexpr uint32_t CONSOLE_WRITE_QUEUE_LEN = 256u;
 static queue_t console_write_queue;
 static volatile uint32_t console_writes_done = 0u;	// counted by Core 1
@@ -729,7 +751,13 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 	// Special-case any writes that need to be handled before the next guest
 	// instruction picks up an incorrect read. I.e., these need to be _fast_.
 	if (wloc == SYSTEM_TASK) {
+		const uint8_t old_task = MC6809.task_get();
 		const uint8_t new_task = MC6809.task_change(wval);
+		if (old_task != 0u && new_task != 0u && new_task != old_task) {
+			task_write_odd_count++;
+			task_write_odd_from = old_task;
+			task_write_odd_to = new_task;
+		}
 		reg[SYSTEM_TASK] = new_task;
 		task_pins_update(new_task);
 	}
@@ -2285,6 +2313,9 @@ status_gather(status_snapshot_t *s)
 	s->bus_state = MC6809.get_bus_state();
 	s->old_bus_state = MC6809.get_old_bus_state();
 	s->task = MC6809.get_task();
+	s->task_write_odd_count = task_write_odd_count;
+	s->task_write_odd_from = task_write_odd_from;
+	s->task_write_odd_to = task_write_odd_to;
 	s->nesting_depth = MC6809.get_nesting_depth();
 	s->task_stack_ptr = MC6809.get_task_stack_ptr();
 	for (uint16_t i = 0; i < s->task_stack_ptr && i < STATUS_MAX_INT_NEST_DEPTH; i++)
@@ -2479,6 +2510,10 @@ status_print(const status_snapshot_t *s)
 	else
 		for (uint16_t i = 0; i < s->task_stack_ptr; i++)
 			printf(" %u", s->task_history[i]);
+	printf("  Odd task writes: %" PRIu32, s->task_write_odd_count);
+	if (s->task_write_odd_count > 0u)
+		printf("   <- last was task %u -> %u!",
+		       s->task_write_odd_from, s->task_write_odd_to);
 	printf("\n");
 
 	// 3. LIC / RTI (DEBUG only)
@@ -2568,6 +2603,8 @@ status_json(const status_snapshot_t *s)
 	       run_state_string[s->run_state], bus_state_string[s->bus_state],
 	       bus_state_string[s->old_bus_state]);
 	printf(R"json(,"task":%u,"nesting_depth":%u,"task_stack_ptr":%u)json", s->task, s->nesting_depth, s->task_stack_ptr);
+	printf(R"json(,"task_write_odd":{"count":%)json" PRIu32 R"json(,"from":%u,"to":%u})json",
+	       s->task_write_odd_count, s->task_write_odd_from, s->task_write_odd_to);
 	printf(R"json(,"task_history":[)json");
 	for (uint16_t i = 0; i < s->task_stack_ptr; i++) {
 		if (i > 0) printf(",");
@@ -4568,8 +4605,12 @@ __no_inline_not_in_flash_func(main_core1)()
 				break;
 
 			case SYSTEM_TASK: // Task reg for DAT/MMU
-				// TODO: MarkM - Don't allow tasks other than zero to do this!
-				// Handled in DMA write ISR via PIO task_output
+				// Nothing to do here, and nothing could be: the write is
+				// applied in bus_write_followup() because the mapping has
+				// to change before the guest's next instruction, so by the
+				// time this ring entry is drained it has been live for many
+				// cycles.  The write is vetted there - see
+				// task_write_odd_count.
 				break;
 
 			case SYSTEM_REQUEST:

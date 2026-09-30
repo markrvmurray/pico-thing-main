@@ -38,6 +38,10 @@ struct status_snapshot_t {
 	uint8_t         nesting_depth;
 	uint16_t        task_stack_ptr;
 	uint8_t         task_history[STATUS_MAX_INT_NEST_DEPTH];
+	// Guest writes to the task register that no kernel path makes: from a
+	// non-zero task, to a different non-zero task.  Expected to stay 0.
+	uint32_t        task_write_odd_count;
+	uint8_t         task_write_odd_from, task_write_odd_to;
 
 	// GPIO pins
 	bool power, reset, halt, nmi, firq, irq;
