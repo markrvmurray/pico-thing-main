@@ -138,9 +138,49 @@ static volatile bool watchpoint_nmi_pending = false;
 // clears the PC slot as it raises the NMI, leaving only BREAK's copy to fill it.
 static volatile bool watchpoint_fired = false;
 
+// Set by the Q-rising EQ handler on an NMI vector fetch - the bus event BS_IRQ
+// reports, and the point by which the 6809 has stacked its whole register
+// frame.  CMD_BREAK clears it before raising the NMI and waits on it after, so
+// "the break has been taken" comes from the bus rather than from a guess about
+// what SHARED holds.
+static volatile bool break_vector_fetched = false;
+
+// The register frame a full-frame interrupt stacks and the BREAK snippet copies
+// into SHARED: CC, A, B, DP, X, Y, U, PC.
+static constexpr uint16_t BREAK_FRAME_LEN = 12u;
+// The E (entire) flag in a stacked CC.  NMI, IRQ and SWI all set it before
+// pushing, so it marks a frame that has actually arrived.
+static constexpr uint8_t CC_ENTIRE = 0x80u;
+
+// Read the frame the BREAK snippet copies into SHARED, once it has landed and
+// stopped changing.  The snippet stores one byte per pass of its loop, CC first
+// and PC last, so a reader that does not wait for a settled copy can catch a PC
+// with only its high byte in.  Two readings a millisecond apart that agree,
+// with E set in the stacked CC, mean the copy is complete.
+//
+// E is the right sentinel and a non-zero PC is not: a guest that breaks at
+// $0000 - where a wild jump lands, and so exactly what one breaks to find -
+// has a legitimately zero PC and would never satisfy it.
+static bool
+break_frame_settled(uint8_t *frame, const uint32_t settle_ms)
+{
+	uint8_t previous[BREAK_FRAME_LEN];
+
+	registers::copy_out(previous, REGISTER_BUFFER_OFFSET, BREAK_FRAME_LEN);
+	for (uint32_t ms = 0u; ms < settle_ms; ms++) {
+		sleep_ms(1u);
+		registers::copy_out(frame, REGISTER_BUFFER_OFFSET, BREAK_FRAME_LEN);
+		if ((frame[0] & CC_ENTIRE) != 0u
+		    && memcmp(frame, previous, BREAK_FRAME_LEN) == 0)
+			return true;
+		memcpy(previous, frame, BREAK_FRAME_LEN);
+	}
+	return false;
+}
+
 // Take the watchpoint down and clear the evidence that it fired.  The BREAK
-// snippet leaves the stacked PC in SHARED[10:11], and anything that finds it
-// non-zero while the watchpoint is armed reads it as a fresh hit - so a report
+// snippet leaves the stacked frame in SHARED, and anything that finds E set in
+// its CC while the watchpoint is armed reads it as a fresh hit - so a report
 // that does not clear it gets made again by the next thing to look.  Restoring
 // the NMI vector matters too: while armed it points at BREAK rather than at
 // wherever the guest had it.
@@ -153,6 +193,7 @@ watchpoint_disarm()
 	}
 	watchpoint_nmi_pending = false;
 	watchpoint_fired = false;
+	reg[REGISTER_BUFFER_OFFSET] = static_cast<uint8_t>(0u);
 	reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
 	reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
 }
@@ -390,6 +431,13 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 					MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
 					MC6809.nesting_depth++;
 				}
+				// Both the break command and the watchpoint point the NMI
+				// vector at the BREAK snippet, and the vector fetch is the
+				// point at which the frame is on the stack and the copy is
+				// about to run.  This is the bus telling the console the
+				// break has been taken.
+				if (eirq == INTERRUPT_NMI)
+					break_vector_fetched = true;
 				// A DAT fault vectors through NMI, and its handler has to
 				// reach the DAT RAM to reclaim the dead process's pages —
 				// which the GAL only enables for task 0.  (The faulting
@@ -455,6 +503,7 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 			const uint8_t pend = pending_interrupts;
 			if ((pend & PEND_NMI) || watchpoint_nmi_pending) {
 				if (watchpoint_nmi_pending) {
+					reg[REGISTER_BUFFER_OFFSET] = static_cast<uint8_t>(0u);
 					reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
 					reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
 					watchpoint_fired = true;
@@ -2027,6 +2076,13 @@ static volatile interrupt console_interrupt = INTERRUPT_NONE;
 // Tracks which interrupt caused the current break (INTERRUPT_NONE = no active break).
 // Set by CMD_BREAK on success; cleared by CMD_BREAK_RETURN.
 static interrupt break_active = INTERRUPT_NONE;
+// The guest's own NMI vector, kept while a break points that vector at the
+// BREAK snippet.  Without it the command leaves the vector redirected for
+// good - on a timeout, and after "break return" - so the guest's next NMI
+// lands in a snippet that copies twelve bytes and spins instead of in its own
+// handler, and a DAT fault would go there too.  The watchpoint has always
+// saved and restored this across arm and disarm; break never did.
+static uint16_t break_saved_nmi_vector = 0u;
 
 static void
 console_set_interrupt(interrupt eirq)
@@ -3950,42 +4006,70 @@ status_done:
 		// NMI break: load the BREAK snippet into the snippet block,
 		// point the NMI vector there, and trigger NMI.  The 6809 pushes its
 		// full register set onto the stack and the snippet catches the 6809.
-		uint32_t timeout = 0u;
+		static constexpr uint32_t BREAK_VECTOR_MS = 1000u;
+		static constexpr uint32_t BREAK_SETTLE_MS = 50u;
 		snippet_copy(BREAK);
 		for (uint i = 0; i < 16; i++) {
 			reg[REGISTER_BUFFER_OFFSET + i] = static_cast<uint8_t>(0x00);
 			registers::write(REGISTER_BUFFER_OFFSET + i) = static_cast<uint8_t>(0x00);
 		}
+		break_saved_nmi_vector = static_cast<uint16_t>(reg[REGISTER_VECTOR_NMI_OFFSET]);
 		reg[REGISTER_VECTOR_NMI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET);
-		printf("NMI break -> %04X\n", REGISTER_SNIPPET);
+		printf("NMI break -> %04X (was %04X)\n", REGISTER_SNIPPET, break_saved_nmi_vector);
+		break_vector_fetched = false;
 		console_set_interrupt(INTERRUPT_NMI);
-		// Wait for the full 6809 register set to be stacked.
-		// TODO	: MarkM: this is exactly what I wanted BS_IRQ to help with.
-		while ((reg[REGISTER_BUFFER + 10] | reg[REGISTER_BUFFER + 11]) == static_cast<uint8_t>(0x00)) { sleep_us(1); if (++timeout > 1000000u) break; }
+		// Wait for the 6809 to take the NMI, then for the snippet's copy of
+		// the stacked frame to settle.  Both waits are on evidence that says
+		// what it means: the vector fetch the Q-rising observer reports as
+		// BUS_IRQ - the bus event this wanted BS_IRQ for all along - and then
+		// a frame that has arrived and stopped changing.
+		//
+		// Watching SHARED for the PC to go non-zero did both jobs badly.  It
+		// returned mid-copy, printing a PC with only its high byte in, since
+		// the snippet writes PC high before PC low and either byte satisfied
+		// it.  And it could not tell a frame not yet copied from one whose PC
+		// is legitimately $0000, so a break there reported "No NMI?" with the
+		// frame sitting correctly in the buffer.
+		uint32_t waited = 0u;
+		while (!break_vector_fetched && ++waited <= BREAK_VECTOR_MS)
+			sleep_ms(1u);
 		console_set_interrupt(INTERRUPT_NONE);
-		if (timeout > 1000000u)
-			printf("Timeout. No NMI?\n");
-		else {
-			break_active = INTERRUPT_NMI;
-			uint8_t cc = reg[REGISTER_BUFFER];
-			printf("CC: ");
-			for (uint i = 0; i < 8; i++) {
-				printf("%c", cc & 0x80 ? "EFHINZVC"[i] : '-');
-				cc <<= 1;
-			}
-			printf("\nA: %02X  B: %02X  DP: %02X\nX: %02X%02X  Y: %02X%02X\nU: %02X%02X  PC: %02X%02X\n",
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 1]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 2]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 3]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 4]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 5]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 6]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 7]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 8]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 9]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 10]),
-				static_cast<uint8_t>(reg[REGISTER_BUFFER + 11]));
+		if (!break_vector_fetched) {
+			// Put the guest's vector back.  A break that never happened
+			// must leave nothing behind: see break_saved_nmi_vector.
+			reg[REGISTER_VECTOR_NMI_OFFSET] = break_saved_nmi_vector;
+			// Say WHY it might not have arrived.  The 6809 does not
+			// recognise NMI after reset until the first program load
+			// of S, so a guest running something that never touches
+			// the stack pointer - LOOP_RW from the loop command, for
+			// one - can never be broken into, and the NMI sits on the
+			// pin ignored.  Without this note the message reads as a
+			// failure of the break machinery, which is a different
+			// thing entirely and wastes an afternoon.
+			printf("Timeout - no NMI was taken.  NMI vector restored "
+			       "to %04X\n", break_saved_nmi_vector);
+			printf("  the 6809 ignores NMI until the guest's first LDS "
+			       "after reset - has it loaded S?\n");
+			printf("  (the loop command's snippet never does, so break "
+			       "cannot interrupt it)\n");
+			break;
 		}
+		uint8_t frame[BREAK_FRAME_LEN];
+		const bool settled = break_frame_settled(frame, BREAK_SETTLE_MS);
+		break_active = INTERRUPT_NMI;
+		uint8_t cc = frame[0];
+		printf("CC: ");
+		for (uint i = 0; i < 8; i++) {
+			printf("%c", cc & 0x80 ? "EFHINZVC"[i] : '-');
+			cc <<= 1;
+		}
+		printf("\nA: %02X  B: %02X  DP: %02X\nX: %02X%02X  Y: %02X%02X\nU: %02X%02X  PC: %02X%02X\n",
+			frame[1], frame[2], frame[3],
+			frame[4], frame[5], frame[6], frame[7],
+			frame[8], frame[9], frame[10], frame[11]);
+		if (!settled)
+			printf("(registers still changing after %" PRIu32 "ms - may be incomplete)\n",
+			       BREAK_SETTLE_MS);
 		break;
 	}
 
@@ -4005,6 +4089,9 @@ status_done:
 			break_active == INTERRUPT_NMI ? "NMI" :
 			break_active == INTERRUPT_SWI ? "SWI" : "???");
 		reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
+		// The guest gets its own NMI vector back with its execution.
+		reg[REGISTER_VECTOR_NMI_OFFSET] = break_saved_nmi_vector;
+		printf("NMI vector restored to %04X\n", break_saved_nmi_vector);
 		break_active = INTERRUPT_NONE;
 		break;
 
@@ -4292,24 +4379,13 @@ poll_console()
 		}
 		mc6809::uart_task(idx > 0);
 
-		// Check for a watchpoint hit.  Once the NMI has been raised, the BREAK
-		// snippet copies the stacked registers into SHARED a byte at a time, CC
-		// first and PC last, then spins.  Report from a settled copy - the PC
-		// set, and two readings a millisecond apart that agree - or the PC can
-		// be caught with only its high byte copied.
+		// Check for a watchpoint hit.  Once the NMI has been raised the BREAK
+		// snippet copies the stacked registers into SHARED, so report from a
+		// settled copy rather than from whatever is there when we look.
 		if (watchpoint_armed && watchpoint_fired) {
 			static constexpr uint32_t WATCHPOINT_SETTLE_MS = 50u;
-			uint8_t frame[12];
-			uint8_t previous[sizeof frame];
-			registers::copy_out(previous, REGISTER_BUFFER_OFFSET, sizeof previous);
-			bool settled = false;
-			for (uint32_t ms = 0u; ms < WATCHPOINT_SETTLE_MS && !settled; ms++) {
-				sleep_ms(1u);
-				registers::copy_out(frame, REGISTER_BUFFER_OFFSET, sizeof frame);
-				settled = (frame[10] != 0u || frame[11] != 0u)
-					  && memcmp(frame, previous, sizeof frame) == 0;
-				memcpy(previous, frame, sizeof frame);
-			}
+			uint8_t frame[BREAK_FRAME_LEN];
+			const bool settled = break_frame_settled(frame, WATCHPOINT_SETTLE_MS);
 			const uint16_t wp_pc = static_cast<uint16_t>((frame[10] << 8) | frame[11]);
 			printf("\n*** WATCHPOINT HIT ***\n");
 			printf("  CC=%02X A=%02X B=%02X DP=%02X X=%04X Y=%04X U=%04X PC=%04X\n",
