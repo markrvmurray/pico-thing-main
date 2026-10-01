@@ -36,7 +36,12 @@ public:
 	void control(uint8_t val);
 	void acknowledge();
 	void reset();
-	[[nodiscard]] interrupt has_interrupt() const;
+	// Called once per Q-rising from Core 1's loop, so it is here rather than
+	// out of line: the whole answer is one load and a select.
+	[[nodiscard]] interrupt has_interrupt() const
+	{
+		return irq_pending ? INTERRUPT_IRQ : INTERRUPT_NONE;
+	}
 	[[nodiscard]] bool is_enabled() const { return enabled; }
 	[[nodiscard]] bool is_irq_pending() const { return irq_pending; }
 	[[nodiscard]] uint8_t get_nmi_countdown() const { return nmi_countdown; }

@@ -770,7 +770,7 @@ TEST_CASE("host_transmit_level_avail returns 0 when RX queue is full") {
 	CHECK(uart.host_transmit_level_avail() == 0);
 
 	// Drain one byte: has_interrupt() stages it, rx_read_fast_path() acks the read
-	uart.has_interrupt();
+	(void)uart.has_interrupt();
 	CHECK(status().rdrf == 1);
 	uart.rx_read_fast_path();
 

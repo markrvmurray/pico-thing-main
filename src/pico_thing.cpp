@@ -67,57 +67,41 @@ extern void            cmd_yy_reset_str_pool(void);
 
 volatile bool verbose = false;
 
-#define BUS_CLOCK_PIO pio0
+// Every PIO program in this firmware, and the block it lives on.  The block is
+// not a free choice: pio0 and pio1 must sit at GPIO base 0 to see E, Q, the
+// address and data buses and !CS, while pio2 sits at base 16 to reach the task
+// pins and the DAT fault signals - so a program goes where its pins are
+// visible and where there is instruction space, not where it would read best.
+//
+// Each program's state machine, instruction offset, DMA channels and interrupt
+// line live together in one pio_dma so they cannot drift apart; -1 means not
+// claimed, or none of that kind.  See the PIO IRQ flag map further down for
+// which flag each program raises.
+#define BUS_CLOCK_PIO	pio0		// E/Q quadrature clock
+#define BUS_READ_PIO	pio0		// guest reads of the register block
+#define BUS_WRITE_PIO	pio1		// guest writes to the register block
+#define RTI_DETECT_PIO	pio1		// RTI opcode detector
+#define TASK_OUTPUT_PIO	pio2		// task pins, GPIO base 16
+#define TRACE_LO_PIO	pio0		// bus trace, GPIO 0-31
+#define TRACE_HI_PIO	pio2		// bus trace, GPIO 32-47
+#define BUS_FAULT_PIO	pio2		// DAT fault sampler, needs GPIO_FAULT
 
-static pio_dma pio_clock = {
-	BUS_CLOCK_PIO,
-	0,
-	-1,
-	-1,
-	IO_IRQ_BANK0
-};
+//                                    pio             sm  off  addr data  irq
+static pio_dma pio_clock     = { BUS_CLOCK_PIO,       -1, -1,  -1,  -1, IO_IRQ_BANK0 };
+static pio_dma piodma_read   = { BUS_READ_PIO,        -1, -1,   0,   1, DMA_IRQ_0 };
+static pio_dma piodma_write  = { BUS_WRITE_PIO,       -1, -1,   4,   5, DMA_IRQ_1 };
+static pio_dma rti_detect    = { RTI_DETECT_PIO,      -1, -1,  -1,  -1, PIO1_IRQ_0 };
+static pio_dma task_output   = { TASK_OUTPUT_PIO,     -1, -1,  -1,  -1, -1 };
+static pio_dma trace_lo      = { TRACE_LO_PIO,        -1, -1,  -1,   2, -1 };
+static pio_dma trace_hi      = { TRACE_HI_PIO,        -1, -1,  -1,   3, -1 };
+static pio_dma bus_fault     = { BUS_FAULT_PIO,       -1, -1,  -1,  -1, PIO2_IRQ_0 };
 
-#define BUS_READ_PIO pio0
-
-static pio_dma piodma_read = {
-	BUS_READ_PIO,
-	0,
-	0,
-	1,
-	DMA_IRQ_0
-};
-
-#define BUS_WRITE_PIO pio1
-
-static pio_dma piodma_write = {
-	BUS_WRITE_PIO,
-	0,
-	4,
-	5,
-	DMA_IRQ_1
-};
-
-// RTI detector PIO — runs on pio1 (needs GPIO 0-21 visibility)
-#define RTI_DETECT_PIO pio1
-static PIO rti_pio;
-static uint rti_pio_sm;
-
-// PIO program offsets (needed for pio_remove_program on shutdown)
-static int pio_clock_offset;
-static int pio_read_offset;
-static int pio_write_offset;
-static int pio_task_offset;
-static int pio_rti_offset;
-
-// PIO-driven task pins (pio2, GPIO base 16, pins 40-45)
-static PIO task_pio;
-static uint task_pio_sm;
 
 static inline void
 task_pins_update(uint8_t task)
 {
 	uint32_t pio_word = task | ((task == 0u) ? (1u << NUM_TASK_PINS) : 0u);
-	pio_sm_put(task_pio, task_pio_sm, pio_word);
+	pio_sm_put(task_output.pio, task_output.sm, pio_word);
 }
 
 // task_stack is now inside mc6809 class (mc6809::task_stack[])
@@ -126,20 +110,40 @@ task_pins_update(uint8_t task)
 // The Pico sets the NMI vector to the BREAK snippet before arming.
 static volatile bool watchpoint_armed = false;
 static uint16_t watchpoint_saved_nmi_vector = 0u;
-// Set by the write ISR on a watchpoint hit, consumed by the Q-rising EQ handler.
-// The ISR must not touch GPIO_NMI itself: the EQ handler drives that pin from
+// Set by the write ISR on a watchpoint hit, consumed by the Q-rising handler.
+// The ISR must not touch GPIO_NMI itself: the Q-rising handler drives that pin from
 // pending_interrupts on every Q-rising, so a direct ASSERT_NMI is released one
 // cycle later — long before the 6809 samples it, and the interrupt is lost.
 // A separate flag also avoids racing the read-modify-write on pending_interrupts.
 static volatile bool watchpoint_nmi_pending = false;
 
-// Set by the Q-rising EQ handler as it raises the watchpoint's NMI, so the
+// Set by the Q-rising handler as it raises the watchpoint's NMI, so the
 // console reports only a real hit.  SHARED also carries copies and system
 // requests, so bytes left there are no sign that BREAK has run; the handler
 // clears the PC slot as it raises the NMI, leaving only BREAK's copy to fill it.
 static volatile bool watchpoint_fired = false;
 
-// Set by the Q-rising EQ handler on an NMI vector fetch - the bus event BS_IRQ
+// Set by the DAT fault handler, consumed by the Q-rising handler, for exactly
+// the reason watchpoint_nmi_pending exists: the Q-rising handler drives the
+// NMI pin from cached state on every pass, so an ISR that asserts the pin
+// itself has it released a cycle later and the interrupt is lost.
+//
+// A separate flag also means the fault handler touches nothing the Q-rising
+// handler read-modify-writes, which is what lets it run at a HIGHER priority
+// and so set this before the pass that will act on it, rather than waiting
+// behind one.  Sampling the fault in PIO moved the latch out of the Q handler
+// and left the request behind it; this puts the request back in front.
+static volatile bool dat_fault_nmi_request = false;
+
+// How many Q-risings the NMI pin is held low for.  The datasheet asks for a
+// pulse width of at least one E cycle, and a one-shot assert - one Q-rising to
+// the next - is one E cycle minus however late the two ISR entries were,
+// which only just meets it.  NMI is edge-triggered, so a wider pulse costs
+// nothing: the edge is latched once and a longer low cannot re-trigger it.
+static constexpr uint8_t NMI_ASSERT_CYCLES = 2u;
+static volatile uint8_t nmi_assert_cycles = 0u;
+
+// Set by the Q-rising handler on an NMI vector fetch - the bus event BS_IRQ
 // reports, and the point by which the 6809 has stacked its whole register
 // frame.  CMD_BREAK clears it before raising the NMI and waits on it after, so
 // "the break has been taken" comes from the bus rather than from a guess about
@@ -199,8 +203,13 @@ watchpoint_disarm()
 	reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
 }
 
+// The three open-collector interrupt pins, driven together from the Q-rising
+// handler.  Asserting one means enabling its output; the output value is
+// already low, so the direction register is the drive.
+static constexpr uint32_t INTERRUPT_PIN_MASK =
+	(1u << GPIO_NMI) | (1u << GPIO_FIRQ) | (1u << GPIO_IRQ);
+
 static volatile bool q_rising_edge = false;
-static volatile bool q_falling_edge = false;
 static volatile bool core1_initialised = false;
 
 mc6850 fast_serial(CONSOLE_CONTROL, CONSOLE_TX_DATA);
@@ -211,9 +220,23 @@ mc6850 aux_serial(AUX_CONTROL, AUX_TX_DATA);
 // for(;;) loop throughput.  Packed into a single byte so the ISR does one
 // volatile read (not three) — the init ISR budget is extremely tight.
 static volatile uint8_t pending_interrupts = 0u;
+// An interrupt enum to its pending bit.  Only three of the nine can be
+// asserted on a pin; INTERRUPT_NONE, the software interrupts and RESET - which
+// no device asks for - contribute nothing.
 static constexpr uint8_t PEND_NMI  = 1u << 0;
 static constexpr uint8_t PEND_FIRQ = 1u << 1;
 static constexpr uint8_t PEND_IRQ  = 1u << 2;
+
+static inline uint8_t
+pend_bit(const interrupt eirq)
+{
+	switch (eirq) {
+	case INTERRUPT_NMI:	return PEND_NMI;
+	case INTERRUPT_FIRQ:	return PEND_FIRQ;
+	case INTERRUPT_IRQ:	return PEND_IRQ;
+	default:		return 0u;
+	}
+}
 
 // 50 Hz tick timer (IRQ) + E-cycle countdown (NMI).
 // Constructed from getInstance() rather than reg: reg is a namespace-scope
@@ -239,12 +262,28 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 // wrap across the three blocks, so pio0's "prev" is pio2 — which matters,
 // because pio1 is full to the word (bus_write 19 + rti_detect 13 = 32) and
 // pio0 is the only base-0 block with room.
-#define TRACE_LO_PIO pio0
-#define TRACE_HI_PIO pio2
-static uint trace_lo_sm = 0u, trace_hi_sm = 0u;
-static int trace_lo_offset = -1, trace_hi_offset = -1;
-static constexpr uint TRACE_LO_DMA = 2u;
-static constexpr uint TRACE_HI_DMA = 3u;
+// PIO IRQ flags, which the instruction streams in pico_thing.pio raise and
+// this file consumes.  They are named here because the two sides are edited
+// independently and a silent mismatch is expensive: a renumbering on
+// 2026-10-01 left the RTI detector raising one flag while this file enabled
+// and cleared another, which killed RTI detection outright - and with it the
+// nesting unwind, so the run state stuck in RS_IN_IRQ - without a word.
+//
+// Flags are per block.  pio1 and pio2 each have their own set of eight.
+//
+//   pio1 flag 1  rti_detect        -> PIO1_IRQ_0 -> pio_rti_irq_handler()
+//   pio2 flag 0  mc6809_clock's "irq prev set 0", once per E cycle at Q-fall
+//                (prev from pio0 wraps to pio2), consumed by bus_fault's wait
+//   pio2 flag 2  bus_capture_lo -> bus_capture_hi handshake, SM to SM
+//   pio2 flag 3  bus_fault, the DAT fault signal to the CPU
+static constexpr uint RTI_PIO_IRQ = 1u;
+static constexpr pio_interrupt_source RTI_PIO_IRQ_SOURCE = pis_interrupt1;
+
+static constexpr uint BUS_FAULT_PIO_IRQ = 3u;
+static constexpr pio_interrupt_source BUS_FAULT_PIO_IRQ_SOURCE = pis_interrupt3;
+
+static constexpr uint TRACE_HANDSHAKE_PIO_IRQ = 2u;
+
 // Set when the capture should wait for its trigger pin rather than start now.
 static volatile bool trace_hw_triggered = false;
 // Set when a capture is armed but the guest is not running yet.
@@ -256,50 +295,50 @@ static void trace_hw_start();
 static uint32_t
 trace_hw_count()
 {
-	if (trace_lo_offset < 0)
+	if (trace_lo.offset < 0)
 		return 0u;
-	const uint32_t left = dma_channel_hw_addr(TRACE_LO_DMA)->transfer_count;
+	const uint32_t left = dma_channel_hw_addr(trace_lo.data_channel)->transfer_count;
 	return (left > TRACE_SIZE) ? 0u : (TRACE_SIZE - left);
 }
 
 static void
 trace_hw_stop()
 {
-	if (trace_lo_offset < 0)
+	if (trace_lo.offset < 0)
 		return;
-	dma_channel_abort(TRACE_LO_DMA);
-	dma_channel_abort(TRACE_HI_DMA);
-	pio_sm_set_enabled(TRACE_LO_PIO, trace_lo_sm, false);
-	pio_sm_set_enabled(TRACE_HI_PIO, trace_hi_sm, false);
+	dma_channel_abort(trace_lo.data_channel);
+	dma_channel_abort(trace_hi.data_channel);
+	pio_sm_set_enabled(trace_lo.pio, trace_lo.sm, false);
+	pio_sm_set_enabled(trace_hi.pio, trace_hi.sm, false);
 }
 
 static void
 trace_hw_arm()
 {
-	if (trace_lo_offset < 0)
+	if (trace_lo.offset < 0)
 		return;
 	trace_hw_stop();
 	// Drain both FIFOs.  The state machines keep sampling after a completed
 	// DMA stops draining them, so without this the next capture would open
 	// with the tail of the previous one.
-	pio_sm_clear_fifos(TRACE_LO_PIO, trace_lo_sm);
-	pio_sm_clear_fifos(TRACE_HI_PIO, trace_hi_sm);
-	pio_sm_restart(TRACE_LO_PIO, trace_lo_sm);
-	pio_sm_restart(TRACE_HI_PIO, trace_hi_sm);
-	pio_interrupt_clear(TRACE_HI_PIO, 0);
+	pio_sm_clear_fifos(trace_lo.pio, trace_lo.sm);
+	pio_sm_clear_fifos(trace_hi.pio, trace_hi.sm);
+	pio_sm_restart(trace_lo.pio, trace_lo.sm);
+	pio_sm_restart(trace_hi.pio, trace_hi.sm);
+	pio_interrupt_clear(trace_hi.pio, TRACE_HANDSHAKE_PIO_IRQ);
 	// .wrap never revisits the trigger, so the PC has to be put back by hand.
 	if (trace_hw_triggered)
-		bus_capture_lo_program_rearm(TRACE_LO_PIO, trace_lo_sm,
-					     static_cast<uint>(trace_lo_offset));
+		bus_capture_lo_program_rearm(trace_lo.pio, trace_lo.sm,
+					     static_cast<uint>(trace_lo.offset));
 	else
-		bus_capture_lo_program_trigger_now(TRACE_LO_PIO, trace_lo_sm,
-						   static_cast<uint>(trace_lo_offset));
-	dma_channel_set_write_addr(TRACE_LO_DMA, MC6809.trace_base(), false);
-	dma_channel_set_write_addr(TRACE_HI_DMA, MC6809.trace_hi_base(), false);
-	dma_channel_set_trans_count(TRACE_LO_DMA, TRACE_SIZE, false);
-	dma_channel_set_trans_count(TRACE_HI_DMA, TRACE_SIZE, false);
-	dma_channel_start(TRACE_LO_DMA);
-	dma_channel_start(TRACE_HI_DMA);
+		bus_capture_lo_program_trigger_now(trace_lo.pio, trace_lo.sm,
+						   static_cast<uint>(trace_lo.offset));
+	dma_channel_set_write_addr(trace_lo.data_channel, MC6809.trace_base(), false);
+	dma_channel_set_write_addr(trace_hi.data_channel, MC6809.trace_hi_base(), false);
+	dma_channel_set_trans_count(trace_lo.data_channel, TRACE_SIZE, false);
+	dma_channel_set_trans_count(trace_hi.data_channel, TRACE_SIZE, false);
+	dma_channel_start(trace_lo.data_channel);
+	dma_channel_start(trace_hi.data_channel);
 	// Hold the state machines off until the guest is actually running.  They
 	// free-run once enabled, so arming against a reset-held bus would spend
 	// the whole one-shot on idle cycles before the guest fetched anything —
@@ -319,8 +358,8 @@ static void
 trace_hw_start()
 {
 	trace_pending_start = false;
-	pio_sm_set_enabled(TRACE_HI_PIO, trace_hi_sm, true);
-	pio_sm_set_enabled(TRACE_LO_PIO, trace_lo_sm, true);
+	pio_sm_set_enabled(trace_hi.pio, trace_hi.sm, true);
+	pio_sm_set_enabled(trace_lo.pio, trace_lo.sm, true);
 }
 
 // Set to zero ONLY for bring-up, and ONLY while !NMI is physically
@@ -376,15 +415,39 @@ extern "C" uint32_t __StackOneBottom;	// linker symbol (NOLINT: the name is the 
 extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK's)
 
 void __isr
-__time_critical_func(gpio_clock_eq_irq_handler())
+__time_critical_func(gpio_q_irq_handler())
 {
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
-	core1_isr_count++;
-	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_RISE) {
+	// Q-RISING ONLY.  The falling edge used to be enabled as well, purely to
+	// poll GPIO_FAULT once per cycle - a million entries a second to read one
+	// pin.  The bus_fault state machine on pio2 does that sampling now,
+	// clocked by the clock program's "irq prev set 0" at the same Q-falling
+	// phase, and raises an interrupt only when a fault is actually there.
+	//
+	// The event mask is still read and tested rather than assumed: this is a
+	// raw handler on IO_IRQ_BANK0, so it is called for any bank 0 interrupt,
+	// and only Q-rising belongs to it.  IO_BANK0 sits behind the APB bridge,
+	// where each register access costs several cycles against one for SIO, so
+	// it is read once and acknowledged once.
+	//
+	// Acknowledging up front is the safe order: the INTR latch is set by the
+	// hardware whenever an edge arrives, so an edge that lands while this
+	// pass is still running is latched again and re-enters.  Acknowledging
+	// afterwards would clear that latch and lose the edge.
+	const uint32_t q_events = gpio_get_irq_event_mask(GPIO_Q);
+
+	gpio_acknowledge_irq(GPIO_Q, q_events & GPIO_IRQ_EDGE_RISE);
+	if (q_events & GPIO_IRQ_EDGE_RISE) {
+		// Counted here rather than on entry: one increment per E cycle
+		// instead of two, and it then measures the same event as
+		// core1_qrise, which the for(;;) loop counts when it observes the
+		// rising edge.  The pair is the starvation ratio that diagnosed the
+		// Core 1 livelock of 2026-09-15 - if this climbs while core1_qrise
+		// and core1_loop stand still, the ISRs are eating the loop.
+		core1_isr_count++;
 		q_rising_edge = true;
-		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_RISE);
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
 		// BUSY/LIC/AVMA are stable at Q-rising (this is the latest valid capture point;
@@ -500,105 +563,42 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 		// when not.  The DMA read ISR clears PEND_IRQ after
 		// rx_read_fast_path() and timer reads, keeping stale assertion
 		// windows short.
+		//
+		// The three pins are driven with one pair of SIO writes rather than
+		// an ASSERT/DEASSERT each: the pins are open-collector, so the
+		// direction register IS the drive, and gpio_set_dir_masked() sets the
+		// output-enables of all three from one mask.  Three stores become
+		// two, and they are unconditional, so nothing here depends on a
+		// shadow copy staying in step with mc6809::init() and deinit(),
+		// which drive the same pins from Core 0.
 		{
 			const uint8_t pend = pending_interrupts;
-			if ((pend & PEND_NMI) || watchpoint_nmi_pending) {
+			uint32_t oe = 0u;
+			if ((pend & PEND_NMI) || watchpoint_nmi_pending
+			    || dat_fault_nmi_request) {
 				if (watchpoint_nmi_pending) {
 					reg[REGISTER_BUFFER_OFFSET] = static_cast<uint8_t>(0u);
 					reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
 					reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
 					watchpoint_fired = true;
 				}
-				ASSERT_NMI;
+				nmi_assert_cycles = NMI_ASSERT_CYCLES;
 				pending_interrupts = pend & ~PEND_NMI;
 				watchpoint_nmi_pending = false;
-			} else
-				DEASSERT_NMI;
-			if (pend & PEND_FIRQ) ASSERT_FIRQ; else DEASSERT_FIRQ;
-			if (pend & PEND_IRQ)  ASSERT_IRQ;  else DEASSERT_IRQ;
-		}
-	}
-	// NOT "else if".  A delayed entry can find both Q edges pending, and an
-	// else-if would run only the rising branch — skipping the falling one and
-	// leaving its flag unacknowledged.  That silently drops a trace sample and,
-	// worse, a fault sample.  Handling both in one pass costs nothing when only
-	// one is pending.
-	if (gpio_get_irq_event_mask(GPIO_Q) & GPIO_IRQ_EDGE_FALL) {
-		q_falling_edge = true;
-		gpio_acknowledge_irq(GPIO_Q, GPIO_IRQ_EDGE_FALL);
-		// BUSY/LIC/AVMA are captured at Q-rising, the latest point that still
-		// describes this cycle; by Q-falling the 6809 has moved them on to the
-		// next, so they are not read here.  RTI detection belongs to the
-		// rti_detect PIO program, which samples D[7:0] at E-fall, and the bus
-		// trace is captured by PIO and DMA, so neither costs this handler
-		// anything.
-
-		// The fault sampler needs the high GPIO bank.
-		high_bus_pins high_pins{};
-		high_pins.word = sio_hw->gpio_hi_in;
-
-		// DAT fault: the decode logic drives GPIO_FAULT high when the guest
-		// reads or writes a block of RAM the DAT does not map.  Sampled as a
-		// level here rather than on its own bank0 edge interrupt — one SIO
-		// read per E cycle is cheaper than the extra interrupt dispatch.
-		//
-		// Q-FALLING, deliberately.  The Fault line is a registered output of
-		// the DAT GAL clocked on Q-rising, so sampling at Q-rising would read
-		// it at the instant it changes; the 6809 in turn guarantees A0-A15,
-		// R/!W, BA and BS are stable from before Q rises until ~20 ns after E
-		// falls.  Q-falling therefore sits in the middle of a window where the
-		// registered signal and the live bus pins are both settled and both
-		// describe the same cycle.
-		//
-		// The fault pin, the task pins, A13-A15 and the NMIBlock readback all
-		// share the high input register, read once above.
-		// First fault wins.  Latching also asserts NMIBlock, which masks the
-		// NMI for every subsequent fault, so a storm cannot overwrite the
-		// record of the one that started it.  The NMI for THIS fault has
-		// already been captured by the GAL at Q-rising, so it still reaches
-		// the guest.  The handler re-arms by writing zero to SYSTEM_DAT_FAULT.
-		//
-		// DAT_FAULT_AUTO_BLOCK == 0 suspends all of that for bring-up: see
-		// the note by the definition.
-		if (high_pins.bits.FAULT && dat_fault_block_countdown == 0u
-		    && (!DAT_FAULT_AUTO_BLOCK || !high_pins.bits.NMI_BLOCK)) {
-			// Arm the mask rather than raising it here: see the note by
-			// DAT_FAULT_BLOCK_DELAY.  Until it expires this countdown also
-			// stands in for the mask as the "already latched" test above, so
-			// a second fault inside the window cannot overwrite the first.
-			if constexpr (DAT_FAULT_AUTO_BLOCK)
-				dat_fault_block_countdown = DAT_FAULT_BLOCK_DELAY;
-			// Tell the BUS_IRQ case that the NMI now on its way is a fault,
-			// so it can drop the guest into task 0 for the handler.
-			dat_fault_nmi_pending = true;
-			// And ask for that NMI rather than relying on the GAL's.
-			//
-			// The GAL raises one - NMI.D = MMU_dat & Last_Block & !NMIBlock -
-			// but it lasts only as long as the faulting access is on the bus,
-			// because the D term goes false the moment the access ends.  That
-			// puts the whole pulse inside the faulting instruction's own last
-			// cycle, and the 6809 samples !NMI on Q-falling of the cycle
-			// BEFORE the last one, so it arrives a cycle too late for the
-			// boundary it caused and is gone before the next.  Seen on a bus
-			// trace as N asserted on the same row as LIC and clear again two
-			// rows later, with no vector fetch anywhere after it.
-			//
-			// Going through pending_interrupts asserts from the next Q-rising
-			// and holds the pin from the handler, which is the path the
-			// watchpoint and the irq tests already use and which is known to
-			// be taken.  The GAL's pulse becomes confirmation rather than the
-			// only mechanism.
-			pending_interrupts |= PEND_NMI;
-			// Nothing else writes bits 2-6.  The NMIBlock bit is not set
-			// here: it mirrors the pin, and the pin is not up yet.
-			reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(
-				DAT_FAULT_FAULT
-				| (gpio_get(GPIO_RW) ? DAT_FAULT_RW : 0u));
-			// The task pins are read back rather than taken from MC6809.task,
-			// so this is what the DAT hardware itself saw.
-			reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(
-				(high_pins.bits.TASK << DAT_FAULT_LOC_TASK_SHIFT)
-				| high_pins.bits.A_HI);
+				dat_fault_nmi_request = false;
+			}
+			// Hold it for the full width, then let it go.  Each request
+			// restarts the count, so a second NMI during the pulse does not
+			// shorten it.
+			if (nmi_assert_cycles > 0u) {
+				oe |= 1u << GPIO_NMI;
+				nmi_assert_cycles--;
+			}
+			if (pend & PEND_FIRQ)
+				oe |= 1u << GPIO_FIRQ;
+			if (pend & PEND_IRQ)
+				oe |= 1u << GPIO_IRQ;
+			gpio_set_dir_masked(INTERRUPT_PIN_MASK, oe);
 		}
 	}
 #ifdef DEBUG
@@ -611,8 +611,99 @@ __time_critical_func(gpio_clock_eq_irq_handler())
 void __isr
 __time_critical_func(pio_rti_irq_handler())
 {
-	pio_interrupt_clear(rti_pio, 0);
+	pio_interrupt_clear(rti_detect.pio, RTI_PIO_IRQ);
 	MC6809.apply_rti();
+}
+
+// ISR for the DAT fault sampler PIO program.
+//
+// Fires when bus_fault finds GPIO_FAULT high at Q-falling, which means the
+// guest has read or written an 8kB block the DAT does not map.  The flag is
+// cleared first: it is a latch, and a handler that returns without clearing it
+// re-enters for ever.
+//
+// Deliberately NOT a re-test of the FAULT pin.  The sampler established the
+// fault at Q-falling, the point where the GAL's registered output and the live
+// bus pins both describe the same cycle; by the time this runs the pin may
+// have gone low again, and a re-test would throw a real fault away.
+//
+// The task and page come from the sampler's own `in pins 16`, so they are the
+// values at the fault rather than whatever the bus has moved on to.  R/!W
+// cannot: it is GPIO 2, outside pio2's base-16 window, so the direction bit is
+// read live here.  The record therefore has mixed provenance - page and task
+// latched, direction sampled a little later - which is worth knowing when a
+// fault's R/!W bit looks wrong.
+void __isr
+__time_critical_func(pio_bus_fault_irq_handler())
+{
+	pio_interrupt_clear(bus_fault.pio, BUS_FAULT_PIO_IRQ);
+
+	// Drain the FIFO and keep the FIRST word.  More than one can be waiting
+	// if the guest faulted again before this ran, and first-fault-wins
+	// applies to the sample exactly as it does to the record.  Draining the
+	// rest also means no stale word is left to be read as the next fault.
+	high_bus_pins high_pins{};
+	bool sampled = false;
+	while (!pio_sm_is_rx_fifo_empty(bus_fault.pio, static_cast<uint>(bus_fault.sm))) {
+		const uint32_t word = pio_sm_get(bus_fault.pio, static_cast<uint>(bus_fault.sm));
+		if (!sampled) {
+			high_pins.word = word;
+			sampled = true;
+		}
+	}
+	// Belt and braces: the flag cannot be raised without the push that
+	// precedes it, but a live read beats recording nothing.
+	if (!sampled)
+		high_pins.word = sio_hw->gpio_hi_in;
+
+	// First fault wins.  The countdown stands in for the mask until it
+	// expires, so a second fault inside the window cannot overwrite the
+	// first, and NMIBlock rejects everything after that until the guest
+	// clears it.
+	if (dat_fault_block_countdown != 0u)
+		return;
+	if (DAT_FAULT_AUTO_BLOCK && high_pins.bits.NMI_BLOCK)
+		return;
+
+	// Stop the interrupts rather than filter them.  A guest dying of a bad
+	// pointer faults on every cycle, and rejecting a million interrupts a
+	// second here would cost more than the Q-falling poll this replaced.
+	// The source goes back on when the guest clears SYSTEM_DAT_FAULT, or at
+	// the next reset - the same two places that lower NMIBlock.
+	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, false);
+
+	// Arm the mask rather than raising it here: see the note by
+	// DAT_FAULT_BLOCK_DELAY.
+	if constexpr (DAT_FAULT_AUTO_BLOCK)
+		dat_fault_block_countdown = DAT_FAULT_BLOCK_DELAY;
+	// Tell the BUS_IRQ case that the NMI now on its way is a fault, so it
+	// can drop the guest into task 0 for the handler.
+	dat_fault_nmi_pending = true;
+	// And ask for that NMI rather than relying on the GAL's.
+	//
+	// The GAL raises one - NMI.D = MMU_dat & Last_Block & !NMIBlock - but it
+	// lasts only as long as the faulting access is on the bus, because the D
+	// term goes false the moment the access ends.  That puts the whole pulse
+	// inside the faulting instruction's own last cycle, and the 6809 samples
+	// !NMI on Q-falling of the cycle BEFORE the last one, so it arrives a
+	// cycle too late for the boundary it caused and is gone before the next.
+	//
+	// Going through pending_interrupts asserts from the next Q-rising and
+	// holds the pin from the Q-rising handler, which is the path the
+	// watchpoint and the irq tests already use.  This handler runs at the
+	// same priority as that one and on the same core, so neither can preempt
+	// the other part-way through this read-modify-write.
+	dat_fault_nmi_request = true;
+	// Nothing else writes bits 2-6.  The NMIBlock bit is not set here: it
+	// mirrors the pin, and the pin is not up yet.
+	reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(
+		DAT_FAULT_FAULT
+		| (gpio_get(GPIO_RW) ? DAT_FAULT_RW : 0u));
+	// The task pins are the ones the DAT hardware itself saw, not
+	// MC6809.task.
+	reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(
+		(high_pins.bits.TASK << DAT_FAULT_LOC_TASK_SHIFT)
+		| high_pins.bits.A_HI);
 }
 
 // ISR for the R/!W bus read loop and DMA chain
@@ -806,6 +897,17 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		// cycle or two after the guest had just cleared it.
 		dat_fault_block_countdown = 0u;
 		gpio_put(GPIO_NMI_BLOCK, block);
+		// Lowering the mask is the guest saying it has dealt with the
+		// fault, so the sampler's interrupt goes back on here - it was
+		// switched off when the fault was latched, to keep a fault storm
+		// from becoming an interrupt storm.  Any queued samples belong to
+		// the fault just handled and must not be read as the next one.
+		if (!block) {
+			pio_sm_clear_fifos(bus_fault.pio, static_cast<uint>(bus_fault.sm));
+			pio_interrupt_clear(bus_fault.pio, BUS_FAULT_PIO_IRQ);
+			pio_set_irq0_source_enabled(bus_fault.pio,
+						    BUS_FAULT_PIO_IRQ_SOURCE, true);
+		}
 		if (block)
 			reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
 		else
@@ -4361,7 +4463,15 @@ poll_console()
 	static constexpr uint32_t WATCHDOG_INTERVAL_MS = 10u;
 	static constexpr uint32_t WATCHDOG_THRESHOLD = 10u;	// 10 × 10ms = 100ms
 	uint32_t watchdog_miss_count = 0u;
-	absolute_time_t watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
+	// A 32-bit microsecond deadline, read with one APB access from
+	// timer_hw->timerawl, rather than an absolute_time_t: get_absolute_time()
+	// takes two APB reads through the latching protocol and
+	// absolute_time_diff_us() then does 64-bit arithmetic, and this is tested
+	// on every pass of a loop whose rate governs the CDC pump and so
+	// DriveWire's throughput.  A 32-bit microsecond counter wraps every 71
+	// minutes, so the signed difference is good for any deadline within about
+	// 35 minutes of now; this one is 10 ms away.
+	uint32_t watchdog_next = timer_hw->timerawl + WATCHDOG_INTERVAL_MS * 1000u;
 	bool watchdog_stalled = false;
 
 	for (;;) {
@@ -4381,7 +4491,7 @@ poll_console()
 			prompted = false;
 		}
 
-		if (absolute_time_diff_us(get_absolute_time(), watchdog_next) <= 0) {
+		if (static_cast<int32_t>(timer_hw->timerawl - watchdog_next) >= 0) {
 			const uint32_t cur_loop = core1_loop_count;
 			const uint32_t cur_isr = core1_isr_count;
 			if (cur_loop == watchdog_last_loop_count && core1_initialised) {
@@ -4432,7 +4542,7 @@ poll_console()
 			}
 			watchdog_last_loop_count = cur_loop;
 			watchdog_last_isr_count = cur_isr;
-			watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
+			watchdog_next = timer_hw->timerawl + WATCHDOG_INTERVAL_MS * 1000u;
 		}
 
 		if (!prompted) {
@@ -4458,7 +4568,7 @@ poll_console()
 				// loop for its duration.
 				watchdog_last_loop_count = core1_loop_count;
 				watchdog_last_isr_count = core1_isr_count;
-				watchdog_next = make_timeout_time_ms(WATCHDOG_INTERVAL_MS);
+				watchdog_next = timer_hw->timerawl + WATCHDOG_INTERVAL_MS * 1000u;
 				idx = 0;
 				prompted = false;
 			} else if (ch == '\b') {
@@ -4540,12 +4650,12 @@ __no_inline_not_in_flash_func(main_core1)()
 	// "power on".  Leaving it in the chain is safe: only Core 1 ever enables
 	// the bank 0 IRQ, and the enable below acknowledges any edge that latched
 	// while the guest was powered off.
-	static bool eq_handler_added = false;
-	if (!eq_handler_added) {
-		gpio_add_raw_irq_handler(GPIO_Q, gpio_clock_eq_irq_handler);
-		eq_handler_added = true;
+	static bool q_handler_added = false;
+	if (!q_handler_added) {
+		gpio_add_raw_irq_handler(GPIO_Q, gpio_q_irq_handler);
+		q_handler_added = true;
 	}
-	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE, true);
 	irq_set_priority(pio_clock.irq, 1);
 	irq_set_enabled(pio_clock.irq, true);
 	printf("Core1 BA/BS and BUSY/LIC/AVMA bus observer started\n");
@@ -4574,15 +4684,27 @@ __no_inline_not_in_flash_func(main_core1)()
 	       PIO_NUM(piodma_write.pio),
 	       piodma_write.sm);
 
-	pio_sm_set_enabled(task_pio, task_pio_sm, true);
-	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_pio), task_pio_sm);
+	pio_sm_set_enabled(task_output.pio, task_output.sm, true);
+	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_output.pio), task_output.sm);
 
-	pio_sm_set_enabled(rti_pio, rti_pio_sm, true);
-	pio_set_irq0_source_enabled(rti_pio, pis_interrupt0, true);
-	irq_set_exclusive_handler(PIO1_IRQ_0, pio_rti_irq_handler);
-	irq_set_priority(PIO1_IRQ_0, 1);
-	irq_set_enabled(PIO1_IRQ_0, true);
-	printf("Core1 RTI detect pio%d/sm%d started\n", PIO_NUM(rti_pio), rti_pio_sm);
+	pio_sm_set_enabled(rti_detect.pio, rti_detect.sm, true);
+	pio_set_irq0_source_enabled(rti_detect.pio, RTI_PIO_IRQ_SOURCE, true);
+	irq_set_exclusive_handler(rti_detect.irq, pio_rti_irq_handler);
+	irq_set_priority(rti_detect.irq, 1);
+	irq_set_enabled(rti_detect.irq, true);
+	printf("Core1 RTI detect pio%d/sm%d started\n", PIO_NUM(rti_detect.pio), rti_detect.sm);
+
+	pio_sm_set_enabled(bus_fault.pio, bus_fault.sm, true);
+	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, true);
+	irq_set_exclusive_handler(bus_fault.irq, pio_bus_fault_irq_handler);
+	// Above the Q-rising handler (priority 1), so a fault's NMI request is in
+	// place before the pass that acts on it.  Safe only because this handler
+	// touches no state that one read-modify-writes - see
+	// dat_fault_nmi_request.  Level with the DMA ISRs, which it must not
+	// delay.
+	irq_set_priority(bus_fault.irq, 0);
+	irq_set_enabled(bus_fault.irq, true);
+	printf("Core1 bus fault detect pio%d/sm%d started\n", PIO_NUM(bus_fault.pio), bus_fault.sm);
 
 	sysreq_initialise();
 
@@ -4618,32 +4740,34 @@ __no_inline_not_in_flash_func(main_core1)()
 			q_rising_edge = false;
 			core1_qrise_count++;
 
-			uint32_t interrupt_refcount[NUM_INTERRUPTS] = {};
-			interrupt eirq;
-			eirq = console_has_interrupt();
-			interrupt_refcount[eirq]++;
-			eirq = system_tick.has_interrupt();
-			interrupt_refcount[eirq]++;
-			eirq = fast_serial.has_interrupt();
-			interrupt_refcount[eirq]++;
-			eirq = aux_serial.has_interrupt();
-			interrupt_refcount[eirq]++;
-			if (interrupt_refcount[INTERRUPT_IRQ] > 0u)
+			// Ask each device what it wants and keep the three bits the
+			// pins can carry.  This used to count into a
+			// uint32_t[NUM_INTERRUPTS] array, zeroed and indexed on every
+			// Q-rising, because the array was handed to
+			// mc6809::apply_interrupts() - which no longer exists.  The
+			// counts were never read as counts.
+			//
+			// Single volatile write at the end: the Q-rising ISR drives all
+			// three pins from this byte.
+			const uint8_t pend = pend_bit(console_has_interrupt())
+					   | pend_bit(system_tick.has_interrupt())
+					   | pend_bit(fast_serial.has_interrupt())
+					   | pend_bit(aux_serial.has_interrupt());
+			if (pend & PEND_IRQ)
 				core1_irq_assert_count++;
-			// Update cached state so the Q-rising ISR can assert/deassert
-			// interrupt pins.  Single volatile write; the ISR handles all
-			// GPIO assertion and deassertion — no apply_interrupts() here.
-			pending_interrupts =
-				(interrupt_refcount[INTERRUPT_NMI]  > 0u ? PEND_NMI  : 0u) |
-				(interrupt_refcount[INTERRUPT_FIRQ] > 0u ? PEND_FIRQ : 0u) |
-				(interrupt_refcount[INTERRUPT_IRQ]  > 0u ? PEND_IRQ  : 0u);
+			pending_interrupts = pend;
 		}
 
 		// Console writes into the register block, carried out as the guest's
 		// would be: the byte into the write side, then the write ISR's own
 		// follow-up, with interrupts off so the ISR cannot interleave.  The
 		// ring entries that queues are dispatched just below, in this pass.
-		{
+		// queue_try_remove() takes the queue's spinlock before it looks at
+		// the level, so an empty queue - which is almost every pass - costs
+		// a lock acquire, a release and their barriers.  The unsafe level
+		// read is two loads and no lock; a stale "empty" only defers a
+		// console write by one pass, and console writes are human-paced.
+		if (queue_get_level_unsafe(&console_write_queue) != 0u) {
 			write_entry w;
 			while (queue_try_remove(&console_write_queue, &w)) {
 				const uint32_t saved = save_and_disable_interrupts();
@@ -4829,8 +4953,8 @@ static void
 clock_pio_init()
 {
 	// SM0: E/Q clock
-	pio_clock_offset = pio_add_program(pio_clock.pio, &mc6809_clock_program);
-	if (pio_clock_offset < 0) {
+	pio_clock.offset = pio_add_program(pio_clock.pio, &mc6809_clock_program);
+	if (pio_clock.offset < 0) {
 		printf("Core0 insufficient space for E/Q program\n");
 		panic("Unable to proceed");
 	}
@@ -4839,9 +4963,9 @@ clock_pio_init()
 		printf("Core0 unable to claim unused SM for E/Q program\n");
 		panic("Unable to proceed");
 	}
-	mc6809_clock_program_init(pio_clock.pio, pio_clock.sm, pio_clock_offset);
+	mc6809_clock_program_init(pio_clock.pio, pio_clock.sm, pio_clock.offset);
 
-	printf("Core0 E/Q clocks pio%d sm%d configured\n", PIO_NUM(BUS_CLOCK_PIO), pio_clock.sm);
+	printf("Core0 E/Q clocks pio%d sm%d configured\n", PIO_NUM(pio_clock.pio), pio_clock.sm);
 }
 
 // RP2350 pads come out of reset with their pull-downs enabled, and nothing
@@ -4931,8 +5055,8 @@ bus_pio_dma_init()
 	dma_channel_claim(piodma_read.data_channel);
 
 	// SM: Bus read responder
-	pio_read_offset = pio_add_program(piodma_read.pio, &mc6809_bus_read_program);
-	if (pio_read_offset < 0) {
+	piodma_read.offset = pio_add_program(piodma_read.pio, &mc6809_bus_read_program);
+	if (piodma_read.offset < 0) {
 		printf("Core0 insufficient space for bus_read program\n");
 		panic("Unable to proceed");
 	}
@@ -4941,7 +5065,7 @@ bus_pio_dma_init()
 		printf("Core0 unable to claim unused SM for bus_read program\n");
 		panic("Unable to proceed");
 	}
-	mc6809_bus_read_program_init(piodma_read.pio, piodma_read.sm, pio_read_offset);
+	mc6809_bus_read_program_init(piodma_read.pio, piodma_read.sm, piodma_read.offset);
 	printf("Core0 read pio%u sm%d configured\n", PIO_NUM(piodma_read.pio), piodma_read.sm);
 	// DMA move the requested memory data to PIO for output
 	dma_channel_config read_out_dma = dma_channel_get_default_config(piodma_read.data_channel);
@@ -4977,8 +5101,8 @@ bus_pio_dma_init()
 	printf("Core0 DMA read_address channel configured\n");
 
 	// SM: Bus write responder
-	pio_write_offset = pio_add_program(piodma_write.pio, &mc6809_bus_write_program);
-	if (pio_write_offset < 0) {
+	piodma_write.offset = pio_add_program(piodma_write.pio, &mc6809_bus_write_program);
+	if (piodma_write.offset < 0) {
 		printf("Core0 insufficient space for bus_write program\n");
 		panic("Unable to proceed");
 	}
@@ -4987,7 +5111,7 @@ bus_pio_dma_init()
 		printf("Core0 unable to claim unused SM for bus_write program\n");
 		panic("Unable to proceed");
 	}
-	mc6809_bus_write_program_init(piodma_write.pio, piodma_write.sm, pio_write_offset);
+	mc6809_bus_write_program_init(piodma_write.pio, piodma_write.sm, piodma_write.offset);
 	printf("Core0 write pio%u sm%d configured\n", PIO_NUM(piodma_write.pio), piodma_write.sm);
 	// DMA for the main MC6809 bus write loop
 	if (dma_channel_is_claimed(piodma_write.address_channel)) {
@@ -5035,69 +5159,79 @@ bus_pio_dma_init()
 	printf("Core0 DMA write_address channel configured\n");
 
 	// SM: Task pin output driver (pio2 with GPIO base 16 for access to GPIO 40-45)
-	task_pio = pio2;
-	pio_set_gpio_base(task_pio, 16);
-	pio_task_offset = pio_add_program(task_pio, &task_output_program);
-	if (pio_task_offset < 0) {
+	pio_set_gpio_base(task_output.pio, 16);
+	task_output.offset = pio_add_program(task_output.pio, &task_output_program);
+	if (task_output.offset < 0) {
 		printf("Core0 insufficient space for task_output program\n");
 		panic("Unable to proceed");
 	}
-	task_pio_sm = pio_claim_unused_sm(task_pio, true);
-	task_output_program_init(task_pio, task_pio_sm, pio_task_offset);
-	printf("Core0 task output pio%u sm%u configured\n", PIO_NUM(task_pio), task_pio_sm);
+	task_output.sm = pio_claim_unused_sm(task_output.pio, true);
+	task_output_program_init(task_output.pio, task_output.sm, task_output.offset);
+	printf("Core0 task output pio%u sm%d configured\n", PIO_NUM(task_output.pio), task_output.sm);
 
 	// SM: RTI opcode detector (pio1, needs GPIO 0-21 visibility)
-	rti_pio = RTI_DETECT_PIO;
-	pio_rti_offset = pio_add_program(rti_pio, &rti_detect_program);
-	if (pio_rti_offset < 0) {
+	rti_detect.offset = pio_add_program(rti_detect.pio, &rti_detect_program);
+	if (rti_detect.offset < 0) {
 		printf("Core0 insufficient space for rti_detect program\n");
 		panic("Unable to proceed");
 	}
-	rti_pio_sm = pio_claim_unused_sm(rti_pio, true);
-	rti_detect_program_init(rti_pio, rti_pio_sm, pio_rti_offset);
-	printf("Core0 RTI detect pio%u sm%u configured\n", PIO_NUM(rti_pio), rti_pio_sm);
+	rti_detect.sm = pio_claim_unused_sm(rti_detect.pio, true);
+	rti_detect_program_init(rti_detect.pio, rti_detect.sm, rti_detect.offset);
+	printf("Core0 RTI detect pio%u sm%d configured\n", PIO_NUM(rti_detect.pio), rti_detect.sm);
 
 	// SM pair: bus trace capture.  pio0 -> pio2 via "irq prev", which wraps
 	// across the three blocks.  pio1 would be the tidier neighbour but has
 	// no instruction memory left.
-	trace_lo_offset = pio_add_program(TRACE_LO_PIO, &bus_capture_lo_program);
-	trace_hi_offset = pio_add_program(TRACE_HI_PIO, &bus_capture_hi_program);
-	if (trace_lo_offset < 0 || trace_hi_offset < 0) {
+	trace_lo.offset = pio_add_program(trace_lo.pio, &bus_capture_lo_program);
+	trace_hi.offset = pio_add_program(trace_hi.pio, &bus_capture_hi_program);
+	if (trace_lo.offset < 0 || trace_hi.offset < 0) {
 		printf("Core0 insufficient space for bus_capture programs\n");
 		panic("Unable to proceed");
 	}
-	trace_lo_sm = pio_claim_unused_sm(TRACE_LO_PIO, true);
-	trace_hi_sm = pio_claim_unused_sm(TRACE_HI_PIO, true);
+	trace_lo.sm = pio_claim_unused_sm(trace_lo.pio, true);
+	trace_hi.sm = pio_claim_unused_sm(trace_hi.pio, true);
 	// Default trigger pin is !NMI; any pin 0-31 will do, since only the low
 	// half ever sees it.  The high half follows via the IRQ handshake.
-	bus_capture_lo_program_init(TRACE_LO_PIO, trace_lo_sm,
-				    static_cast<uint>(trace_lo_offset), GPIO_NMI);
-	bus_capture_hi_program_init(TRACE_HI_PIO, trace_hi_sm,
-				    static_cast<uint>(trace_hi_offset));
+	bus_capture_lo_program_init(trace_lo.pio, trace_lo.sm,
+				    static_cast<uint>(trace_lo.offset), GPIO_NMI);
+	bus_capture_hi_program_init(trace_hi.pio, trace_hi.sm,
+				    static_cast<uint>(trace_hi.offset));
+	// DAT fault sampler, on pio2 beside the trace's high half.  The SM is
+	// claimed rather than chosen: pio2 already runs task_output on sm0 and
+	// bus_capture_hi on sm1, and initialising one of those by hand would
+	// silently restart it with this program's configuration.
+	bus_fault.offset = pio_add_program(bus_fault.pio, &bus_fault_program);
+	if (bus_fault.offset < 0) {
+		printf("Core0 insufficient space for bus_fault program\n");
+		panic("Unable to proceed");
+	}
+	bus_fault.sm = pio_claim_unused_sm(bus_fault.pio, true);
+	bus_fault_program_init(bus_fault.pio, bus_fault.sm,
+			       static_cast<uint>(bus_fault.offset), GPIO_FAULT);
 
-	dma_channel_claim(TRACE_LO_DMA);
-	dma_channel_claim(TRACE_HI_DMA);
-	dma_channel_config tlo = dma_channel_get_default_config(TRACE_LO_DMA);
+	dma_channel_claim(trace_lo.data_channel);
+	dma_channel_claim(trace_hi.data_channel);
+	dma_channel_config tlo = dma_channel_get_default_config(trace_lo.data_channel);
 	channel_config_set_transfer_data_size(&tlo, DMA_SIZE_32);
 	channel_config_set_read_increment(&tlo, false);
 	channel_config_set_write_increment(&tlo, true);
-	channel_config_set_dreq(&tlo, pio_get_dreq(TRACE_LO_PIO, trace_lo_sm, false));
-	dma_channel_configure(TRACE_LO_DMA, &tlo, MC6809.trace_base(),
-			      &TRACE_LO_PIO->rxf[trace_lo_sm], TRACE_SIZE, false);
+	channel_config_set_dreq(&tlo, pio_get_dreq(trace_lo.pio, trace_lo.sm, false));
+	dma_channel_configure(trace_lo.data_channel, &tlo, MC6809.trace_base(),
+			      &trace_lo.pio->rxf[trace_lo.sm], TRACE_SIZE, false);
 	// 16 bits: the high bank is only GPIO 32-47, so a half-word read of the
 	// FIFO takes the whole sample and halves the buffer.
-	dma_channel_config thi = dma_channel_get_default_config(TRACE_HI_DMA);
+	dma_channel_config thi = dma_channel_get_default_config(trace_hi.data_channel);
 	channel_config_set_transfer_data_size(&thi, DMA_SIZE_16);
 	channel_config_set_read_increment(&thi, false);
 	channel_config_set_write_increment(&thi, true);
-	channel_config_set_dreq(&thi, pio_get_dreq(TRACE_HI_PIO, trace_hi_sm, false));
-	dma_channel_configure(TRACE_HI_DMA, &thi, MC6809.trace_hi_base(),
-			      &TRACE_HI_PIO->rxf[trace_hi_sm], TRACE_SIZE, false);
+	channel_config_set_dreq(&thi, pio_get_dreq(trace_hi.pio, trace_hi.sm, false));
+	dma_channel_configure(trace_hi.data_channel, &thi, MC6809.trace_hi_base(),
+			      &trace_hi.pio->rxf[trace_hi.sm], TRACE_SIZE, false);
 
 	MC6809.set_trace_callbacks(trace_hw_arm, trace_hw_stop, trace_hw_count);
-	printf("Core0 bus trace pio%u sm%u + pio%u sm%u, DMA %u/%u\n",
-	       PIO_NUM(TRACE_LO_PIO), trace_lo_sm, PIO_NUM(TRACE_HI_PIO), trace_hi_sm,
-	       TRACE_LO_DMA, TRACE_HI_DMA);
+	printf("Core0 bus trace pio%u sm%d + pio%u sm%d, DMA %d/%d\n",
+	       PIO_NUM(trace_lo.pio), trace_lo.sm, PIO_NUM(trace_hi.pio), trace_hi.sm,
+	       trace_lo.data_channel, trace_hi.data_channel);
 }
 
 static void
@@ -5121,9 +5255,14 @@ pio_shutdown()
 	irq_remove_handler(piodma_write.irq, dma_bus_write_irq_handler);
 
 	// RTI detect IRQ (pio1)
-	pio_set_irq0_source_enabled(rti_pio, pis_interrupt0, false);
-	irq_set_enabled(PIO1_IRQ_0, false);
-	irq_remove_handler(PIO1_IRQ_0, pio_rti_irq_handler);
+	pio_set_irq0_source_enabled(rti_detect.pio, RTI_PIO_IRQ_SOURCE, false);
+	irq_set_enabled(rti_detect.irq, false);
+	irq_remove_handler(rti_detect.irq, pio_rti_irq_handler);
+
+	// Bus fault detect IRQ (pio2)
+	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, false);
+	irq_set_enabled(bus_fault.irq, false);
+	irq_remove_handler(bus_fault.irq, pio_bus_fault_irq_handler);
 
 	// --- Bus trace pair (pio0 low half + pio2 high half) ---
 	// Everything the trace takes has to go back, or a second power-on cannot
@@ -5132,27 +5271,34 @@ pio_shutdown()
 	// add it again, and pio_add_program returns -1.  The state machines and
 	// the two fixed DMA channels leak the same way behind it.
 	MC6809.trace_stop();
-	dma_channel_abort(TRACE_LO_DMA);
-	dma_channel_abort(TRACE_HI_DMA);
-	dma_channel_unclaim(TRACE_LO_DMA);
-	dma_channel_unclaim(TRACE_HI_DMA);
-	bus_capture_hi_program_deinit(TRACE_HI_PIO, trace_hi_sm);
-	bus_capture_lo_program_deinit(TRACE_LO_PIO, trace_lo_sm);
-	pio_remove_program(TRACE_HI_PIO, &bus_capture_hi_program, static_cast<uint>(trace_hi_offset));
-	pio_remove_program(TRACE_LO_PIO, &bus_capture_lo_program, static_cast<uint>(trace_lo_offset));
+	dma_channel_abort(trace_lo.data_channel);
+	dma_channel_abort(trace_hi.data_channel);
+	dma_channel_unclaim(trace_lo.data_channel);
+	dma_channel_unclaim(trace_hi.data_channel);
+	bus_capture_hi_program_deinit(trace_hi.pio, trace_hi.sm);
+	bus_capture_lo_program_deinit(trace_lo.pio, trace_lo.sm);
+	pio_remove_program(trace_hi.pio, &bus_capture_hi_program, static_cast<uint>(trace_hi.offset));
+	pio_remove_program(trace_lo.pio, &bus_capture_lo_program, static_cast<uint>(trace_lo.offset));
 	// The offsets are the "trace hardware exists" guard for trace_hw_arm(),
 	// trace_hw_stop() and trace_hw_count(), so they go negative here.
-	trace_lo_offset = trace_hi_offset = -1;
+	trace_lo.offset = trace_hi.offset = -1;
 	trace_pending_start = false;
 	MC6809.set_trace_callbacks(nullptr, nullptr, nullptr);
+	bus_fault_program_deinit(bus_fault.pio, bus_fault.sm);
+	if (bus_fault.offset >= 0) {
+		pio_remove_program(bus_fault.pio, &bus_fault_program,
+				   static_cast<uint>(bus_fault.offset));
+		bus_fault.offset = -1;
+	}
+	bus_fault.sm = -1;
 
 	// --- RTI detect (pio1) ---
-	rti_detect_program_deinit(rti_pio, rti_pio_sm);
-	pio_remove_program(rti_pio, &rti_detect_program, pio_rti_offset);
+	rti_detect_program_deinit(rti_detect.pio, rti_detect.sm);
+	pio_remove_program(rti_detect.pio, &rti_detect_program, rti_detect.offset);
 
 	// --- Task output (pio2) ---
-	task_output_program_deinit(task_pio, task_pio_sm);
-	pio_remove_program(task_pio, &task_output_program, pio_task_offset);
+	task_output_program_deinit(task_output.pio, task_output.sm);
+	pio_remove_program(task_output.pio, &task_output_program, task_output.offset);
 
 	// --- Bus write SM + DMA ---
 	dma_channel_abort(piodma_write.address_channel);
@@ -5160,7 +5306,7 @@ pio_shutdown()
 	dma_channel_unclaim(piodma_write.address_channel);
 	dma_channel_unclaim(piodma_write.data_channel);
 	mc6809_bus_write_program_deinit(piodma_write.pio, piodma_write.sm);
-	pio_remove_program(piodma_write.pio, &mc6809_bus_write_program, pio_write_offset);
+	pio_remove_program(piodma_write.pio, &mc6809_bus_write_program, piodma_write.offset);
 
 	// --- Bus read SM + DMA ---
 	dma_channel_abort(piodma_read.address_channel);
@@ -5168,11 +5314,11 @@ pio_shutdown()
 	dma_channel_unclaim(piodma_read.address_channel);
 	dma_channel_unclaim(piodma_read.data_channel);
 	mc6809_bus_read_program_deinit(piodma_read.pio, piodma_read.sm);
-	pio_remove_program(piodma_read.pio, &mc6809_bus_read_program, pio_read_offset);
+	pio_remove_program(piodma_read.pio, &mc6809_bus_read_program, piodma_read.offset);
 
 	// --- E/Q clock (stop last — other SMs synchronise to it) ---
 	mc6809_clock_program_deinit(pio_clock.pio, pio_clock.sm);
-	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock_offset);
+	pio_remove_program(pio_clock.pio, &mc6809_clock_program, pio_clock.offset);
 
 	// --- Trace pins to hi-Z (not a consecutive run on version 2) ---
 	static constexpr uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
@@ -5260,9 +5406,21 @@ set_power()
 		// the guest stops being the one that faulted, so the mask goes down
 		// here with the rest of the per-run state.
 		dat_fault_block_countdown = 0u;
+		dat_fault_nmi_request = false;
+		nmi_assert_cycles = 0u;
 		gpio_put(GPIO_NMI_BLOCK, false);
 		reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(0u);
 		reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(0u);
+		// The sampler's interrupt goes back on with the mask, and its FIFO
+		// is emptied of anything the previous run left behind.  A guest
+		// that faulted and never cleared the mask would otherwise hand a
+		// disabled fault interrupt to whatever ran next.
+		if (bus_fault.sm >= 0) {
+			pio_sm_clear_fifos(bus_fault.pio, static_cast<uint>(bus_fault.sm));
+			pio_interrupt_clear(bus_fault.pio, BUS_FAULT_PIO_IRQ);
+			pio_set_irq0_source_enabled(bus_fault.pio,
+						    BUS_FAULT_PIO_IRQ_SOURCE, true);
+		}
 	});
 	MC6809.set_task_pin_callback(task_pins_update);
 	printf("Core0 guest powered on and initialised\n");

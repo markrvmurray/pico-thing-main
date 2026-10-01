@@ -37,6 +37,10 @@ const char *run_state_string[] = {
 	foreach_runstate(enum_list_strings)
 };
 
+// The one instance.  See the note in mc6809.h: a class member rather than a
+// function-local static, so no use site pays for an initialisation guard.
+mc6809 mc6809::instance;
+
 mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 {
 	old_bus_state = BUS_RUNNING;
@@ -62,23 +66,6 @@ mc6809::task_initialise()
 	reg[SYSTEM_TASK] = static_cast<uint8_t>(0u);
 	task_stack_ptr = 0x00u;
 	task = 0u;
-}
-
-// Done when the guest changes the task register; task pins are
-// driven by the PIO task_output program in pico_thing.cpp.
-uint8_t
-mc6809::task_change(uint8_t new_task)
-{
-	new_task &= TASK_PINS_MASK;
-	task = new_task;
-	return new_task;
-}
-
-// Return the active task number
-uint8_t
-mc6809::task_get() const
-{
-	return task;
 }
 
 bool
@@ -290,26 +277,6 @@ mc6809::release()
 	HALT_DEASSERT;
 }
 
-void
-mc6809::apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS])
-{
-	if (interrupt_refcount[INTERRUPT_NMI] > 0u) {
-		ASSERT_NMI;
-		interrupt_refcount[INTERRUPT_NMI] = 0u;
-	} else
-		DEASSERT_NMI;
-	if (interrupt_refcount[INTERRUPT_FIRQ] > 0u) {
-		ASSERT_FIRQ;
-		interrupt_refcount[INTERRUPT_FIRQ] = 0u;
-	} else
-		DEASSERT_FIRQ;
-	if (interrupt_refcount[INTERRUPT_IRQ] > 0u) {
-		ASSERT_IRQ;
-		interrupt_refcount[INTERRUPT_IRQ] = 0u;
-	} else
-		DEASSERT_IRQ;
-}
-
 // The PIO RTI detector has spotted an RTI opcode fetch.  The RTI has not
 // executed yet, so the interrupt is unwound here - nesting depth and task
 // stack - but any task restore has to wait out the instruction: 15 E cycles
@@ -345,21 +312,19 @@ mc6809::apply_rti()
 	}
 }
 
-// Called once per Q-rising from the ISR. When the countdown expires,
-// restore the previous task and update task pins.  With
-// PICO_THING_RTI_TASK_RESTORE off the countdown is never armed, so this is one
-// test and nothing else.
+// The deferred task restore's countdown has expired: put the interrupted task
+// back.  Reached from tick_rti_countdown(), which is inline in the header
+// because it runs on every Q-rising; this half runs once per RTI at most, so
+// it stays out of line and out of the ISR's instruction footprint.
 void
-mc6809::tick_rti_countdown()
+mc6809::rti_task_expired()
 {
-	if (rti_task_countdown > 0u && --rti_task_countdown == 0u) {
-		task = rti_pending_task;
-		reg[SYSTEM_TASK] = rti_pending_task;
-		if (task_pin_callback)
-			task_pin_callback(rti_pending_task);
-		if (nesting_depth == 0u)
-			run_state = RS_RUNNING;
-	}
+	task = rti_pending_task;
+	reg[SYSTEM_TASK] = rti_pending_task;
+	if (task_pin_callback)
+		task_pin_callback(rti_pending_task);
+	if (nesting_depth == 0u)
+		run_state = RS_RUNNING;
 }
 
 static uart_port_state port_state[2];

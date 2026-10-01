@@ -29,13 +29,30 @@
 
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.
+;
+; The last instruction carries "irq prev set 0" as well as its side-set, so it
+; costs nothing: all four were nop placeholders for the side-set, and the loop
+; is still four PIO clocks, so E's frequency and duty are untouched.  It ticks
+; the bus_fault sampler on pio2 once per E cycle.
+;
+; THE PHASE IS THE POINT.  That instruction is the one that drops Q while E is
+; still high, and Q-falling is where the DAT fault signal must be sampled: the
+; Fault line is a registered output of the DAT GAL clocked on Q-RISING, so
+; sampling at Q-rising would read it at the instant it changes, while the 6809
+; guarantees A0-A15, R/!W, BA and BS are stable from before Q rises until about
+; 20 ns after E falls.  Q-falling therefore sits in the middle of a window
+; where the registered signal and the live bus pins are both settled and both
+; describe the same cycle.
+;
+; "prev" from pio0 is pio2 because the three blocks wrap.  If this program is
+; ever moved to another block, the tick lands somewhere else without a word.
 .program	mc6809_clock
 .side_set	2
 .wrap_target
-	nop		side 0b00	; Q=0, E=0
-	nop		side 0b10	; Q=1, E=0
-	nop		side 0b11	; Q=1, E=1
-	nop		side 0b01	; Q=0, E=1
+	nop			side 0b00	; Q=0, E=0
+	nop			side 0b10	; Q=1, E=0
+	nop			side 0b11	; Q=1, E=1
+	irq	prev set 0	side 0b01	; Q=0, E=1
 .wrap
 
 % c-sdk {
@@ -238,7 +255,7 @@ check_data:
 	mov	x isr			; X = D[7:0]
 	mov	isr null		; Clear ISR for next use
 	jmp	x!=y wait_lic		; Not RTI → back to LIC sampling
-	irq	set 0			; RTI detected — signal the Pico
+	irq	set 1			; RTI detected — signal the Pico
 .wrap				; back to wait_lic (consecutive LIC caught next cycle)
 
 % c-sdk {
@@ -336,7 +353,7 @@ trigger:
 	wait	1 gpio GPIO_E		; resynchronise
 	wait	0 gpio GPIO_E		; E falling
 	in	pins 32			; autopush -> RX FIFO -> DMA
-	irq	prev set 0		; wake the high half (wraps pio0 -> pio2)
+	irq	prev set 2		; wake the high half (wraps pio0 -> pio2)
 .wrap
 
 ; Bus capture (high half) — GPIO 32-47, 16 bits per E cycle.
@@ -348,7 +365,7 @@ trigger:
 ; for the whole cycle, unlike the data bus.
 .program bus_capture_hi
 .wrap_target
-	wait	1 irq 0			; set by the low half; satisfied wait clears it
+	wait	1 irq 2			; set by the low half; satisfied wait clears it
 	in	pins 16			; autopush -> RX FIFO -> DMA
 .wrap
 
@@ -403,6 +420,46 @@ bus_capture_lo_program_deinit(PIO pio, uint sm)
 
 static inline void
 bus_capture_hi_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	pio_sm_unclaim(pio, sm);
+}
+
+%}
+
+; FAULT pin interrupt, sampled on the Q falling edge, signalled by IRQ.
+;
+; This runs on a PIO whose GPIO base is 16, so it can see the GPIO 16-47
+; pins, but NOT Q, which is GPIO 1 and outside that window.  Hence the
+; IRQ handshake rather than a second edge wait.  The extra couple of
+; clocks of lag do not matter: everything in the high word is stable
+; for the whole cycle.
+.program bus_fault
+.wrap_target
+next_cycle:
+	wait	1 irq 0			; set by the low half; satisfied wait clears it
+	jmp	pin got_fault		; An unallocated RAM block has been addressed
+	jmp	next_cycle		; All is well
+got_fault:
+	in	pins 16			; grab the address/page bits A13-A15
+	irq	set 3			; Signal the Pico
+.wrap
+
+% c-sdk {
+
+// FAULT pin interrupt, sampled on the Q falling edge, signalled by IRQ.
+static inline void
+bus_fault_program_init(PIO pio, uint sm, uint offset, uint trigger_pin)
+{
+	pio_sm_config c = bus_fault_program_get_default_config(offset);
+	sm_config_set_in_pins(&c, 32);			// sample GPIO 32-47
+	sm_config_set_in_shift(&c, false, true, 16);	// shift left, autopush at 16
+	sm_config_set_jmp_pin(&c, trigger_pin);
+	pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void
+bus_fault_program_deinit(PIO pio, uint sm)
 {
 	pio_sm_set_enabled(pio, sm, false);
 	pio_sm_unclaim(pio, sm);

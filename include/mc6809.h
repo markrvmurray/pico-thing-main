@@ -105,6 +105,7 @@ private:
 	volatile uint8_t nesting_depth = 0;
 	volatile uint8_t rti_task_countdown = 0;	// E-cycle countdown for deferred task restore
 	uint8_t rti_pending_task = 0;			// task to restore when countdown expires
+	void rti_task_expired();			// the countdown reached zero: put the task back
 	volatile uint8_t task_stack[MAX_INT_NEST_DEPTH]{};
 	std::atomic<uint16_t> task_stack_ptr{0u};
 	volatile bool busy, lic, vma;
@@ -143,10 +144,27 @@ private:
 	mc6809(); // no public constructor
 	~mc6809() = default; // no public destructor
 public:
-	static mc6809& getInstance() {
-		static mc6809 instance;
-		return instance;
-	}
+	// The one instance, defined in mc6809.cpp and reached through the MC6809
+	// macro below.  It is a static data member rather than a function-local
+	// static inside getInstance() because a function-local static with a
+	// non-trivial constructor carries a thread-safe-initialisation guard, and
+	// that guard is consulted at EVERY use site: load the guard byte, test
+	// it, branch past the initialiser, then do the work.  There were 26 such
+	// sequences in the Q-rising handler alone, which runs two million times a
+	// second at 1 MHz E.  A class member is initialised once before main and
+	// has no guard, and its address is a link-time constant.
+	//
+	// It cannot be constant-initialised - the constructor assigns to volatile
+	// members, which constant evaluation does not allow - so it is still
+	// dynamically initialised at startup.  Nothing else's constructor may
+	// touch it: no translation unit in this tree does.
+	//
+	// A static member can use the private constructor, so there is still no
+	// way to make a second one.
+	static mc6809 instance;
+	// Kept for any caller that wants the old spelling; no guard, no local
+	// static, and it folds away to the address of the member above.
+	static mc6809& getInstance() { return instance; }
 	mc6809(const mc6809&) = delete;
 	mc6809& operator=(const mc6809&) = delete;
 	void set_busy_lic_avma(uint8_t value)
@@ -198,20 +216,38 @@ public:
 	void init();
 	void deinit();
 	void set_setup_callback(setup_callback_t cb) { setup_callback = cb; }
-	uint8_t task_change(uint8_t new_task);
+	// Called from the DMA write ISR on every guest write to $FFC0, so both
+	// of these are here rather than out of line: task_get() compiled to four
+	// bytes reached by a call, and task_change() to ten.
+	uint8_t task_change(uint8_t new_task)
+	{
+		new_task &= TASK_PINS_MASK;
+		task = new_task;
+		return new_task;
+	}
 	void set_task_pin_callback(task_pin_cb_t cb) { task_pin_callback = cb; }
 	void apply_rti();
-	void tick_rti_countdown();	// called per Q-rising from ISR
+	// Called once per Q-rising from the ISR - two million times a second at
+	// 1 MHz E - so the idle test is inline here and only the expiry, which
+	// happens once per RTI at most, is a call.  With
+	// PICO_THING_RTI_TASK_RESTORE off the countdown is never armed at all,
+	// and this is one load and one branch.
+	void tick_rti_countdown()
+	{
+		if (rti_task_countdown == 0u)
+			return;
+		if (--rti_task_countdown == 0u)
+			rti_task_expired();
+	}
 
 	[[nodiscard]] bool assert_powered() const;
 	[[nodiscard]] bool assert_stopped() const;
-	[[nodiscard]] uint8_t task_get() const;
+	[[nodiscard]] uint8_t task_get() const { return task; }
 	void start();
 	[[nodiscard]] bool start_with_timeout(uint32_t timeout_ms, bool sync_means_stop = true);
 	static void stop();
 	static void halt();
 	static void release();
-	static void apply_interrupts(uint32_t interrupt_refcount[NUM_INTERRUPTS]);
 	static void uart_task(bool suppress_cdc_read = false);
 	void preserve_state();
 	void restore_state();
@@ -230,7 +266,7 @@ public:
 	[[nodiscard]] uint8_t get_nesting_depth() const { return nesting_depth; }
 	[[nodiscard]] uint16_t get_task_stack_ptr() const { return task_stack_ptr; }
 	[[nodiscard]] uint8_t get_task_history(uint16_t i) const { return (i < MAX_INT_NEST_DEPTH) ? task_stack[i] : 0u; }
-	friend void gpio_clock_eq_irq_handler();
+	friend void gpio_q_irq_handler();
 	friend void dma_bus_read_irq_handler();
 	friend void dma_bus_write_irq_handler();
 	friend void process_command(char *buf);
@@ -239,4 +275,4 @@ public:
 // Tidy up the singleton access semantics
 // auto MC6809() { return &processor::getInstance(); }
 // processor *MC6809 = processor::getInstance();
-#define MC6809 mc6809::getInstance()
+#define MC6809 mc6809::instance

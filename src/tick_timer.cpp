@@ -80,9 +80,3 @@ tick_timer::reset()
 	nmi_countdown = 0;
 	reg[status_offset] = static_cast<uint8_t>(0x00u);
 }
-
-interrupt
-tick_timer::has_interrupt() const
-{
-	return irq_pending ? INTERRUPT_IRQ : INTERRUPT_NONE;
-}

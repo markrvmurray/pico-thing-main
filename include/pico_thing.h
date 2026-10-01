@@ -111,12 +111,22 @@ enum {
 
 void init_pins_range(uint8_t base, uint8_t count);
 
+// One PIO program and everything claimed on its behalf.  Every program in
+// this firmware has one of these, so that a block, a state machine, an
+// instruction offset, a DMA channel or an interrupt line is never named by a
+// loose global or a bare constant: a mismatch between any two of them is
+// silent on hardware and expensive to find.
+//
+// -1 means "not claimed" or "the program has none", so a teardown can tell an
+// unclaimed resource from resource zero, and a premature use shows up as a
+// bad index rather than quietly touching state machine 0 or DMA channel 0.
 struct pio_dma {
-	PIO pio;
-	int sm;
-	int address_channel;
+	PIO pio;		// the block the program runs on
+	int sm;			// state machine, claimed at power-on
+	int offset;		// instruction offset from pio_add_program()
+	int address_channel;	// DMA channels feeding the program
 	int data_channel;
-	uint32_t irq;
+	int irq;		// NVIC line this program's IRQ drives
 };
 
 union bus_pins {

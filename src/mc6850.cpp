@@ -179,8 +179,9 @@ mc6850::sync_status()
 inline void
 mc6850::sync_transmit()
 {
-	transmit_buffer_empty = tx.has_space();
-	cts_deasserted = (tx.get_level() > CTS_THRESHOLD) || host_cts_deasserted;
+	const SpscQueue::level_space tx_state = tx.get_level_space();
+	transmit_buffer_empty = tx_state.space;
+	cts_deasserted = (tx_state.level > CTS_THRESHOLD) || host_cts_deasserted;
 	sync_status();
 }
 
@@ -204,19 +205,6 @@ mc6850::set_host_cts(bool deasserted)
 		host_cts_deasserted = deasserted;
 		irq_dirty = true;
 	}
-}
-
-// Called from Core 1 write ISR to update RTS immediately, before the
-// write_ring delivers the full guest_control() call.  This closes the
-// window where has_interrupt() could stage another byte after the 6809
-// deasserted RTS but before the for(;;) loop processed the control write.
-void
-mc6850::control_written_isr(uint8_t val)
-{
-	mc6850_control cr = {val};
-	if (cr.divide_select != 0b11u)		// not a reset
-		rts_deasserted = (cr.tx_irq == 0b10u);
-	irq_dirty = true;
 }
 
 void
@@ -303,17 +291,17 @@ mc6850::guest_receive()
 }
 
 interrupt
-mc6850::has_interrupt()
+mc6850::has_interrupt_recompute()
 {
-	// Fast path: if no state has changed since the last call, return
-	// the cached result without recomputing anything.
-	if (!irq_dirty)
-		return cached_irq_result;
+	// The caller has already found irq_dirty set; see the inline half in
+	// mc6850.h.
 	irq_dirty = false;
 
 	// Absorb TX queue state refresh (formerly update_task/sync_transmit).
-	transmit_buffer_empty = tx.has_space();
-	cts_deasserted = (tx.get_level() > CTS_THRESHOLD) || host_cts_deasserted;
+	// One read of the queue's indices, not two: see get_level_space().
+	const SpscQueue::level_space tx_state = tx.get_level_space();
+	transmit_buffer_empty = tx_state.space;
+	cts_deasserted = (tx_state.level > CTS_THRESHOLD) || host_cts_deasserted;
 
 	// Stage the next byte if the slot is empty. Called every Q-rising edge,
 	// so RDRF is current before apply_interrupts() drives /IRQ. There is an

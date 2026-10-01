@@ -33,6 +33,21 @@ public:
 	{
 		return (head.load(std::memory_order_acquire) - tail.load(std::memory_order_acquire)) & MASK;
 	}
+	// The level and whether there is room, from one read of the indices.
+	// is_full() is exactly level == MASK - if head + 1 == tail then
+	// head - tail == MASK, both modulo CAPACITY - so a caller that wants
+	// both, as the ACIA's status recompute does on every dirty Q-rising,
+	// need not load head and tail twice.
+	struct level_space {
+		uint16_t level;
+		bool space;
+	};
+	[[nodiscard]] level_space get_level_space() const
+	{
+		const uint16_t level = (head.load(std::memory_order_acquire)
+					- tail.load(std::memory_order_acquire)) & MASK;
+		return { level, level != MASK };
+	}
 	uint8_t get()
 	{
 		auto t = tail.load(std::memory_order_relaxed);
@@ -115,6 +130,7 @@ private:
 	bool loopback_queue = false;	// divide_select==0b10 (÷64): TX→RX queue
 	volatile bool tx_write_pending = false;	// set by write ISR, cleared by guest_transmit()
 	volatile bool irq_dirty = true;		// set by any state change, cleared by has_interrupt()
+	[[nodiscard]] interrupt has_interrupt_recompute();
 	volatile bool host_cts_deasserted = false;  // set by Core 0 when USB host can't accept data
 	[[nodiscard]] uint8_t status_byte() const;
 	void sync_status();
@@ -123,7 +139,17 @@ public:
 	mc6850(uint16_t ctl_off, uint16_t data_off);
 	void reset();
 	void write_received();		// called from Core 1 write ISR: clears TDRE until guest_transmit() runs
-	void control_written_isr(uint8_t val);	// called from Core 1 write ISR: updates RTS immediately
+	// Called from the Core 1 write ISR on every guest write to a control
+	// register, so it is here rather than out of line.  RTS must take effect
+	// before the for(;;) loop processes the write: otherwise has_interrupt()
+	// can stage another byte in the window after the 6809 deasserted RTS.
+	void control_written_isr(const uint8_t val)
+	{
+		const mc6850_control cr = {val};
+		if (cr.divide_select != 0b11u)		// not a reset
+			rts_deasserted = (cr.tx_irq == 0b10u);
+		irq_dirty = true;
+	}
 	uint host_transmit_level_avail() { return (CONSOLE_QUEUE_LEN - 1) - rx.get_level(); }
 	uint transmit_level() { return rx.get_level(); }
 	uint host_receive_level_avail() { return tx.get_level(); }
@@ -148,7 +174,17 @@ public:
 	void guest_transmit(uint8_t data);
 	void guest_control(uint8_t val);
 	void rx_read_fast_path();	// called from read ISR: clears RDRF immediately
-	[[nodiscard]] interrupt has_interrupt();
+	// Called once per Q-rising per ACIA from Core 1's loop - two million
+	// calls a second between the two of them at 1 MHz E - and the answer is
+	// usually the cached one.  That test is here so the common case is a
+	// load, a branch and a return; the recompute, which is an order of
+	// magnitude bigger, stays out of line.
+	[[nodiscard]] interrupt has_interrupt()
+	{
+		if (!irq_dirty)
+			return cached_irq_result;
+		return has_interrupt_recompute();
+	}
 	[[nodiscard]] bool is_rts_deasserted() const { return rts_deasserted; }
 	void set_host_cts(bool deasserted);
 	[[nodiscard]] uint16_t get_ctl_offset() const { return ctl_offset; }
