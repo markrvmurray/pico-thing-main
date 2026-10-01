@@ -2237,14 +2237,22 @@ console_has_interrupt()
 // reference reading low inflates every voltage and deflates every
 // temperature, which is exactly the pair of symptoms a board shows when this
 // is left at its nominal value.  Measure ADC_AVDD and set it here.
-static constexpr float ADC_VREF_VOLTS = 3.2464f;	// A101 pin 53 (no test point), replacement version 2 board
+// Derived rather than probed, 2026-10-01: pin 53 has no test point, so this
+// comes from the divider midpoint instead - 2.5014V metered at GPIO 46 against
+// a quiet mean of 3158.88 counts gives 2.5014 x 4096 / 3158.88 = 3.2435.  The
+// quiet mean is the one to use: halted and unpowered agreed to 0.01 counts
+// (3158.89 and 3158.88, SD 1.6 and 1.2), while the guest serving the bus reads
+// 3533 with SD 49 - see the serving artefact note.  The previous 3.2464, taken
+// on pin 53 in September, left the supply reading 5 mV high; this leaves it
+// 0.1 mV high.
+static constexpr float ADC_VREF_VOLTS = 3.2435f;	// 2.5014V at GPIO 46 / 3158.88 counts, quiet
 
 // What the divider feeding GPIO 46 actually divides the 5V line by.  It is a
 // per-board figure: the first version 2 board measured 1.9407, the replacement
 // measures 2.0001, from 5.0005V at the rail against 2.5001V at GPIO 46.  Unlike
 // the reference it affects only the supply reading, so the two can be told
 // apart by whether the die temperature moves with it.
-static constexpr float BUS_DIVIDER_RATIO = 2.0001f;	// 5.0005V rail / 2.5001V pin
+static constexpr float BUS_DIVIDER_RATIO = 2.0000f;	// 5.0027V rail / 2.5014V pin, 2026-10-01
 
 // The converter's zero error, in counts, subtracted before anything is scaled.
 // It is not a per-channel figure: the same offset appears on the supply
@@ -2252,13 +2260,19 @@ static constexpr float BUS_DIVIDER_RATIO = 2.0001f;	// 5.0005V rail / 2.5001V pi
 // reference error - a reference error scales, an offset shifts, and no single
 // reference value fits both channels while one offset fits both.
 //
-// Measured on the replacement version 2 board it is zero: GPIO 46 at 2.5001V
-// should read 2.5001 x 4096 / 3.2464 = 3154.4 counts and reads 3154.7, a
-// difference well inside the two counts a reading wanders by at rest.  With
-// zero, the die channel's 870 counts are 36.6C.  The first board needed 54,
-// turning its 928 counts into 31.8C against a 25.0C ambient, so this too is a
-// per-board figure.
-static constexpr float ADC_OFFSET_COUNTS = 0.0f;	// 3154.7 counts read for 3154.4 expected
+// Still zero on the replacement version 2 board, and deliberately so rather
+// than by measurement, because one pin voltage cannot separate an offset from
+// a reference error: 2.5014V at GPIO 46 should read 3155.9 counts against the
+// old reference and reads 3158.88, which fits either a 0.09% lower reference
+// or a +3 count offset equally well.  The die channel cannot break the tie
+// either - 39.3C one way, 40.3C the other, both plausible.  With nothing to
+// choose between them, the reference carries it and this stays at zero, which
+// is the fewer moving parts.  Separating them needs a second, different pin
+// voltage.
+//
+// The first board needed 54 counts, turning its 928 into 31.8C against a 25.0C
+// ambient, so this is a per-board figure and a real offset can be large.
+static constexpr float ADC_OFFSET_COUNTS = 0.0f;	// not distinguishable from the reference at one point
 
 // Counts to the voltage on the pin: a 12-bit conversion against the reference,
 // with the converter's own zero error taken out first.
@@ -2608,12 +2622,26 @@ status_print(const status_snapshot_t *s)
 	       s->power ? "HIGH" : "low",
 	       !s->reset ? "high" : "LOW",
 	       !s->halt ? "high" : "LOW");
+	// Both ADC channels read high whenever the Pico is answering bus reads,
+	// and only RS_HALTED and RS_UNPOWERED have been measured against a
+	// meter - those are the two the calibration constants were derived from.
+	// Everything else serves the bus, where the supply reads 0.54 to 0.66V
+	// high depending on what the guest is doing and the die about 123 counts
+	// high, for reasons not yet understood.  Saying so beats printing -18C
+	// as though it were a temperature, which is a misreading I made myself
+	// before working out what the figures meant.
+	const bool adc_quiet = s->run_state == RS_HALTED
+			    || s->run_state == RS_UNPOWERED;
+	static constexpr const char *adc_warning =
+		"   <- the bus is being served; both ADC channels read high";
 #if PICO_THING_BOARD_VERSION >= 2
-	printf("BUS POWER: %.2fV (%u counts)\n",
-	       adc_bus_volts(s->voltage), s->voltage);
+	printf("BUS POWER: %.2fV (%u counts)%s\n",
+	       adc_bus_volts(s->voltage), s->voltage,
+	       adc_quiet ? "" : adc_warning);
 #endif
-	printf("PICO TEMPERATURE: %.1fC (%u counts)\n",
-	       adc_die_celsius(s->temperature), s->temperature);
+	printf("PICO TEMPERATURE: %.1fC (%u counts)%s\n",
+	       adc_die_celsius(s->temperature), s->temperature,
+	       adc_quiet ? "" : adc_warning);
 	const char part = s->qfn60 ? 'A' : 'B';
 	if (const chip_stepping_t *stepping = chip_stepping(s->rom_version)) {
 		if (stepping->revision == s->chip_revision)
@@ -3275,6 +3303,25 @@ status_done:
 		// switches at all.  Unpowering power-cycles the guest, so its RAM is
 		// lost.  Readings are buffered and printed at the end, because powering
 		// down and back up prints progress that would otherwise split the CSV.
+		//
+		// ADC_RAM_LOOP is the discriminator the other conditions cannot be.
+		// LOOP_RW is five bytes of LDA extended and BRA, and it runs at
+		// $FFE0 - inside the Pico's own window - so five of its eight cycles
+		// are opcode and operand fetches that the PICO answers, and only the
+		// data read reaches RAM.  Reset is the same story at one fetch per
+		// cycle, and the faulting loop likewise.  All three therefore serve
+		// the bus at about the same rate, which is why their agreeing on an
+		// offset proves nothing: it cannot separate "the Pico is serving"
+		// from "the Pico is serving at this rate".
+		//
+		// This condition runs byte-for-byte the same loop from RAM at $2000,
+		// reading the same $20D0.  The bus is every bit as busy - same
+		// instruction, same address lines, same eight-cycle period - but the
+		// Pico drives D0-D7 not once.  If the offset survives, the cause is
+		// current through the ground return or something else the bus does,
+		// and no amount of serving less will help.  If it vanishes, the cause
+		// is the Pico answering reads, and the data-bus drive strength is
+		// where to look next.
 #if PICO_THING_BOARD_VERSION < 2
 		// Version 1 has the power enable on GPIO 46, not a supply divider,
 		// so there is no second channel to compare the die sensor against
@@ -3286,9 +3333,30 @@ status_done:
 		static constexpr uint32_t ADC_BURST = 64u;
 		static constexpr uint8_t ADC_BURST_PAGE = 1u;	// the page condition 2 unmaps
 		static constexpr uint32_t ADC_HALT_TIMEOUT_MS = 100u;
+		// Discarded conversions before each condition's burst.  The supply
+		// channel's first readings come in low and climb - 3210 rising to
+		// 3320 over the first twelve samples of the RAM-loop condition,
+		// measured 2026-10-01 - which dragged that condition's mean down by
+		// about 10 counts.  The die channel is settled from its first sample,
+		// so whatever charges up belongs to the divider and the converter
+		// rather than to the board, and the guest settling for longer before
+		// sampling would not have touched it: the ramp is inside the burst.
+		// Running the same mux-and-convert pattern for a while first, and
+		// keeping none of it, puts the channel at equilibrium before sample
+		// zero.
+		static constexpr uint32_t ADC_WARMUP = 64u;
+		// LDA $20D0 / BRA -5, assembled by hand: the same instructions
+		// LOOP_RW runs, at the same target, but placed in RAM.  $2000 and
+		// $20D0 are both in ADC_BURST_PAGE, so one DAT entry maps the lot.
+		static constexpr uint16_t ADC_RAM_LOOP_ADDR = 0x2000u;
+		static const uint8_t adc_ram_loop[] = {
+			0xB6u, 0x20u, 0xD0u,	// LDA $20D0
+			0x20u, 0xFBu		// BRA -5, back to $2000
+		};
 		enum : uint8_t {
 			ADC_RESET,		// guest held in reset
 			ADC_LOOP,		// LOOP_RW reading a mapped page
+			ADC_RAM_LOOP,		// the same loop, but resident in RAM
 			ADC_FAULTING,		// LOOP_RW reading an unmapped page
 			ADC_HALTED,		// LOOP_RW halted, bus released
 			ADC_UNPOWERED,		// guest rail off
@@ -3329,11 +3397,30 @@ status_done:
 					MC6809.stop();
 					sleep_ms(1u);
 				}
-				if (cond != ADC_RESET) {
+				if (cond == ADC_RAM_LOOP) {
+					// Lay the loop down in RAM and start the guest on it
+					// rather than on the snippet.  copy() runs a snippet
+					// of its own, so this has to be the last thing before
+					// the vector is pointed at RAM.
+					if (!copy(OUTWARDS, sizeof adc_ram_loop,
+						  ADC_RAM_LOOP_ADDR, adc_ram_loop))
+						printf("Could not write the RAM loop - "
+						       "condition %u is not what it claims\n",
+						       ADC_RAM_LOOP);
+					MC6809.stop();
+					sleep_ms(1u);
+					reg[REGISTER_VECTOR_RESET_OFFSET] = ADC_RAM_LOOP_ADDR;
+					MC6809.start();
+					sleep_ms(2u);	// let the loop get going before sampling
+				} else if (cond != ADC_RESET) {
 					snippet_copy(LOOP_RW);
 					reg[REGISTER_SNIPPET_OFFSET + 0u] = static_cast<uint8_t>(0xB6u);	// LDA extended
 					reg[REGISTER_SNIPPET_OFFSET + 1u] =
 						static_cast<uint8_t>(ADC_BURST_PAGE << 5);
+					// Explicitly, not by leftover: the RAM condition above
+					// points this at RAM, and the next condition must not
+					// inherit that.
+					reg[REGISTER_VECTOR_RESET_OFFSET] = REGISTER_SNIPPET;
 					MC6809.start();
 					sleep_ms(2u);	// let the loop get going before sampling
 				}
@@ -3345,6 +3432,18 @@ status_done:
 						printf("Guest did not halt within %" PRIu32 "ms - sampled anyway\n",
 						       ADC_HALT_TIMEOUT_MS);
 				}
+			}
+
+			// Warm the channel up, keeping nothing: see ADC_WARMUP.  The
+			// pattern matches the burst below exactly, so the converter and
+			// the mux see the same conditions either side of sample zero.
+			for (uint32_t n = 0u; n < ADC_WARMUP; n++) {
+				adc_select_input(GPIO_POWER_ADC - ADC_BASE_PIN);
+				(void) adc_read();
+				(void) adc_read();
+				adc_select_input(NUM_ADC_CHANNELS - 1);
+				(void) adc_read();
+				(void) adc_read();
 			}
 
 			for (uint32_t n = 0u; n < ADC_BURST; n++) {
@@ -3370,7 +3469,9 @@ status_done:
 		if (!set_power())
 			printf("Guest not powered back on - use 'power on'\n");
 
-		printf("cond 0 = guest in reset, 1 = LOOP_RW running, 2 = faulting loop, 3 = halted, 4 = unpowered\n");
+		printf("cond 0 = guest in reset, 1 = LOOP_RW at $FFE0 (Pico serves the fetches),\n"
+		       "     2 = the same loop in RAM at $2000 (Pico serves nothing),\n"
+		       "     3 = faulting loop, 4 = halted, 5 = unpowered\n");
 		printf("cond,n,bus,die\n");
 		for (uint8_t cond = 0u; cond < ADC_CONDITIONS; cond++)
 			for (uint32_t n = 0u; n < ADC_BURST; n++)
