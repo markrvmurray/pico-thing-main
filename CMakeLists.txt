@@ -246,6 +246,37 @@ set(PICO_THING_RTI_TASK_RESTORE 0 CACHE STRING
 	"Restore the interrupted task ~15 E cycles after an RTI (0 = the guest owns the task register)")
 message(STATUS "Pico-Thing RTI task restore ${PICO_THING_RTI_TASK_RESTORE}")
 
+# The UART console's baud rate, on GPIO 30/31.  This is the ONLY real baud rate
+# in the firmware, and the UART is the ONLY console: stdio is wired to the UART
+# alone (see pico_enable_stdio_usb 0 / pico_enable_stdio_uart 1 below), and the
+# two USB CDC ports belong entirely to the guest's ACIAs.  Those ignore
+# whatever line coding the host asks for, and the guest's own divide-select
+# bits pick loopback and reset rather than a rate.
+#
+# 115200 because the cost of a faster rate falls on input, where there is no
+# workaround: the UART has no flow control and it is the only place to paste
+# anything, so bulk input cannot be sent by some better-behaved route.  32
+# bytes of RX FIFO is 2.78 ms of runway at 115200 against 1.39 ms at 230400,
+# and Core 0 blocks for longer than that in several places - the break settle,
+# adcdump's sleeps, snippet timeouts - so characters pasted during one of
+# those go over the side with nothing to throttle the sender.  S-records are
+# checksummed (srec.cpp), so a mangled record is refused rather than loaded,
+# which is the only protection there is.
+#
+# The price is paid on output.  Every printf blocks Core 0 once the 32-byte TX
+# FIFO fills, and Core 0 is the loop that also runs usb_poll() and the CDC pump
+# for the guest's two serial ports, so a trace dump or a long status page costs
+# the guest DriveWire throughput.  A character costs 86.8 us here against 43.4
+# us at 230400, which doubles that penalty.  Raise this to 230400 if printf
+# latency ever hurts the guest more than slow pasting hurts.
+#
+# The rate comes from clk_peri, which must stay at 48 MHz: 115200 wants
+# IBRD 26 / FBRD 3, giving 115177 baud, -0.02%.  `st` reports clk_peri, which
+# is how a PLL change that silently drags it would be caught.
+set(PICO_THING_CONSOLE_BAUD 115200 CACHE STRING
+	"UART console baud rate on GPIO 30/31 (the CDC ports ignore baud entirely)")
+message(STATUS "Pico-Thing UART console ${PICO_THING_CONSOLE_BAUD} baud")
+
 # The ADC calibration - reference voltage, divider ratio and converter zero
 # error - is deliberately not settable here.  Those three are measurements of
 # one physical board, not choices about how to build it, and as cache
@@ -264,6 +295,7 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_DAT_FAULT_AUTO_BLOCK=${PICO_THING_DAT_FAULT_AUTO_BLOCK}
 	PICO_THING_DAT_FAULT_BLOCK_DELAY=${PICO_THING_DAT_FAULT_BLOCK_DELAY}u
 	PICO_THING_RTI_TASK_RESTORE=${PICO_THING_RTI_TASK_RESTORE}
+	PICO_THING_CONSOLE_BAUD=${PICO_THING_CONSOLE_BAUD}
 )
 
 target_link_libraries(pico-thing

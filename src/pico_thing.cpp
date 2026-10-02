@@ -61,9 +61,18 @@ extern void            cmd_yy_reset_str_pool(void);
 // I'm really pushing my luck with this.
 #define SYS_CLK_DEFAULT 320000000
 
-// Default pico uart for command-line interactive access
+// The Pico's command console, and the only one: stdio is wired to this UART
+// alone, while both USB CDC ports belong to the guest's ACIAs.  So this is
+// also the only real baud rate in the firmware - the CDC ports ignore the
+// host's line coding, and the guest's divide-select bits pick loopback and
+// reset rather than a rate.
+// Set from CMake with -DPICO_THING_CONSOLE_BAUD=<baud>; see the note there for
+// why the default is 115200 and what a faster rate would cost on input.
 #define CONSOLE uart0
-#define CONSOLE_BAUDRATE 115200
+#ifndef PICO_THING_CONSOLE_BAUD
+#define PICO_THING_CONSOLE_BAUD 115200
+#endif
+#define CONSOLE_BAUDRATE PICO_THING_CONSOLE_BAUD
 
 volatile bool verbose = false;
 
