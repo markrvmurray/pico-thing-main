@@ -250,6 +250,15 @@ static constexpr uint8_t PEND_NMI  = 1u << 0;
 static constexpr uint8_t PEND_FIRQ = 1u << 1;
 static constexpr uint8_t PEND_IRQ  = 1u << 2;
 
+// Interrupt amplification.  acia_torture's handler is entered ~300 times for
+// 24 real ACIA receive events, and the question is whether the 6809 really
+// takes 300 interrupts (so /IRQ is being held asserted too long) or whether
+// something else re-enters the handler.  irq_vectors counts the vector
+// fetches the processor actually performs; pend_irq_cycles counts the E cycles
+// /IRQ was asserted, so their ratio is the cycles per taken interrupt.
+static volatile uint32_t irq_vectors = 0u;
+static volatile uint32_t pend_irq_cycles = 0u;
+
 static inline uint8_t
 pend_bit(const interrupt eirq)
 {
@@ -539,6 +548,8 @@ __time_critical_func(gpio_q_irq_handler())
 				// point at which the frame is on the stack and the copy is
 				// about to run.  This is the bus telling the console the
 				// break has been taken.
+				if (eirq == INTERRUPT_IRQ)
+					irq_vectors++;
 				if (eirq == INTERRUPT_NMI)
 					break_vector_fetched = true;
 				// A DAT fault vectors through NMI, and its handler has to
@@ -612,6 +623,8 @@ __time_critical_func(gpio_q_irq_handler())
 		// which drive the same pins from Core 0.
 		{
 			const uint8_t pend = pending_interrupts;
+			if (pend & PEND_IRQ)
+				pend_irq_cycles++;
 			uint32_t oe = 0u;
 			if ((pend & PEND_NMI) || watchpoint_nmi_pending
 			    || dat_fault_nmi_request) {
@@ -766,6 +779,37 @@ static          uint8_t rx_processed_count = 0;
 static volatile uint8_t aux_rx_read_count = 0;
 static          uint8_t aux_rx_processed_count = 0;
 
+// What the guest was SERVED on each console ACIA status read, newest last.
+// The counters showed RDRF staged and cleared identically whether or not a
+// host is attached, so the question is no longer "what cleared it" but "what
+// did the handler actually see, and in what order".  This answers that: it is
+// the byte the read DMA handed over, recorded in the ISR that saw the access.
+// Only the reads served with S_IRQ set are the handler's - the rest are the
+// polled output loop waiting on TDRE, and there are over a thousand of those.
+// The FIRST ones are kept, not the last, because test 3 is the first interrupt
+// the suite ever takes.
+// Console status reads, counted IN THE ISR because the generic notification
+// path cannot see them.  The ISR handles CONSOLE_STATUS in a branch of its own
+// and that branch does not set read_irq_received, so the Core 1 switch which
+// increments the other three access counters is never reached for this address
+// - which left st's console "Status" column a permanent zero from 1527983
+// until this was noticed on 2026-10-04.  AUX_STATUS has no such branch and so
+// counted all along, which is what made the asymmetry visible: an identical
+// flowtest run reported 8193 writes against 8390 status reads on the aux port
+// and 8193 against 0 on the console.
+//
+// A plain counter rather than the read_irq_received flag, for the same reason
+// rx_read_count is one: that flag carries a single address, so two reads
+// arriving before Core 1 drains it are counted once.  The aux column still has
+// that flaw and is a lower bound; this one is exact.
+static volatile unsigned CONSOLE_STATUS_READS = 0u;
+
+#define STATUS_SEEN_LEN 16u
+static volatile uint8_t status_seen[STATUS_SEEN_LEN];
+static volatile uint32_t status_seen_n = 0u;	// reads with S_IRQ set
+static volatile uint32_t status_irq_rdrf = 0u;	// ... and S_RDRF set too: correct
+static volatile uint32_t status_irq_nordrf = 0u;	// ... but S_RDRF CLEAR: the fault
+
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
 {
@@ -791,6 +835,21 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// from all device has_interrupt() calls each Q-rising edge.
 			// Clearing here would briefly deassert /IRQ even if another
 			// device still has a pending interrupt.
+		} else if (loc == CONSOLE_STATUS) {
+			CONSOLE_STATUS_READS++;
+			// registers::read() is what the DMA served from.
+			const uint8_t served =
+				*reinterpret_cast<volatile uint8_t *>(
+					registers::read_address() + CONSOLE_STATUS);
+			if (served & 0x80u) {		// S_IRQ
+				if (status_seen_n < STATUS_SEEN_LEN)
+					status_seen[status_seen_n] = served;
+				status_seen_n++;
+				if (served & 0x01u)	// S_RDRF
+					status_irq_rdrf++;
+				else
+					status_irq_nordrf++;
+			}
 		} else if (loc == AUX_RX_DATA) {
 			aux_rx_read_count++;
 			aux_serial.rx_read_fast_path();
@@ -1091,7 +1150,7 @@ static const char *chunk_string[] = {
 
 #ifdef DEBUG
 static volatile unsigned ACIA_CONTROL_COUNT = 0u, ACIA_TX_DATA_COUNT = 0u;
-static volatile unsigned ACIA_STATUS_COUNT = 0u, ACIA_RX_DATA_COUNT = 0u;
+static volatile unsigned ACIA_RX_DATA_COUNT = 0u;
 static volatile unsigned AUX_ACIA_CONTROL_COUNT = 0u, AUX_ACIA_TX_DATA_COUNT = 0u;
 static volatile unsigned AUX_ACIA_STATUS_COUNT = 0u, AUX_ACIA_RX_DATA_COUNT = 0u;
 #endif
@@ -1110,8 +1169,8 @@ peripheral_clear(const bool sysvectors)
 #ifdef DEBUG
 	ACIA_CONTROL_COUNT = 0u;
 	ACIA_TX_DATA_COUNT = 0u;
-	ACIA_STATUS_COUNT = 0u;
 	ACIA_RX_DATA_COUNT = 0u;
+	CONSOLE_STATUS_READS = 0u;
 	AUX_ACIA_CONTROL_COUNT = 0u;
 	AUX_ACIA_TX_DATA_COUNT = 0u;
 	AUX_ACIA_STATUS_COUNT = 0u;
@@ -2535,6 +2594,18 @@ status_gather_flow(acia_status_t *a, const uint8_t port)
 	a->held = st.tx_count > 0u && st.tx_index < st.tx_count;
 }
 
+// Where a staged byte's RDRF went.  Three places clear it and the counts tell
+// them apart - which is the only way to answer why acia_torture test 3 fails
+// while a host is attached and passes while it is not.
+static void
+status_print_rdrf(const char *name, const mc6850::rdrf_why &w)
+{
+	printf("    %-7s RDRF: staged %" PRIu32 "  cleared by: guest-read %" PRIu32
+	       "  RTS-drop %" PRIu32 "  reset %" PRIu32 "   host-CTS changes %"
+	       PRIu32 "\n",
+	       name, w.staged, w.rx_read, w.rts_drop, w.reset, w.cts_change);
+}
+
 static void
 status_print_flow(const char *name, const acia_status_t *a)
 {
@@ -2665,7 +2736,7 @@ status_gather(status_snapshot_t *s)
 #ifdef DEBUG
 	s->console_acia.control_count = ACIA_CONTROL_COUNT;
 	s->console_acia.tx_data_count = ACIA_TX_DATA_COUNT;
-	s->console_acia.status_count = ACIA_STATUS_COUNT;
+	s->console_acia.status_count = CONSOLE_STATUS_READS;
 	s->console_acia.rx_data_count = ACIA_RX_DATA_COUNT;
 #endif
 
@@ -2864,12 +2935,30 @@ status_print(const status_snapshot_t *s)
 	       s->console_acia.control_count, s->console_acia.tx_data_count,
 	       s->console_acia.status_count, s->console_acia.rx_data_count);
 	status_print_flow("Console", &s->console_acia);
+	status_print_rdrf("Console", fast_serial.why_rdrf());
+	{
+		const uint32_t n = status_seen_n;
+		const uint32_t show = (n < STATUS_SEEN_LEN) ? n : STATUS_SEEN_LEN;
+		printf("    IRQ taken %" PRIu32 " times; /IRQ asserted %" PRIu32
+		       " E cycles (%.1f cycles per taken interrupt)\n",
+		       irq_vectors, pend_irq_cycles,
+		       irq_vectors ? (double) pend_irq_cycles / (double) irq_vectors
+				   : 0.0);
+		printf("    Console S_IRQ status reads: %" PRIu32
+		       " (with RDRF %" PRIu32 ", WITHOUT RDRF %" PRIu32
+		       "); first %" PRIu32 ":", n, status_irq_rdrf,
+		       status_irq_nordrf, show);
+		for (uint32_t i = 0; i < show; i++)
+			printf(" %02X", status_seen[i]);
+		printf("\n");
+	}
 	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
 	       s->aux_acia.interrupt_status,
 	       s->aux_acia.tx_level, s->aux_acia.rx_level,
 	       s->aux_acia.control_count, s->aux_acia.tx_data_count,
 	       s->aux_acia.status_count, s->aux_acia.rx_data_count);
 	status_print_flow("Aux", &s->aux_acia);
+	status_print_rdrf("Aux", aux_serial.why_rdrf());
 #else
 	printf("ACIA:        IRQ  Tx Lvl  Rx Lvl\n");
 	printf("  Console     %02X  %6u  %6u\n",
@@ -5142,8 +5231,8 @@ __no_inline_not_in_flash_func(main_core1)()
 				if (cr.divide_select == 0b11u) {
 					ACIA_CONTROL_COUNT = 0u;
 					ACIA_TX_DATA_COUNT = 0u;
-					ACIA_STATUS_COUNT = 0u;
 					ACIA_RX_DATA_COUNT = 0u;
+					CONSOLE_STATUS_READS = 0u;
 				}
 				ACIA_CONTROL_COUNT++;
 #endif
@@ -5217,10 +5306,12 @@ __no_inline_not_in_flash_func(main_core1)()
 				// Will be set by the sysreq processor
 				break;
 
-			case CONSOLE_STATUS: // ACIA status
-#ifdef DEBUG
-				ACIA_STATUS_COUNT++;
-#endif
+			case CONSOLE_STATUS:
+				// UNREACHABLE, and left here saying so: the read
+				// ISR handles this address in a branch that never
+				// sets read_irq_received, so nothing arrives for
+				// it.  Counted in the ISR itself as
+				// CONSOLE_STATUS_READS.
 				break;
 
 			case AUX_STATUS:

@@ -132,6 +132,16 @@ private:
 	volatile bool irq_dirty = true;		// set by any state change, cleared by has_interrupt()
 	[[nodiscard]] interrupt has_interrupt_recompute();
 	volatile bool host_cts_deasserted = false;  // set by Core 0 when USB host can't accept data
+	// Why RDRF went away.  Three places clear receive_buffer_full and the
+	// difference between them is the whole question when a staged byte
+	// vanishes - see acia_torture test 3, which fails only while a host is
+	// attached to the CDC port.  Counters, not flags: the interesting
+	// quantity is how OFTEN, against a run where the port is closed.
+	volatile uint32_t n_reset = 0u;		// reset() - clears everything
+	volatile uint32_t n_rx_read = 0u;	// rx_read_fast_path() - guest read RX
+	volatile uint32_t n_rts_drop = 0u;	// guest_receive() with RTS deasserted
+	volatile uint32_t n_staged = 0u;	// a byte moved queue -> RX register
+	volatile uint32_t n_cts_change = 0u;	// set_host_cts() actually changed it
 	[[nodiscard]] uint8_t status_byte() const;
 	void sync_status();
 	void sync_transmit();
@@ -186,6 +196,11 @@ public:
 		return has_interrupt_recompute();
 	}
 	[[nodiscard]] bool is_rts_deasserted() const { return rts_deasserted; }
+	struct rdrf_why {
+		uint32_t reset, rx_read, rts_drop, staged, cts_change;
+	};
+	[[nodiscard]] rdrf_why why_rdrf() const
+		{ return { n_reset, n_rx_read, n_rts_drop, n_staged, n_cts_change }; }
 	void set_host_cts(bool deasserted);
 	[[nodiscard]] uint16_t get_ctl_offset() const { return ctl_offset; }
 	[[nodiscard]] uint16_t get_data_offset() const { return data_offset; }

@@ -53,6 +53,17 @@ TEST_NUM	EQU	SHARED+5	; 1 byte
 PASS_COUNT	EQU	SHARED+6	; 1 byte
 FAIL_COUNT	EQU	SHARED+7	; 1 byte
 IRQ_NOSIRQ	EQU	SHARED+8	; 2 bytes - handler calls where S_IRQ was not set
+; NOT SHARED+10 or +11: the firmware zeroes those two itself (watchpoint_disarm).
+IRQ_ENTRIES	EQU	SHARED+12	; 2 bytes - EVERY handler entry, ours or not.
+					; CUMULATIVE ACROSS TESTS, which is the trap:
+					; IRQ_COUNT is cleared per test by ClrIRQ, so
+					; comparing the two reads as a 12x amplification
+					; that is not there.  Measured 2026-10-04:
+					; 301 entries, 301 interrupts, 301 staged
+					; bytes - of which 256 are test 8's bulk phase
+					; and 24 are test 12's burst.  ALL 301 find
+					; S_RDRF; there are NO spurious entries.
+					; The per-test tables below are what proves it.
 
 NTESTS		EQU	12
 
@@ -798,6 +809,65 @@ T12Done
 	LDX	#SDone
 	LBSR	PPuts
 
+	; The instrument for "300 entries, 24 of them ours".  Printed before the
+	; verdict so a failing run still shows it.  Only non-zero tests are
+	; listed, to keep this to three short lines.
+	LDX	#OursHdr
+	LBSR	PPuts
+	LDB	#0		; test 0 included: anything landing there is
+OuLoop	PSHS	B		; an entry outside every test
+	LSLB
+	LDX	#OursTab
+	ABX
+	LDD	,X
+	BEQ	OuNext		; LDD sets Z only when both bytes are zero
+	PSHS	D		; value; the index is now at 2,S
+	LDA	#' '
+	LBSR	POutch
+	LDA	2,S
+	LBSR	PPrintA		; test number, decimal
+	LDA	#':'
+	LBSR	POutch
+	PULS	D
+	LBSR	PPrintD		; count, four hex digits
+OuNext	PULS	B
+	INCB
+	CMPB	#NTESTS
+	BLS	OuLoop
+
+	LDX	#SpurHdr
+	LBSR	PPuts
+	LDB	#0		; test 0 included: anything landing there is
+SpLoop	PSHS	B		; an entry outside every test
+	LSLB
+	LDX	#SpurTab
+	ABX
+	LDD	,X
+	BEQ	SpNext		; LDD sets Z only when both bytes are zero
+	PSHS	D		; value; the index is now at 2,S
+	LDA	#' '
+	LBSR	POutch
+	LDA	2,S
+	LBSR	PPrintA		; test number, decimal
+	LDA	#':'
+	LBSR	POutch
+	PULS	D
+	LBSR	PPrintD		; count, four hex digits
+SpNext	PULS	B
+	INCB
+	CMPB	#NTESTS
+	BLS	SpLoop
+
+	LDX	#KindHdr
+	LBSR	PPuts
+	LDD	SpurSIRQ
+	LBSR	PPrintD
+	LDX	#KindHdr2
+	LBSR	PPuts
+	LDD	SpurNoSIRQ
+	LBSR	PPrintD
+	LBSR	PCrlf
+
 	LDA	FAIL_COUNT
 	BEQ	AllPass
 	LDX	#SomeFail
@@ -812,9 +882,32 @@ Done	BRA	Done
 ; Reads status and data, records in SHARED block
 ; ===============================================================
 MyIRQ	LDA	ACIAS
-	STA	IRQ_STATUS
+	LDX	IRQ_ENTRIES	; count every entry - X, so A keeps the status
+	LEAX	1,X
+	STX	IRQ_ENTRIES
 	BITA	#S_RDRF
-	BEQ	MyIRQX		; not our interrupt
+	BEQ	MyIRQSp		; not ours - and do NOT touch IRQ_STATUS
+	; Ours.  Tally it against the test that was running, so the 24-in-300
+	; can be read per test rather than in aggregate.  B and X only: A still
+	; holds the status and the code below needs it.
+	LDB	TEST_NUM
+	ANDB	#15		; tables are 16 wide, so no index can escape
+	LSLB			; two bytes per entry
+	LDX	#OursTab
+	ABX
+	INC	1,X		; 16 bit, because test 8 alone overflowed a byte
+	BNE	OursTabC
+	INC	,X
+OursTabC
+	; Record the status only for an entry that is actually ours.  Stored
+	; unconditionally it was a shared slot any entry could overwrite, which
+	; is what made test 3 pass or fail on whichever entry wrote last.  STA
+	; sets N and Z from A, but the BITA below recomputes them, so the
+	; sequence is unaffected.
+	;
+	; The "~276 entries in 300 that find nothing" this comment used to claim
+	; DO NOT EXIST - measured 2026-10-04, see the header.
+	STA	IRQ_STATUS
 	; check S_IRQ is set alongside S_RDRF
 	BITA	#S_IRQ
 	BNE	MyIRQ0
@@ -834,6 +927,40 @@ MyIRQ0	LDA	ACIARX		; read data clears IRQ
 MyIRQ1	LDD	IRQ_COUNT
 	ADDD	#1
 	STD	IRQ_COUNT
+	RTS			; and NOT into the block below - the first cut of
+				; this instrument fell through here, so every
+				; genuine entry was tallied as spurious too and
+				; the two tables came out identical
+; Not ours: the handler was entered and found no S_RDRF.  Two things worth
+; knowing, and they point at different culprits.
+;
+; WHERE: which test was running.  If these cluster in the polled tests - 1, 2,
+; 7, 8 - then I is simply left unmasked across the polled phases and the ACIA
+; interrupts for bytes the foreground is about to consume itself.
+;
+; WHAT KIND: whether the ACIA was still asserting.  S_IRQ set means it had a
+; live reason and the data had gone elsewhere - the foreground consumed it
+; between the assert and this read.  S_IRQ clear means it had already been
+; satisfied before the handler even read the status.
+MyIRQSp	LDB	TEST_NUM
+	ANDB	#15		; tables are 16 wide, so no index can escape
+	LSLB			; two bytes per entry
+	LDX	#SpurTab
+	ABX
+	INC	1,X		; 16 bit, because test 8 alone overflowed a byte
+	BNE	SpurTabC
+	INC	,X
+SpurTabC
+	BITA	#S_IRQ		; INC touched CC, BITA recomputes it from A
+	BEQ	MyIRQSp0
+	LDX	SpurSIRQ
+	LEAX	1,X
+	STX	SpurSIRQ
+	RTS
+MyIRQSp0
+	LDX	SpurNoSIRQ
+	LEAX	1,X
+	STX	SpurNoSIRQ
 MyIRQX	RTS
 
 ; ===============================================================
@@ -1047,6 +1174,14 @@ AllOK	FCC	"ALL TESTS PASSED\n"
 	FCB	0
 SomeFail	FCC	"*** FAILURES DETECTED ***\n"
 	FCB	0
+OursHdr	FCC	"ours by test:"
+	FCB	0
+SpurHdr	FCC	"\nspurious by test:"
+	FCB	0
+KindHdr	FCC	"\nnon-RDRF: S_IRQ set 0x"
+	FCB	0
+KindHdr2	FCC	"  clear 0x"
+	FCB	0
 
 	ENDSECTION
 
@@ -1058,6 +1193,20 @@ SomeFail	FCC	"*** FAILURES DETECTED ***\n"
 
 RxBufPtr	RMB	2		; pointer into RxBuf (0 = buffering disabled)
 RxBuf		RMB	256		; 256-byte receive buffer
+
+; Handler entries tallied against the test that was running, 2 bytes each
+; because test 8 alone overflows a byte.  16 entries wide so a masked TEST_NUM
+; can never index off the end.  BSSCLR zeroes them at Start.
+;
+; What a healthy run looks like, and why it is worth keeping: OursTab summing
+; to the number of bytes the run moved, SpurTab EMPTY, and both kind-counters
+; zero.  Anything in SpurTab means the handler was entered without S_RDRF, and
+; its two kinds say which way: S_IRQ set means the ACIA had a live reason and
+; the data went elsewhere, S_IRQ clear means it had already been satisfied.
+OursTab		RMB	32		; entries that found S_RDRF, 2 bytes each
+SpurTab		RMB	32		; entries that did not, 2 bytes each
+SpurSIRQ	RMB	2		; of those, the ACIA was still asserting
+SpurNoSIRQ	RMB	2		; of those, it was not
 
 	ENDSECTION
 
