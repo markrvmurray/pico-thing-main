@@ -6,7 +6,7 @@ serial console into another machine entirely.
 
     P=/Users/markmurray/Documents/PICO/venv/bin/python
     $P scripts/console.py --listen 5            read only, writes nothing
-    $P scripts/console.py --probe               one CR, identify the device
+    $P scripts/console.py --ping                one CR, identify the device
     $P scripts/console.py st flow               identify, then run commands
     $P scripts/console.py --load chunk/x.s19    paced S-record load
 
@@ -65,7 +65,7 @@ def main():
     ap.add_argument("--port", default=PORT)
     ap.add_argument("--listen", type=float, metavar="S",
                     help="READ ONLY for S seconds, then exit")
-    ap.add_argument("--probe", action="store_true",
+    ap.add_argument("--ping", action="store_true",
                     help="identify only: one CR, show the reply, stop")
     ap.add_argument("--force", action="store_true",
                     help="send commands even if the signature check fails")
@@ -74,6 +74,10 @@ def main():
                          " for the prompt between lines (the console has no"
                          " flow control and 32 bytes of RX FIFO)")
     ap.add_argument("--timeout", type=float, default=15.0)
+    ap.add_argument("--settle", type=float, default=0.4,
+                    help="quiet time that ends a reply (default 0.4s). Raise"
+                         " it for commands with internal sleeps, such as"
+                         " break, which waits for the stacked frame to settle")
     ap.add_argument("command", nargs="*")
     a = ap.parse_args()
 
@@ -92,10 +96,17 @@ def main():
 
         show("pending on open", drain(ser, settle=0.3, limit=2.0))
 
-        print(">> CR (identification - the only pre-check write)")
-        ser.write(b"\r")
-        ser.flush()
-        reply = drain(ser, limit=a.timeout)
+        # Up to three CRs, patiently: the bridge occasionally swallows the
+        # first one just after the port is opened, and a bare prompt is all
+        # we are waiting for.
+        reply = b""
+        for attempt in range(1, 4):
+            print(f">> CR (identification {attempt}/3 - the only pre-check write)")
+            ser.write(b"\r")
+            ser.flush()
+            reply = drain(ser, settle=1.0, limit=5.0)
+            if reply:
+                break
         show("reply", reply)
 
         if not any(s in reply for s in SIGNATURE):
@@ -105,7 +116,7 @@ def main():
                 return 2
             print("WARNING: no signature, continuing because --force")
 
-        if a.probe:
+        if a.ping:
             print("identified; stopping here as asked")
             return 0
 
@@ -132,7 +143,8 @@ def main():
             print(f">> {cmd}")
             ser.write(cmd.encode() + b"\r")
             ser.flush()
-            show(f"reply to {cmd!r}", drain(ser, limit=a.timeout))
+            show(f"reply to {cmd!r}",
+                 drain(ser, settle=a.settle, limit=a.timeout))
     return 0
 
 
