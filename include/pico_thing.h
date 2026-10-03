@@ -151,6 +151,38 @@ union bus_pins {
 };
 
 // GPIO 32 upwards, as read from the SIO high input register.
+// BUSY, LIC and AVMA as a PIO state machine samples them at E-falling and a
+// DMA mirrors them into memory - see bus_status_mirror in pico_thing.cpp.
+//
+// All three are "in advance" signals: they describe the NEXT bus cycle, and the
+// datasheet makes them valid only t_CD after Q-rising (300 ns at 1 MHz, 250 at
+// 1.5, 200 at 2).  Sampling at Q-rising therefore reads the previous cycle's
+// values, which is what the firmware used to do.  Sampled at E-falling - the
+// last moment of a cycle, and well clear of t_CD at every supported E - and
+// read during the cycle that follows, they mean what one wants them to mean:
+// AVMA "this cycle is a valid bus cycle" and LIC "this cycle is the first cycle
+// of an instruction".  The conversion is done by the choice of sample point, so
+// no reader has to remember to shift it.
+//
+// Named for bus_pins and high_bus_pins above, and NOT "bus_status": that is
+// the pio_dma instance's name, and a variable hides a union of the same name.
+//
+// Bit order matches union BLA, so the word's low three bits feed
+// mc6809::set_busy_lic_avma() unchanged.
+//
+// READ IT ONCE.  Every bitfield read of a volatile is its own load, so testing
+// two fields in one expression can mix samples from adjacent E cycles.  Copy
+// `word` into a local and decode that.
+union bus_status_pins {
+	struct {
+		uint32_t BUSY : 1;	// 20
+		uint32_t LIC : 1;	// 21
+		uint32_t AVMA : 1;	// 22
+		uint32_t : 29;
+	} bits;
+	uint32_t word;
+};
+
 union high_bus_pins {
 	struct {
 #if PICO_THING_BOARD_VERSION >= 2

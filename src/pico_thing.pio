@@ -30,10 +30,20 @@
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.
 ;
-; The last instruction carries "irq prev set 0" as well as its side-set, so it
-; costs nothing: all four were nop placeholders for the side-set, and the loop
-; is still four PIO clocks, so E's frequency and duty are untouched.  It ticks
-; the bus_fault sampler on pio2 once per E cycle.
+; Two of the four instructions carry an "irq prev set" as well as their
+; side-set, which costs nothing: all four were nop placeholders for the
+; side-set, and the loop is still four PIO clocks, so E's frequency and duty are
+; untouched.  Both ticks go to pio2, one per E cycle each.
+;
+; Flag 0, on the LAST instruction, is Q-falling: it ticks the bus_fault sampler,
+; for the phase reasons set out below.
+;
+; Flag 1, on the FIRST instruction, is E-falling: it ticks the bus_status
+; sampler.  BUSY, LIC and AVMA are valid only t_CD after Q-rising - 300 ns at
+; 1 MHz - and E-falling is the last moment of the cycle, so it is both safely
+; past t_CD at every supported E and correctly aligned, since all three describe
+; the cycle that follows.  Separate flags because a satisfied wait clears the
+; flag, so two state machines cannot share one.
 ;
 ; THE PHASE IS THE POINT.  That instruction is the one that drops Q while E is
 ; still high, and Q-falling is where the DAT fault signal must be sampled: the
@@ -49,10 +59,10 @@
 .program	mc6809_clock
 .side_set	2
 .wrap_target
-	nop			side 0b00	; Q=0, E=0
+	irq	prev set 1	side 0b00	; Q=0, E=0 - E FALLS here: tick bus_status
 	nop			side 0b10	; Q=1, E=0
 	nop			side 0b11	; Q=1, E=1
-	irq	prev set 0	side 0b01	; Q=0, E=1
+	irq	prev set 0	side 0b01	; Q=0, E=1 - Q falls: tick bus_fault
 .wrap
 
 % c-sdk {
@@ -460,6 +470,46 @@ bus_fault_program_init(PIO pio, uint sm, uint offset, uint trigger_pin)
 
 static inline void
 bus_fault_program_deinit(PIO pio, uint sm)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	pio_sm_unclaim(pio, sm);
+}
+
+%}
+
+; BUSY/LIC/AVMA mirror.  Two instructions, ticked at E-falling by the clock
+; program's "irq prev set 1", feeding a DMA that keeps the latest sample in one
+; word of memory so either core can read it without an interrupt.
+;
+; The DMA is not decorative: with autopush and nothing draining, the RX FIFO
+; fills after four samples and then NEW pushes are dropped, so a reader would
+; get the oldest sample and it would only get staler.  A DMA draining
+; continuously always leaves the newest one in place.
+;
+; Runs on the GPIO-base-16 PIO, which can see GPIO 20-22.  Sampling three pins
+; from GPIO 20 with shift-left and autopush at 3 puts BUSY, LIC and AVMA in the
+; word's low three bits, in the order union BLA expects.
+;
+; IN pins: (3) BUSY, LIC, AVMA - base GPIO 20
+.program bus_status
+.wrap_target
+	wait	1 irq 1			; E-falling, from the clock program on pio0
+	in	pins 3			; autopush -> RX FIFO -> DMA -> memory
+.wrap
+
+% c-sdk {
+
+static inline void
+bus_status_program_init(PIO pio, uint sm, uint offset, uint first_pin)
+{
+	pio_sm_config c = bus_status_program_get_default_config(offset);
+	sm_config_set_in_pins(&c, first_pin);		// BUSY, LIC, AVMA
+	sm_config_set_in_shift(&c, false, true, 3);	// shift left, autopush at 3
+	pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void
+bus_status_program_deinit(PIO pio, uint sm)
 {
 	pio_sm_set_enabled(pio, sm, false);
 	pio_sm_unclaim(pio, sm);

@@ -65,6 +65,13 @@ struct status_snapshot_t {
 	uint32_t rti_count;
 	uint32_t last_lic;
 	bool     lic_stalled;
+	uint8_t  busy_lic_avma;	// live mirror bits, as the Q handler last used them
+	uint32_t mirror_raw;	// the whole mirror word, to see bits outside the low three
+	uint8_t  mirror_pc;	// bus_status SM's PC, relative to its program offset
+	uint8_t  mirror_fifo;	// its RX FIFO level
+	bool     mirror_dma_busy;
+	uint8_t  pio2_irq;	// all eight of pio2's SM-visible IRQ flags
+	uint8_t  clock_pc;	// the E/Q clock SM's PC, to prove it is cycling
 #endif
 
 	// Register blocks (raw bytes for hex dump / JSON array)
