@@ -15,6 +15,16 @@ enum {
 	ITF_NUM_TOTAL
 };
 
+enum {
+	STRID_LANGID = 0,
+	STRID_MANUFACTURER,
+	STRID_PRODUCT,
+	STRID_SERIAL,
+	STRID_CDC_0,
+	STRID_CDC_1,
+	STRID_VENDOR
+};
+
 #define EPNUM_CDC_0_NOTIF	0x81	/* EP1 IN  (interrupt) */
 #define EPNUM_CDC_0_OUT		0x02	/* EP2 OUT (bulk)      */
 #define EPNUM_CDC_0_IN		0x82	/* EP2 IN  (bulk)      */
@@ -38,9 +48,9 @@ tusb_desc_device_t const desc_device = {
 	.idProduct = USB_PID,
 	.bcdDevice = 0x0100,
 
-	.iManufacturer = 0x01,
-	.iProduct = 0x02,
-	.iSerialNumber = 0x03,
+	.iManufacturer = STRID_MANUFACTURER,
+	.iProduct = STRID_PRODUCT,
+	.iSerialNumber = STRID_SERIAL,
 
 	.bNumConfigurations = 1
 };
@@ -54,38 +64,50 @@ tud_descriptor_device_cb(void)
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + 2 * TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
-	/* Configuration descriptor */
-	TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+	/*
+	 * Configuration descriptor.  Two of these arguments are not what
+	 * reaches the wire: the macro ORs bit 7 into bmAttributes itself
+	 * (bus powered, no remote wakeup), and it halves bMaxPower, which
+	 * the spec encodes in 2 mA units - so 100 means 100 mA, sent as 50.
+	 */
+	TUD_CONFIG_DESCRIPTOR(
+		1,			/* config number    */
+		ITF_NUM_TOTAL,		/* interface count  */
+		0,			/* no name string   */
+		CONFIG_TOTAL_LEN,	/* total length     */
+		0x00,			/* bmAttributes     */
+		100			/* bMaxPower in mA  */
+	),
 
 	/* CDC 0 — console UART */
 	TUD_CDC_DESCRIPTOR(
 		ITF_NUM_CDC_0,		/* interface number */
-		4,			/* string index     */
+		STRID_CDC_0,		/* string index     */
 		EPNUM_CDC_0_NOTIF,	/* notification ep  */
-		8,
+		8,			/* notify ep size   */
 		EPNUM_CDC_0_OUT,	/* OUT EP   */
 		EPNUM_CDC_0_IN,		/* IN EP    */
-		64
+		CFG_TUD_CDC_EP_BUFSIZE
 	),
 
 	/* CDC 1 — auxiliary UART */
 	TUD_CDC_DESCRIPTOR(
 		ITF_NUM_CDC_1,		/* interface number */
-		6,			/* string index     */
+		STRID_CDC_1,		/* string index     */
 		EPNUM_CDC_1_NOTIF,	/* notification ep  */
-		8,
+		8,			/* notify ep size   */
 		EPNUM_CDC_1_OUT,	/* OUT EP   */
 		EPNUM_CDC_1_IN,		/* IN EP    */
-		64
+		CFG_TUD_CDC_EP_BUFSIZE
 	),
 
 	/* Vendor interface (bulk in/out) */
 	TUD_VENDOR_DESCRIPTOR(
 		ITF_NUM_VENDOR,		/* interface number */
-		5,			/* string index     */
+		STRID_VENDOR,		/* string index     */
 		EPNUM_VENDOR_OUT,
 		EPNUM_VENDOR_IN,
-		64
+		CFG_TUD_VENDOR_EPSIZE
 	)
 };
 
@@ -99,14 +121,20 @@ tud_descriptor_configuration_cb(uint8_t index)
 #define DESC_STR_MAXLEN 32u
 static uint16_t desc_str[DESC_STR_MAXLEN];
 
+/*
+ * Designated, so that the STRID_ enum IS the array order: reordering these
+ * lines is a no-op, and an index cannot disagree with the string it names.
+ * Positional initialisers with the index in a comment are exactly what put
+ * CDC 1's name on the vendor interface and the vendor's name on CDC 1.
+ */
 char const *string_desc_arr[] = {
-	(const char[]){0x09, 0x04}, /* supported language: English */
-	"MarkM",                    /* 1: Manufacturer */
-	"Pico-Thing",               /* 2: Product */
-	"6809",                     /* 3: Serial number */
-	"MC6809 Serial",            /* 4 */
-	"MC6809 Aux Serial",        /* 6 */
-	"MC6809 Bulk",              /* 5 */
+	[STRID_LANGID]       = (const char[]){0x09, 0x04},	/* English */
+	[STRID_MANUFACTURER] = "MarkM",
+	[STRID_PRODUCT]      = "Pico-Thing",
+	[STRID_SERIAL]       = "6809",
+	[STRID_CDC_0]        = "MC6809 Serial",
+	[STRID_CDC_1]        = "MC6809 Aux Serial",
+	[STRID_VENDOR]       = "MC6809 Bulk",
 };
 
 uint16_t const *
@@ -121,7 +149,16 @@ tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 	if (index >= (sizeof(string_desc_arr) / sizeof(string_desc_arr[0])))
 		return NULL;
 
+	/*
+	 * A designated initialiser leaves a hole if an enum member is ever added
+	 * without its string, and the bound check above waves that through.
+	 * strlen(NULL) here faults inside a control transfer, which is an awkward
+	 * place to debug; refusing the request stalls it harmlessly instead.
+	 */
 	const char *str = string_desc_arr[index];
+	if (str == NULL)
+		return NULL;
+
 	size_t len = MIN(strlen(str), DESC_STR_MAXLEN - 1);
 	desc_str[0] = (uint16_t) ((TUSB_DESC_STRING << 8) | (2 + (len * 2)));
 
