@@ -38,6 +38,7 @@
 #include "uart_pump.h"
 #include "srec.h"
 #include "mc6850.h"
+#include "rail_monitor.h"
 #include "tick_timer.h"
 #include "build_time.h"
 #include "command_parser.h"
@@ -2321,7 +2322,7 @@ adc_pin_volts(const uint16_t raw)
 }
 
 static inline float
-adc_bus_volts(const uint16_t raw)
+adc_rail_volts(const uint16_t raw)
 {
 	return adc_pin_volts(raw)*BUS_DIVIDER_RATIO;
 }
@@ -2348,12 +2349,46 @@ adc_die_celsius(const uint16_t raw)
 // channel and reading it, and both readings would be wrong.  Everything else
 // reads the counts cached here.
 
+// How much external 5V has to be there before the load switch is closed.
+// Set from CMake with -DPICO_THING_POWER_RAIL_MIN_VOLTS=<volts>; the fallback
+// here is for anything that compiles this without the build system.  A
+// nominal 5V supply may sag 10%, so the value sits just above that: high
+// enough to reject an absent or failing supply, low enough to accept a
+// working one under load.
+#ifndef PICO_THING_POWER_RAIL_MIN_VOLTS
+#define PICO_THING_POWER_RAIL_MIN_VOLTS 4.5f
+#endif
+static constexpr float POWER_RAIL_MIN_VOLTS = PICO_THING_POWER_RAIL_MIN_VOLTS;
+// It doubles as the "healthy" line for the baseline below: only a sample at
+// or above this may seed or move the baseline, so a sag cannot drag its own
+// reference down, and a USB-powered start with no +VDC - the Pico runs fine
+// on VBUS through D109 - never establishes one to fall from.
+
 // Below this the supply is no longer usable and the load switch is dropped.
 // Set from CMake with -DPICO_THING_POWER_RAIL_DROP_VOLTS=<volts>.
 #ifndef PICO_THING_POWER_RAIL_DROP_VOLTS
 #define PICO_THING_POWER_RAIL_DROP_VOLTS 4.0f
 #endif
 static constexpr float POWER_RAIL_DROP_VOLTS = PICO_THING_POWER_RAIL_DROP_VOLTS;
+
+// How far below its own slow baseline +5VP has to fall to count as low.  This
+// is the PRIMARY detector; POWER_RAIL_DROP_VOLTS above is only the backstop
+// for a baseline that never established.  Relative rather than absolute
+// because both ADC channels read 0.5 to 0.7V high whenever the Pico serves
+// the bus, and that inflation cancels in a difference but corrupts an
+// absolute threshold completely.  Set with
+// -DPICO_THING_POWER_RAIL_FALL_VOLTS=<volts>.
+#ifndef PICO_THING_POWER_RAIL_FALL_VOLTS
+#define PICO_THING_POWER_RAIL_FALL_VOLTS 0.40f
+#endif
+static constexpr float POWER_RAIL_FALL_VOLTS = PICO_THING_POWER_RAIL_FALL_VOLTS;
+
+// Healthy samples needed before a baseline is trusted, and the divisor of the
+// running average once it is.  At RAIL_MONITOR_MS that is about a second to
+// establish and five seconds of memory - slow enough that a real collapse,
+// which is milliseconds, trips long before the baseline can follow it down.
+static constexpr uint32_t RAIL_GOOD_SAMPLES = 50u;
+static constexpr uint32_t RAIL_BASELINE_DIV = 250u;
 
 // How long the rail is given to charge the board's bulk capacitance before
 // the monitor is allowed to judge it.  Set from CMake with
@@ -2386,6 +2421,8 @@ static volatile uint16_t rail_raw = 0u;		// counts, external 5V through the divi
 static volatile uint16_t rail_trip_raw = 0u;	// the sample that opened the switch
 static volatile uint16_t die_raw = 0u;		// counts, internal temperature sensor
 static volatile uint32_t rail_low_count = 0u;	// consecutive samples below the cutout
+static volatile float rail_baseline = 0.0f;	// slow average of a healthy +5VP
+static volatile uint32_t rail_good_count = 0u;	// consecutive healthy samples seen
 static volatile uint64_t rail_settle_until = 0u;	// us since boot; no judging before this
 static volatile bool rail_sampled = false;	// at least one pass has run
 static volatile bool rail_collapsed = false;	// set here, acted on by the console loop
@@ -2429,19 +2466,40 @@ power_rail_monitor(repeating_timer *)
 	// be done from an alarm callback - and it is the part that matters.
 	// Stopping the PIOs, the DMA and Core 1 needs the console loop, so that
 	// is left to it.
-	if (POWER_IS_ASSERTED && !rail_collapsed && time_us_64() >= rail_settle_until) {
-		if (adc_bus_volts(raw) < POWER_RAIL_DROP_VOLTS) {
-			if (++rail_low_count >= RAIL_LOW_SAMPLES) {
-				// Keep the sample that decided it.  By the time the
-				// console loop reports this the switch is open, the
-				// load is gone and the rail has recovered, so a
-				// reading taken then says nothing about why.
-				rail_trip_raw = raw;
-				POWER_DEASSERT;
-				rail_collapsed = true;
-			}
-		} else
-			rail_low_count = 0u;
+	// The decision itself is rail_judge(), in rail_monitor.h, so that ctest
+	// can cover the sags, recoveries, glitches and the settle window
+	// without collapsing a real rail - see tests/test_rail_monitor.cpp.
+	// The volts are computed unconditionally now rather than only when
+	// armed and settled: one float divide every 20 ms, against a decision
+	// that is finally testable.
+	static constexpr rail_limits rail_cfg = {
+		POWER_RAIL_DROP_VOLTS,
+		POWER_RAIL_FALL_VOLTS,
+		POWER_RAIL_MIN_VOLTS,
+		RAIL_LOW_SAMPLES,
+		RAIL_GOOD_SAMPLES,
+		RAIL_BASELINE_DIV,
+	};
+	const rail_state rs = {
+		POWER_IS_ASSERTED && !rail_collapsed,
+		time_us_64(),
+		rail_settle_until,
+		adc_rail_volts(raw),
+		rail_low_count,
+		rail_baseline,
+		rail_good_count,
+	};
+	const rail_judgement rj = rail_judge(rs, rail_cfg);
+	rail_low_count = rj.low_count;
+	rail_baseline = rj.baseline;
+	rail_good_count = rj.good_count;
+	if (rj.trip) {
+		// Keep the sample that decided it.  By the time the console loop
+		// reports this the switch is open, the load is gone and the rail
+		// has recovered, so a reading taken then says nothing about why.
+		rail_trip_raw = raw;
+		POWER_DEASSERT;
+		rail_collapsed = true;
 	}
 #endif
 	// The die sensor is internal, on the channel above the pins
@@ -2547,6 +2605,8 @@ status_gather(status_snapshot_t *s)
 #ifdef DEBUG
 	static uint32_t last_LIC = 0u;
 	s->lic_count = MC6809.get_lic_count();
+	s->rail_baseline = rail_baseline;
+	s->rail_good = rail_good_count;
 	s->busy_lic_avma = MC6809.get_busy_lic_avma();
 	s->mirror_raw = bus_status_mirror.word;
 	s->mirror_pc = (bus_status.sm < 0) ? 0xFFu : static_cast<uint8_t>(
@@ -2689,8 +2749,18 @@ status_print(const status_snapshot_t *s)
 	static constexpr const char *adc_warning =
 		"   <- the bus is being served; both ADC channels read high";
 #if PICO_THING_BOARD_VERSION >= 2
-	printf("BUS POWER: %.2fV (%u counts)%s\n",
-	       adc_bus_volts(s->voltage), s->voltage,
+	// The baseline as well as the sample: without it there is no way to see
+	// whether the relative detector is armed, which is what the bench test
+	// for the cutout has to watch while it sags the sense node at J107.
+	if (s->rail_baseline > 0.0f)
+		printf("  cutout baseline %.2fV (%" PRIu32 " good)%s\n",
+		       (double) s->rail_baseline, s->rail_good,
+		       s->rail_good >= 50u ? ", armed"
+					   : ", still establishing");
+	else
+		printf("  cutout baseline not established - absolute floor only\n");
+	printf("PICO SUPPLY (+5VP): %.2fV (%u counts)%s\n",
+	       adc_rail_volts(s->voltage), s->voltage,
 	       adc_quiet ? "" : adc_warning);
 #endif
 	printf("PICO TEMPERATURE: %.1fC (%u counts)%s\n",
@@ -2859,7 +2929,7 @@ status_json(const status_snapshot_t *s)
 	// the counts are what was actually measured.  Version 1 has no bus
 	// divider, so its voltage is null rather than a misleading zero.
 #if PICO_THING_BOARD_VERSION >= 2
-	printf(R"json(,"voltage":%.2f,"voltage_raw":%u)json", adc_bus_volts(s->voltage), s->voltage);
+	printf(R"json(,"voltage":%.2f,"voltage_raw":%u)json", adc_rail_volts(s->voltage), s->voltage);
 #else
 	printf(R"json(,"voltage":null,"voltage_raw":null)json");
 #endif
@@ -4692,9 +4762,9 @@ poll_console()
 		if (rail_collapsed) {
 			rail_collapsed = false;
 			printf("\n*** external 5V collapsed to %.2fV - guest powered down ***\n",
-			       adc_bus_volts(rail_trip_raw));
+			       adc_rail_volts(rail_trip_raw));
 			printf("    (reads %.2fV now the load is off)\n",
-			       adc_bus_volts(rail_raw));
+			       adc_rail_volts(rail_raw));
 			if (!MC6809.is_unpowered())
 				reset_power();
 			printf("Console still up; check the supply, then \"power on\".\n");
@@ -5592,17 +5662,6 @@ pio_shutdown()
 	bus_pin_pulls(false);
 }
 
-// How much external 5V has to be there before the load switch is closed.
-// Set from CMake with -DPICO_THING_POWER_RAIL_MIN_VOLTS=<volts>; the fallback
-// here is for anything that compiles this without the build system.  A
-// nominal 5V supply may sag 10%, so the value sits just above that: high
-// enough to reject an absent or failing supply, low enough to accept a
-// working one under load.
-#ifndef PICO_THING_POWER_RAIL_MIN_VOLTS
-#define PICO_THING_POWER_RAIL_MIN_VOLTS 4.5f
-#endif
-static constexpr float POWER_RAIL_MIN_VOLTS = PICO_THING_POWER_RAIL_MIN_VOLTS;
-
 // Close the load switch, and give the rail time to settle before anything is
 // driven into the guest logic.  On version 2 the external supply is measured
 // first: ADC channel 6 reads it through the divider ahead of the switch, so
@@ -5613,7 +5672,7 @@ static bool
 power_rail_enable()
 {
 #if PICO_THING_BOARD_VERSION >= 2
-	const float volts = adc_bus_volts(rail_raw);
+	const float volts = adc_rail_volts(rail_raw);
 	if (volts < POWER_RAIL_MIN_VOLTS) {
 		printf("Core0 external 5V not present (%.2fV, need %.2fV) - power not switched on\n",
 		       volts, POWER_RAIL_MIN_VOLTS);

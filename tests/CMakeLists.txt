@@ -47,6 +47,19 @@ include(CTest)
 include(Catch)
 
 # ---------------------------------------------------------------------------
+# test_rail_monitor: the supply cutout's decision.  Pure host build - the
+# header deliberately has no SDK dependency, so there is nothing to fake.
+# ---------------------------------------------------------------------------
+add_executable(test_rail_monitor
+    test_rail_monitor.cpp
+)
+target_include_directories(test_rail_monitor PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_link_libraries(test_rail_monitor PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test_rail_monitor)
+
+# ---------------------------------------------------------------------------
 # test_srec: pure host build, no pico-sdk dependency
 # ---------------------------------------------------------------------------
 add_executable(test_srec

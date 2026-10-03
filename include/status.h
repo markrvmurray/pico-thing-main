@@ -65,6 +65,8 @@ struct status_snapshot_t {
 	uint32_t rti_count;
 	uint32_t last_lic;
 	bool     lic_stalled;
+	float    rail_baseline;	// the cutout's slow reference, 0 = not established
+	uint32_t rail_good;	// consecutive healthy samples behind it
 	uint8_t  busy_lic_avma;	// live mirror bits, as the Q handler last used them
 	uint32_t mirror_raw;	// the whole mirror word, to see bits outside the low three
 	uint8_t  mirror_pc;	// bus_status SM's PC, relative to its program offset
