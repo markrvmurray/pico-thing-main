@@ -752,9 +752,16 @@ TEST_CASE("irq command", "[parser][irq]")
 		REQUIRE(parse("irq 8", &cmd));
 		CHECK(cmd.irq.testnum == 8);
 	}
-	SECTION("irq 9 (out of range) is rejected")
+	SECTION("irq 9 is the single-step test")
 	{
-		CHECK_FALSE(parse("irq 9", &cmd));
+		REQUIRE(parse("irq 9", &cmd));
+		CHECK(cmd.irq.testnum == 9);
+	}
+	// The test number is parsed as hex, so 'a' is 10 - the first value
+	// above the range rather than a malformed one.
+	SECTION("irq a (out of range) is rejected")
+	{
+		CHECK_FALSE(parse("irq a", &cmd));
 		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
 	}
 }

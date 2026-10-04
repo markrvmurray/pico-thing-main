@@ -259,6 +259,61 @@ static constexpr uint8_t PEND_IRQ  = 1u << 2;
 static volatile uint32_t irq_vectors = 0u;
 static volatile uint32_t pend_irq_cycles = 0u;
 
+// Single-stepping (TODO 1b).  Both halves of a step MUST happen in the same
+// Q-rising pass: clearing the BREAK snippet's spin byte so the guest falls
+// through to its RTI, and arming the countdown that will bring it straight
+// back.  Driven from Core 0 instead, the two writes are about a millisecond
+// apart - a thousand E cycles, some hundreds of instructions of a tight loop -
+// and what comes back is not a step at all.  Hence the request flag: Core 0
+// asks, the handler does it atomically.
+static volatile uint8_t step_arm_cycles = 0u;	// non-zero: release and arm now
+static volatile bool step_active = false;	// restore the spin on NMI entry
+
+// LIC-gated stepping, which is what actually steps ONE INSTRUCTION.  A cycle
+// count cannot: instructions are 2 to 11 cycles, so the count that advances
+// exactly one depends on the lengths of the code being stepped (991fb9d
+// measured 29 for a NOP+BRA loop, and the pattern oscillates with those two
+// lengths).  LIC does not care: the mirror from 6b77bb3 makes it mean "this
+// cycle is an opcode fetch", so raising NMI there leaves it pending through
+// the instruction being fetched, and the 6809 finishes that one and takes it.
+//
+// Three states, because the snippet's own RTI has to be stepped over first.
+// The detector fires on the RTI's OPCODE FETCH (LIC=1 then $3B at E-fall), so
+// at that moment the RTI has not run yet; the first LIC rising edge after it is
+// the RTI finishing, measured on the board at E cycle 15 - a full frame is 15
+// cycles.  Arm there and the NMI is pending through exactly one guest
+// instruction, which the 6809 completes before taking it.
+//
+// No cycle count anywhere, which is the point: neither the RTI's length nor the
+// stepped instruction's length appears in the rule.  Proved on the board
+// against a four-instruction loop of three different lengths.
+//
+// IT MUST BE THE RAW LIC PIN, NOT THE DMA MIRROR.  Both were swept, offsets 0
+// to 2 E cycles, and every mirror variant stepped exactly TWO instructions
+// while the raw pin at offset 0 stepped one.  The mirror is written by DMA at
+// E-falling and read here a quarter cycle later at Q-rising, so it is a whole
+// cycle stale - and a cycle is precisely what the gate cannot spare.  The
+// mirror's re-phasing exists to make a trace readable (6b77bb3); acting one
+// cycle ahead needs the "in advance" signal as the 6809 drives it.
+enum : uint8_t { STEP_IDLE = 0u, STEP_RELEASED = 1u, STEP_AFTER_RTI = 2u };
+static volatile uint8_t step_state = STEP_IDLE;
+static volatile bool step_request = false;	// Core 0 asks; the handler acts
+static volatile bool step_prev_lic = false;	// for the rising-edge test
+// Instrument, not mechanism: where the LIC rising edges actually fall after
+// the snippet's RTI is fetched, in E cycles from that fetch.  The settle above
+// was a guess at "past the RTI", and the board says it is not - every stop came
+// back at the same PC, so the NMI is pending before the guest executes
+// anything.  Guessing again is no better: log the edges, read which one the
+// working cycle count corresponds to, and arm on that edge instead of a count.
+// Costs a compare per pass and only while a step test is running.
+static constexpr uint8_t STEP_EDGE_MAX = 8u;
+static volatile uint8_t step_edge[STEP_EDGE_MAX] = {};
+static volatile uint8_t step_edges = 0u;	// how many recorded
+static volatile uint8_t step_pass = 0u;		// E cycles since the RTI fetch
+static volatile bool step_logging = false;	// armed by the RTI detector
+static volatile uint8_t step_armed_edge = 0u;	// edge the LIC gate fired on
+
+
 static inline uint8_t
 pend_bit(const interrupt eirq)
 {
@@ -550,8 +605,15 @@ __time_critical_func(gpio_q_irq_handler())
 				// break has been taken.
 				if (eirq == INTERRUPT_IRQ)
 					irq_vectors++;
-				if (eirq == INTERRUPT_NMI)
+				if (eirq == INTERRUPT_NMI) {
 					break_vector_fetched = true;
+					// The guest is entering BREAK again, so it is
+					// long past the spin it fell through: put the
+					// offset back before it gets there.
+					if (step_active)
+						reg[REGISTER_SNIPPET + 14] =
+							static_cast<uint8_t>(0xFEu);
+				}
 				// A DAT fault vectors through NMI, and its handler has to
 				// reach the DAT RAM to reclaim the dead process's pages —
 				// which the GAL only enables for task 0.  (The faulting
@@ -601,11 +663,62 @@ __time_critical_func(gpio_q_irq_handler())
 		}
 		// Deferred task restore after RTI detection
 		MC6809.tick_rti_countdown();
-		// E-cycle countdown NMI timer
-#if 0
+		// LIC-gated step.  Release and gate are both here for the same
+		// reason the cycle-count path is: from Core 0 the two would be a
+		// millisecond apart, which is not a step.
+		{
+			// The raw pin, deliberately: see the note on the states.
+			const bool lic_now = gpio_get(GPIO_LIC);
+			if (step_request) {
+				// Zeroing the BRA's offset turns the snippet's spin into
+				// "branch to the next byte", which is the RTI.
+				reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
+				step_state = STEP_RELEASED;
+				step_request = false;
+			}
+			if (step_logging) {
+				if (step_pass < 0xFFu)
+					step_pass++;
+				if (lic_now && !step_prev_lic
+				    && step_edges < STEP_EDGE_MAX)
+					step_edge[step_edges++] = step_pass;
+			}
+			if (step_state == STEP_AFTER_RTI
+			    && lic_now && !step_prev_lic) {
+				// The RTI has ended and the guest's own
+				// instruction is this cycle.  PEND_NMI reaches the
+				// pin later in this same pass, so it is pending
+				// through that one instruction.
+				pending_interrupts |= PEND_NMI;
+				step_armed_edge = step_edges;
+				step_state = STEP_IDLE;
+			}
+			step_prev_lic = lic_now;
+		}
+		// A step asked for: release the guest and arm, in this one pass.
+		// Ordered before the tick below so the cycle armed here is not
+		// immediately spent.
+		if (step_arm_cycles != 0u) {
+			// Zeroing the BRA's offset turns the snippet's spin into
+			// "branch to the next byte", which is the RTI.
+			reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
+			system_tick.arm_countdown(step_arm_cycles);
+			step_arm_cycles = 0u;
+		}
+		// E-cycle countdown NMI timer: $FFC8 bits 5:1 are a 5-bit count,
+		// decremented here once per Q-rising, and the pass it reaches zero
+		// on raises NMI.  So "LDA #(1<<1); STA $FFC8" means NMI after one
+		// E cycle - the single-stepping primitive.
+		//
+		// This was disabled by an #if 0 from e6c56df (March 2026) with no
+		// reason recorded.  Re-enabled 2026-10-04 and proved on the board;
+		// if it misbehaves, the first suspect is that PEND_NMI is shared
+		// with the DAT fault, the watchpoint and break, all of which funnel
+		// through the one nmi_assert_cycles pulse below - two requests in
+		// the same pass collapse into a single pulse, and only break has a
+		// way (break_vector_fetched) to confirm its own was the one taken.
 		if (system_tick.tick())
 			pending_interrupts |= PEND_NMI;
-#endif
 
 		// Assert/deassert all interrupt pins from cached pending state.
 		// NMI is edge-triggered (one-shot): assert once and clear flag.
@@ -665,6 +778,18 @@ __time_critical_func(pio_rti_irq_handler())
 {
 	pio_interrupt_clear(rti_detect.pio, RTI_PIO_IRQ);
 	MC6809.apply_rti();
+	// During a LIC-gated step this is the BREAK snippet's own RTI: from the
+	// next opcode fetch onwards the guest is running its own code again.
+	if (step_state == STEP_RELEASED)
+		step_state = STEP_AFTER_RTI;
+	// Both gates log, so the cycle count that works can be read against the
+	// edges it falls between.
+	if (step_active) {
+		step_pass = 0u;
+		step_edges = 0u;
+		step_armed_edge = 0u;
+		step_logging = true;
+	}
 }
 
 // ISR for the DAT fault sampler PIO program.
@@ -4006,6 +4131,161 @@ status_done:
 			// Consume the one-shot: with the CPU about to be stopped it can
 			// never fill, and an armed trace keeps the E-fall interrupt alive.
 			MC6809.trace_stop();
+			break;
+		} else if (hexnum == 9) {
+			// Single step (TODO 1b), composed from parts that already
+			// work: the countdown NMI re-enabled in f1b36b7, the BREAK
+			// snippet's copy of the stacked frame, break_vector_fetched
+			// for "the NMI was taken", and break_frame_settled() for
+			// "the copy has finished".
+			//
+			// The target is a FOUR-instruction loop of three different
+			// lengths, and the stepping is judged by whether each stacked
+			// PC is the SUCCESSOR of the last one.
+			//
+			//   $0000  10 CE E0 00  LDS #$E000   NMI is masked until S is
+			//   $0004  12           NOP      2c  loaded, so this comes first
+			//   $0005  B6 00 20     LDA $0020 5c
+			//   $0008  12           NOP      2c
+			//   $0009  20 F9        BRA $0004 3c
+			//
+			// It used to be a two-instruction NOP/BRA loop, judged by the
+			// PC ALTERNATING - and that test cannot tell one instruction
+			// from any ODD number of them.  It is how 991fb9d came to call
+			// a 29-cycle arm "perfect": the board later showed LIC edges at
+			// 15 18 20 23 25 28 after the RTI fetch, so arming at 29 steps
+			// past SIX instruction boundaries, and alternated purely by
+			// parity.  A four-state loop has no such hiding place, and the
+			// 5-cycle LDA in the middle means a rule that depends on
+			// instruction length cannot pass either.
+			printf("Single-step test\n");
+			static constexpr uint8_t step_target[] = {
+				0x10u, 0xCEu, 0xE0u, 0x00u,
+				0x12u, 0xB6u, 0x00u, 0x20u, 0x12u, 0x20u, 0xF9u
+			};
+			// Successor of each legal PC, one instruction on.
+			static constexpr uint16_t STEP_PC[] = {
+				0x0004u, 0x0005u, 0x0008u, 0x0009u
+			};
+			static constexpr uint16_t STEP_NEXT[] = {
+				0x0005u, 0x0008u, 0x0009u, 0x0004u
+			};
+			// 29 E cycles after the release is what 991fb9d swept out as
+			// "perfect" on the old two-instruction loop, and it is kept
+			// here only as the negative control.  On this loop it fails,
+			// which is the point: the board showed LIC edges at
+			// 15 18 20 23 25 28 after the RTI fetch, so 29 arms six
+			// instruction boundaries downstream.  The old loop could not
+			// show that, because any ODD number of instructions alternates
+			// between two PCs.
+			static constexpr uint8_t STEP_ARM_CYCLES = 29u;
+			static constexpr uint STEP_COUNT = 6u;
+
+			MC6809.stop();
+			sleep_ms(1u);
+			// Before BREAK: copy() runs a snippet of its own.
+			if (!copy(OUTWARDS, sizeof step_target, 0x0000u, step_target)) {
+				printf("  could not plant the target loop\n");
+				break;
+			}
+			const uint16_t step_saved_nmi =
+				static_cast<uint16_t>(reg[REGISTER_VECTOR_NMI_OFFSET]);
+			snippet_copy(BREAK);
+			printf("  gate PCs                     verdict\n");
+			// Pass 0 is the cycle count, kept as the negative control:
+			// it should FAIL on this loop, and that failure is the
+			// evidence that a count cannot step arbitrary code.
+			for (uint pass = 0u; pass < 2u; pass++) {
+			const bool use_lic = (pass != 0u);
+			const char *step_label = use_lic ? "LIC" : "29";
+			reg[REGISTER_VECTOR_NMI_OFFSET] =
+				static_cast<uint16_t>(REGISTER_SNIPPET);
+			reg[REGISTER_VECTOR_RESET_OFFSET] = static_cast<uint16_t>(0x0000);
+			step_active = true;
+			break_vector_fetched = false;
+			MC6809.start();
+
+			// The first stop is not a step: it is the countdown fired once
+			// to get the guest into BREAK in the first place.
+			system_tick.arm_countdown(1u);
+			uint32_t waited = 0u;
+			while (!break_vector_fetched && ++waited <= 1000u)
+				sleep_ms(1u);
+			bool step_ok = break_vector_fetched;
+			if (!step_ok)
+				printf("  the guest never reached BREAK - did it load S?\n");
+
+			uint16_t pcs[STEP_COUNT] = {};
+			uint n = 0u;
+			for (; step_ok && n < STEP_COUNT; n++) {
+				uint8_t frame[BREAK_FRAME_LEN];
+				(void) break_frame_settled(frame, 50u);
+				pcs[n] = static_cast<uint16_t>((frame[10] << 8) | frame[11]);
+				break_vector_fetched = false;
+				if (use_lic)
+					step_request = true;		// gate on the next opcode fetch
+				else
+					step_arm_cycles = STEP_ARM_CYCLES;
+				waited = 0u;
+				while (!break_vector_fetched && ++waited <= 1000u)
+					sleep_ms(1u);
+				if (!break_vector_fetched) {
+					printf("  step %u: no NMI came back\n", n + 1u);
+					step_ok = false;
+				}
+			}
+
+			step_active = false;
+			step_logging = false;
+			reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0xFEu);
+			MC6809.stop();
+			sleep_ms(1u);
+
+			uint steps_of_one = 0u, wrong = 0u, strays = 0u;
+			for (uint i = 0; i < n; i++) {
+				uint slot = 4u;
+				for (uint k = 0u; k < 4u; k++)
+					if (pcs[i] == STEP_PC[k])
+						slot = k;
+				if (slot == 4u) {
+					strays++;
+					continue;
+				}
+				if (i == 0u)
+					continue;
+				uint prev = 4u;
+				for (uint k = 0u; k < 4u; k++)
+					if (pcs[i - 1] == STEP_PC[k])
+						prev = k;
+				if (prev < 4u && pcs[i] == STEP_NEXT[prev])
+					steps_of_one++;
+				else
+					wrong++;
+			}
+			printf("  %-4s ", step_label);
+			for (uint i = 0; i < STEP_COUNT; i++)
+				printf(i < n ? "%04X " : ".... ", pcs[i]);
+			if (n != STEP_COUNT)
+				printf("  stalled after %u\n", n);
+			else if (strays)
+				printf("  %u outside the loop\n", strays);
+			else if (wrong == 0u)
+				printf("  ONE INSTRUCTION PER STEP\n");
+			else
+				printf("  %u/%u not the next instruction\n",
+				       wrong, steps_of_one + wrong);
+			// Where the LIC rising edges fell on the last step of this
+			// gate, in E cycles after the snippet's RTI was fetched.  The
+			// count gate arms at STEP_ARM_CYCLES, so the edge it lands
+			// just past is the one the LIC gate should use.
+			if (!use_lic) {
+				printf("       edges after the RTI fetch:");
+				for (uint i = 0u; i < step_edges; i++)
+					printf(" %u", static_cast<uint>(step_edge[i]));
+				printf("\n");
+			}
+			}	// cycle-count pass, then LIC pass
+			reg[REGISTER_VECTOR_NMI_OFFSET] = step_saved_nmi;
 			break;
 		} else if (hexnum == 8) {
 			// DAT fault.  The snippet unmaps one 8kB block of the running

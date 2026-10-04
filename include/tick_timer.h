@@ -45,6 +45,11 @@ public:
 	[[nodiscard]] bool is_enabled() const { return enabled; }
 	[[nodiscard]] bool is_irq_pending() const { return irq_pending; }
 	[[nodiscard]] uint8_t get_nmi_countdown() const { return nmi_countdown; }
+	// Arm the countdown without touching the 50 Hz enable, which control()
+	// would rewrite from bit 0.  For the firmware's own single-stepping: the
+	// guest arms it by writing $FFC8, but a step has to arm it from the
+	// Q-rising handler, in the same pass that releases the guest.
+	void arm_countdown(uint8_t cycles) { nmi_countdown = cycles; }
 
 	// Called once per E-cycle (Q-rising ISR).  Returns true when the
 	// NMI countdown expires, signalling the caller to set PEND_NMI.
