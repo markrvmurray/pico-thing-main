@@ -282,6 +282,12 @@ mc6809::release()
 // stack - but any task restore has to wait out the instruction: 15 E cycles
 // for a full frame, 6 for FIRQ, so 15 covers both.
 //
+// SETTLED, not pending (the owner, 2026-10-04): leave this as it is.  The
+// alternatives were a universal switch to task 0 on entry with the guest
+// restoring, or restoring here unless the handler had written the task
+// register itself.  Both change the environment every guest interrupt handler
+// runs in, and the arrangement below is the only one proven to boot NitrOS-9.
+//
 // With PICO_THING_RTI_TASK_RESTORE off, which is the default, no restore is
 // armed and the task register stays where the handler left it.  Putting the
 // interrupted task back suits an interrupt that resumes what it interrupted,
@@ -295,7 +301,15 @@ mc6809::apply_rti()
 #ifdef DEBUG
 	count_rti();
 #endif
-	if (nesting_depth > 0u) {
+	if (nesting_depth == 0u) {
+		// An RTI with nothing to unwind: either a vector fetch was missed,
+		// or the detector was fooled - LIC is high while stacking too, so
+		// it cannot be made exact.  Counted so the OS's declaration has
+		// something to be judged against.
+		depth_underflows++;
+		return;
+	}
+	{
 		nesting_depth--;
 		if (task_stack_ptr > 0u) {
 			const uint8_t interrupted_task =

@@ -103,6 +103,14 @@ private:
 	static constexpr uint8_t MAX_INT_NEST_DEPTH = 16u;
 	volatile uint8_t task;
 	volatile uint8_t nesting_depth = 0;
+	// Where the depth count goes wrong, counted rather than hidden.  Neither
+	// was visible before: a push dropped at MAX_INT_NEST_DEPTH used to skip
+	// the depth increment as well, so the count silently stopped rising
+	// while every RTI kept lowering it, and an RTI with no matching push did
+	// nothing at all.
+	volatile uint32_t depth_overflows = 0;	// task history full, push dropped
+	volatile uint32_t depth_underflows = 0;	// RTI with the depth already 0
+	volatile uint32_t depth_declares = 0;	// times the OS resynchronised us
 	volatile uint8_t rti_task_countdown = 0;	// E-cycle countdown for deferred task restore
 	uint8_t rti_pending_task = 0;			// task to restore when countdown expires
 	void rti_task_expired();			// the countdown reached zero: put the task back
@@ -289,6 +297,20 @@ public:
 	[[nodiscard]] enum bus_state get_old_bus_state() const { return old_bus_state; }
 	[[nodiscard]] uint8_t get_task() const { return task; }
 	[[nodiscard]] uint8_t get_nesting_depth() const { return nesting_depth; }
+	struct depth_errors { uint32_t overflows, underflows, declares; };
+	[[nodiscard]] depth_errors get_depth_errors() const
+		{ return { depth_overflows, depth_underflows, depth_declares }; }
+	// The OS declaring where it really is.  Trims the task history to match:
+	// entries above the declared depth describe interrupts that, as far as
+	// the OS is concerned, are over.
+	void declare_depth(uint8_t depth)
+	{
+		nesting_depth = depth;
+		task_stack_ptr = (depth < MAX_INT_NEST_DEPTH) ? depth : MAX_INT_NEST_DEPTH;
+		depth_declares++;
+		if (depth == 0u && rti_task_countdown == 0u)
+			run_state = RS_RUNNING;
+	}
 	[[nodiscard]] uint16_t get_task_stack_ptr() const { return task_stack_ptr; }
 	[[nodiscard]] uint8_t get_task_history(uint16_t i) const { return (i < MAX_INT_NEST_DEPTH) ? task_stack[i] : 0u; }
 	friend void gpio_q_irq_handler();

@@ -594,9 +594,19 @@ __time_critical_func(gpio_q_irq_handler())
 				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
 				if (eirq <= INTERRUPT_RESET)
 					MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
-				if (eirq < INTERRUPT_RESET && MC6809.task_stack_ptr < mc6809::MAX_INT_NEST_DEPTH) {
-					MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(1u, std::memory_order_relaxed)] = MC6809.task;
-					MC6809.nesting_depth++;
+				if (eirq < INTERRUPT_RESET) {
+					// The depth counts every interrupt; only the task
+					// HISTORY is bounded.  These used to share one guard,
+					// so at MAX_INT_NEST_DEPTH the depth stopped rising
+					// while every RTI kept lowering it - the count went
+					// permanently out of step, and nothing said so.
+					if (MC6809.task_stack_ptr < mc6809::MAX_INT_NEST_DEPTH)
+						MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(
+							1u, std::memory_order_relaxed)] = MC6809.task;
+					else
+						MC6809.depth_overflows++;
+					if (MC6809.nesting_depth < 0xFFu)
+						MC6809.nesting_depth++;
 				}
 				// Both the break command and the watchpoint point the NMI
 				// vector at the BREAK snippet, and the vector fetch is the
@@ -614,6 +624,19 @@ __time_critical_func(gpio_q_irq_handler())
 						reg[REGISTER_SNIPPET + 14] =
 							static_cast<uint8_t>(0xFEu);
 				}
+				// DELIBERATELY NOT UNIVERSAL (the owner, 2026-10-04).
+				// The brief once asked for every interrupt to switch to
+				// task 0 on entry; this switches only a DAT fault.  So
+				// every other handler runs under the INTERRUPTED task's
+				// own mapping and must switch for itself if it needs
+				// system memory - the DAT only lets task 0 write DAT RAM.
+				// Making the switch universal would change the
+				// environment every NitrOS-9 handler runs in, so the risk
+				// is in the guest rather than here, and this is the only
+				// arrangement proven to boot an OS.  Asked and answered:
+				// leave it.  See also apply_rti(), where the matching
+				// decision not to restore the task lives.
+				//
 				// A DAT fault vectors through NMI, and its handler has to
 				// reach the DAT RAM to reclaim the dead process's pages —
 				// which the GAL only enables for task 0.  (The faulting
@@ -1097,6 +1120,10 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		aux_serial.write_received();
 	else if (wloc == SYSTEM_TIMER_CONTROL_13)
 		system_tick.control(wval);
+	else if (wloc == SYSTEM_INT_DEPTH)
+		// The OS telling us where it really is; see the note in
+		// pico_thing.h for why this exists at all.
+		MC6809.declare_depth(wval);
 	else if (wloc == SYSTEM_WATCHPOINT) {
 		// Arm/disarm deferred to write ring handler (needs snippet_code[])
 	}
@@ -2989,6 +3016,15 @@ status_print(const status_snapshot_t *s)
 	printf("Bus State: %-16s  Prev: %-16s\n",
 	       bus_state_string[s->bus_state], bus_state_string[s->old_bus_state]);
 	printf("Run State: %s  Nesting: %u\n", run_state_string[s->run_state], s->nesting_depth);
+	{
+		// Only worth a line when something has actually gone wrong, or the
+		// OS has had to put us right.  A clean run says nothing.
+		const mc6809::depth_errors d = MC6809.get_depth_errors();
+		if (d.overflows || d.underflows || d.declares)
+			printf("  depth: %" PRIu32 " overflows (history full), %" PRIu32
+			       " underflows (RTI at 0), %" PRIu32 " OS declarations\n",
+			       d.overflows, d.underflows, d.declares);
+	}
 	printf("Task: %u  History:", s->task);
 	if (s->task_stack_ptr == 0)
 		printf(" -");

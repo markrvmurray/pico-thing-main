@@ -327,6 +327,19 @@ union high_bus_pins {
 // different bus cycles — see the sampling note in the Q-falling ISR.
 #define SYSTEM_DAT_FAULT_LOC	uint16_t(0x0Du) // Read ($FFCD)
 
+// Interrupt nesting depth ($FFCE).  Read: the depth the Pico believes it is
+// at, counted from interrupt vector fetches and RTI opcode fetches.  Write:
+// DECLARE the depth, which is the OS resynchronising the Pico to the truth.
+//
+// The declaration exists because the count cannot be made perfect from the
+// bus alone: the RTI detector can be fooled (LIC is high while stacking too),
+// and the task history is only MAX_INT_NEST_DEPTH deep.  Rather than pretend
+// otherwise, the OS gets a way to say "I am at depth N" - typically 0, from
+// its idle loop - and the Pico believes it.  A write also trims the task
+// history to match, since entries above the declared depth are no longer
+// about anything.
+#define SYSTEM_INT_DEPTH	uint16_t(0x0Eu) // Read/Write ($FFCE)
+
 // SYSTEM_DAT_FAULT bits
 #define DAT_FAULT_FAULT		uint8_t(1u << 0) // set when GPIO_FAULT is sampled high
 #define DAT_FAULT_RW		uint8_t(1u << 1) // R/!W latched with the fault, read-only
