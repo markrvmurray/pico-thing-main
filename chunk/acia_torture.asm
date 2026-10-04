@@ -577,11 +577,23 @@ T9Drain	LDA	ACIAS
 T9Go	LBSR	ClrIRQ
 	; unmask CPU IRQ and wait for host keypress
 	ANDCC	#$EF
-	; timeout loop: ~2.4 seconds at 1MHz
-	; inner: LDY #0 → 65536 iterations (wraps from 0 to $FFFF)
-	; outer: LDX #2  → 2 passes = 131072 inner iterations
-	; ~18 cycles/iteration → ~23.6M cycles ≈ 24s at 1MHz
-	LDX	#4		; outer counter
+	; TIMEOUT LOOP.  Inner: LDY #0 gives 65536 iterations (wraps 0 -> $FFFF).
+	; A pass is LDA extended, BITA, LEAY, BNE ~= 18 E cycles, so the window is
+	; outer x 65536 x 18 E CYCLES - a fixed CYCLE count, which means a window
+	; that SHRINKS AS E RISES while the host round trip it waits for does not.
+	;
+	; At the old LDX #4 that was 4.7M cycles: 4.7 s at 1 MHz but only 2.0 s at
+	; 2.4 MHz, against a wall-clock USB round trip plus the harness's own
+	; read-loop and its 50 ms settle.  Measured 2026-10-09: PASS at 1.0 MHz and
+	; FAIL at 2.4 MHz on the SAME firmware, which is this arithmetic and not a
+	; fault in the ACIA path.
+	;
+	; LDX #16 gives 18.9M cycles: 18.9 s at 1 MHz, 7.9 s at 2.4, 6.3 s at 3.0 -
+	; comfortably inside the harness's 40 s default at every clock this board
+	; can reach.  The two comment lines that used to be here disagreed with each
+	; other AND with the code (they claimed #2 and "24s" for a #4 that gave
+	; 4.7 s), which is why the shrinking window went unnoticed.
+	LDX	#16		; outer counter
 	LDY	#0		; inner counter (65536 iterations per outer)
 T9Wait	LDA	IRQ_FLAGS
 	BITA	#1
