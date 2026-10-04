@@ -832,18 +832,14 @@ flow_cmd:
 	}
 	;
 
+/* No "break <addr>": running to an address is a loop of single steps reading
+ * the stacked PC, which modifies no guest code - see the NMI step gate.  The
+ * stub that printed "not yet implemented" is gone, so an address is now a
+ * syntax error rather than a promise.
+ */
 break_cmd:
 	  TOK_BREAK {
 		result->tag = CMD_BREAK;
-	}
-	| TOK_BREAK TOK_NUMBER {
-		uint32_t v = parse_hex($2);
-		if (v == UINT32_MAX || v > 0xFFFFu) {
-			printf("Invalid hex address '%s'\n", $2);
-			YYERROR;
-		}
-		result->tag         = CMD_BREAK_ADDR;
-		result->brk.address = (uint16_t)v;
 	}
 	| TOK_BREAK TOK_RETURN {
 		result->tag = CMD_BREAK_RETURN;

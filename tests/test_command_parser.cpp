@@ -1198,20 +1198,12 @@ TEST_CASE("break command", "[parser][break]")
 		REQUIRE(parse("br", &cmd));
 		CHECK(cmd.tag == CMD_BREAK);
 	}
-	SECTION("break with address -> CMD_BREAK_ADDR")
+	SECTION("break takes no address")
 	{
-		REQUIRE(parse("break 1234", &cmd));
-		CHECK(cmd.tag == CMD_BREAK_ADDR);
-		CHECK(cmd.brk.address == 0x1234u);
-	}
-	SECTION("br with address -> CMD_BREAK_ADDR")
-	{
-		REQUIRE(parse("br FFFE", &cmd));
-		CHECK(cmd.tag == CMD_BREAK_ADDR);
-		CHECK(cmd.brk.address == 0xFFFEu);
-	}
-	SECTION("break with invalid address is rejected")
-	{
+		// Removed rather than left as a stub: running to an address is a
+		// loop of single steps reading the stacked PC.
+		CHECK_FALSE(parse("break 1234", &cmd));
+		CHECK_FALSE(parse("br FFFE", &cmd));
 		CHECK_FALSE(parse("break GGGG", &cmd));
 	}
 	SECTION("break return -> CMD_BREAK_RETURN")

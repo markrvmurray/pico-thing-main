@@ -2477,7 +2477,29 @@ console_set_interrupt(interrupt eirq)
 static interrupt
 console_has_interrupt()
 {
-	return console_interrupt;
+	const interrupt eirq = console_interrupt;
+	// NMI IS CONSUMED ON READ.  It is edge-triggered and unmaskable, so a
+	// level request is wrong for it: Core 1 writes pending_interrupts on
+	// every iteration of its loop, the Q-rising handler turns PEND_NMI into a
+	// two-cycle pulse and then releases the pin, and the next iteration
+	// asserts it again - a fresh falling edge every three E cycles or so, for
+	// as long as the request stands.  Nothing stops the guest taking NMI
+	// again INSIDE the handler it has just entered, because NMI masks neither
+	// itself nor anything else.
+	//
+	// That is what made `break` print the BREAK snippet's own registers -
+	// PC $FFE4, four bytes in, with X $FFD0, its copy pointer - instead of
+	// the guest's: a nested NMI stacked the snippet mid-copy, and the frame
+	// that reached SHARED was the snippet's.  break holds the request until
+	// Core 0 SEES the vector fetch, which it polls in 1 ms steps, so there
+	// was room for hundreds of extra entries.
+	//
+	// FIRQ and IRQ stay held, deliberately: they are level-sensitive, a short
+	// pulse can expire unseen, and the guest's own masking on entry is what
+	// stops them re-entering.
+	if (eirq == INTERRUPT_NMI)
+		console_interrupt = INTERRUPT_NONE;
+	return eirq;
 }
 
 // Raw ADC counts to engineering units.  Shared by the human-readable and the
@@ -4262,6 +4284,15 @@ status_done:
 
 			step_active = false;
 			step_logging = false;
+			// Force the gate idle.  A pass that bailed out early - "no
+			// NMI came back" - leaves step_state at RELEASED or
+			// AFTER_RTI, and AFTER_RTI arms on the very next LIC edge,
+			// so the guest collects a spurious NMI long after the test
+			// has finished and parks in the BREAK snippet.  The symptom
+			// is a later `break` reporting a PC inside $FFE0 rather than
+			// the guest's own.
+			step_state = STEP_IDLE;
+			step_request = false;
 			reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0xFEu);
 			MC6809.stop();
 			sleep_ms(1u);
@@ -4935,11 +4966,6 @@ status_done:
 			       BREAK_SETTLE_MS);
 		break;
 	}
-
-	case CMD_BREAK_ADDR:
-		// TODO: address-based breakpoint at $%04X
-		printf("Address breakpoint at $%04X (not yet implemented)\n", cmd.brk.address);
-		break;
 
 	case CMD_BREAK_RETURN:
 		if (!MC6809.assert_powered())
