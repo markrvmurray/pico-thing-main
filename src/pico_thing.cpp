@@ -542,8 +542,10 @@ __time_critical_func(gpio_q_irq_handler())
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
 		// BUSY/LIC/AVMA are stable at Q-rising (this is the latest valid capture point;
-		// by Q-falling the 6809 has already updated them for the next cycle). Unpack
-		// immediately so that vma is valid before the DMA read ISR fires (~20 cycles later).
+		// by Q-falling the 6809 has already updated them for the next cycle).
+		// Unpacked here for the trace columns and for st; the read DMA ISR
+		// reads the AVMA PIN instead, because the mirror is a cycle stale by
+		// the time this handler has it - see the note on that guard.
 		// From the mirror, not from bus_pins: these three are valid only
 		// t_CD after Q-rising - 300 ns at 1 MHz - so the snapshot this
 		// handler just took of the pins has the PREVIOUS cycle's values.
@@ -965,7 +967,22 @@ __time_critical_func(dma_bus_read_irq_handler())
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
-	if (MC6809.run_state >= RS_RUNNING && MC6809.get_vma()) {
+	// AVMA from the RAW PIN, not the mirror.  Measured 2026-10-04 over a full
+	// acia_torture run: the mirrored AVMA was LOW on 92% of the completions
+	// this ISR saw, where the pin was low on 7%, and the two disagreed 86% of
+	// the time - on a cycle the read DMA has just served, AVMA should be HIGH,
+	// because it WAS a valid access.  Offset $FFD4 turned up in both the
+	// passed and the rejected set, which is the proof: the mirrored verdict
+	// follows the cycle pattern of whatever instruction did the reading, not
+	// the address.  An access preceded by a dead cycle - extended addressing
+	// is opcode, addr-hi, addr-lo, DEAD, data - read as rejected.
+	//
+	// The mirror is a DMA snapshot taken at E-falling and read here a quarter
+	// cycle later, so it is a whole cycle stale; the pin, read this early
+	// after Q-rising, still holds what the 6809 drove in the previous cycle,
+	// which for an "in advance" signal describes THIS one.  Same finding as
+	// the LIC-gated step in c53ac5f.
+	if (MC6809.run_state >= RS_RUNNING && gpio_get(GPIO_AVMA)) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
 		const uint8_t loc = read_addr & registers::register_mask;
 		if (loc == CONSOLE_RX_DATA) {
@@ -3048,6 +3065,13 @@ status_print(const status_snapshot_t *s)
 	       live.bit.BUSY ? 'B' : '.',
 	       live.bit.LIC  ? 'L' : '.',
 	       live.bit.AVMA ? 'V' : '.');
+	// Which stage is stuck, when the mirror is not tracking: a PC parked on
+	// the wait means the clock's E-falling flag is not arriving; a full FIFO
+	// means the state machine pushes but the DMA does not drain; an idle DMA
+	// means the endless transfer is not running at all.
+	printf("mirror raw %08" PRIX32 "  sm pc +%u  rx fifo %u  dma %s\n",
+	       s->mirror_raw, s->mirror_pc, s->mirror_fifo,
+	       s->mirror_dma_busy ? "busy" : "IDLE");
 	// Which stage is stuck, when the mirror is not tracking: a PC parked on
 	// the wait means the clock's E-falling flag is not arriving; a full FIFO
 	// means the state machine pushes but the DMA does not drain; an idle DMA
