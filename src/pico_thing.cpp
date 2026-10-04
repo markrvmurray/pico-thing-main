@@ -106,11 +106,6 @@ static pio_dma task_output   = { TASK_OUTPUT_PIO,     -1, -1,  -1,  -1, -1 };
 static pio_dma trace_lo      = { TRACE_LO_PIO,        -1, -1,  -1,   2, -1 };
 static pio_dma trace_hi      = { TRACE_HI_PIO,        -1, -1,  -1,   3, -1 };
 static pio_dma bus_fault     = { BUS_FAULT_PIO,       -1, -1,  -1,  -1, PIO2_IRQ_0 };
-// One channel, in the RP2350's ENDLESS transfer-count mode, so nothing has to
-// re-arm it and it never stops of its own accord.  Chaining two channels to
-// each other looks like the way to get an endless transfer but is not: see
-// bus_pio_dma_init().  It goes in the data field; it carries no address.
-static pio_dma bus_status    = { BUS_STATUS_PIO,      -1, -1,  -1,   6, -1 };
 
 
 static inline void
@@ -224,13 +219,6 @@ watchpoint_disarm()
 // already low, so the direction register is the drive.
 static constexpr uint32_t INTERRUPT_PIN_MASK =
 	(1u << GPIO_NMI) | (1u << GPIO_FIRQ) | (1u << GPIO_IRQ);
-
-// BUSY, LIC and AVMA, sampled at E-falling by the bus_status state machine and
-// written here by its DMA, once per E cycle, for ever.  Read at Q-rising - the
-// cycle after the sample - the three bits describe the cycle being read.  See
-// union bus_status in pico_thing.h for why that is the correct sample point and
-// why a reader must take the word once rather than the fields one at a time.
-static volatile bus_status_pins bus_status_mirror = { .word = 0u };
 
 static volatile bool q_rising_edge = false;
 static volatile bool core1_initialised = false;
@@ -362,9 +350,9 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 //   pio2 flag 0  mc6809_clock's "irq prev set 0", once per E cycle at Q-fall
 //                (prev from pio0 wraps to pio2), consumed by bus_fault's wait
 //   pio2 flag 1  mc6809_clock's "irq prev set 1", once per E cycle at E-fall,
-//                consumed by bus_status's wait.  Nothing else may wait on it:
-//                a satisfied wait clears the flag, so a second waiter would
-//                steal samples from the BUSY/LIC/AVMA mirror
+//                CONSUMED BY NOTHING since the BUSY/LIC/AVMA mirror was
+//                removed, so it simply stays set.  One waiter only if it is
+//                ever used again: a satisfied wait clears the flag
 //   pio2 flag 2  bus_capture_lo -> bus_capture_hi handshake, SM to SM
 //   pio2 flag 3  bus_fault, the DAT fault signal to the CPU
 static constexpr uint RTI_PIO_IRQ = 1u;
@@ -541,24 +529,20 @@ __time_critical_func(gpio_q_irq_handler())
 		q_rising_edge = true;
 		bus_pins bus_pins{};
 		bus_pins.word = gpio_get_all();
-		// BUSY/LIC/AVMA are stable at Q-rising (this is the latest valid capture point;
-		// by Q-falling the 6809 has already updated them for the next cycle).
-		// Unpacked here for the trace columns and for st; the read DMA ISR
-		// reads the AVMA PIN instead, because the mirror is a cycle stale by
-		// the time this handler has it - see the note on that guard.
-		// From the mirror, not from bus_pins: these three are valid only
-		// t_CD after Q-rising - 300 ns at 1 MHz - so the snapshot this
-		// handler just took of the pins has the PREVIOUS cycle's values.
-		// The mirror was sampled at the last E-falling, which describes
-		// this cycle.  One load, then decode: see union bus_status_pins.
-		const auto bla = static_cast<uint8_t>(bus_status_mirror.word & 0x07u);
+		// BUSY/LIC/AVMA straight out of the snapshot above, which is free -
+		// one gpio_get_all() already read them.  This handler runs past
+		// t_CD, measured, so these are the RAW IN-ADVANCE values: they
+		// describe the NEXT cycle, not this one.  That is the phase the
+		// step gate below needs, and it is one cycle fresher than the
+		// DMA-maintained mirror this replaced - see union bus_pins.
+		const auto bla = static_cast<uint8_t>(bus_pins.bits.BUSY_LIC_AVMA);
 		MC6809.set_busy_lic_avma(bla);
-		// Keep what we just used, against the row the capture DMA is about
+		// Keep what we just read, against the row the capture DMA is about
 		// to write, so the columns line up.  Only while armed: this reads a
 		// DMA register, which is not something to do on every E cycle for
 		// nothing.
 		if (MC6809.trace_is_armed())
-			MC6809.trace_mirror_store(trace_hw_count(), bla);
+			MC6809.trace_bla_store(trace_hw_count(), bla);
 		auto address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
 		const auto new_bs = static_cast<enum bus_state>(bus_pins.bits.BS_BA & 0x03u);
 		const bool reset_now = RESET_IS_ASSERTED;
@@ -692,8 +676,9 @@ __time_critical_func(gpio_q_irq_handler())
 		// reason the cycle-count path is: from Core 0 the two would be a
 		// millisecond apart, which is not a step.
 		{
-			// The raw pin, deliberately: see the note on the states.
-			const bool lic_now = gpio_get(GPIO_LIC);
+			// The pins, deliberately, and the same read the rest of this
+			// handler uses: see the note on the states.
+			const bool lic_now = (bla & 0x02u) != 0u;	// LIC is bit 1
 			if (step_request) {
 				// Zeroing the BRA's offset turns the snippet's spin into
 				// "branch to the next byte", which is the RTI.
@@ -967,21 +952,22 @@ __time_critical_func(dma_bus_read_irq_handler())
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
 	dma_channel_acknowledge_irq0(piodma_read.data_channel);
-	// AVMA from the RAW PIN, not the mirror.  Measured 2026-10-04 over a full
-	// acia_torture run: the mirrored AVMA was LOW on 92% of the completions
-	// this ISR saw, where the pin was low on 7%, and the two disagreed 86% of
-	// the time - on a cycle the read DMA has just served, AVMA should be HIGH,
-	// because it WAS a valid access.  Offset $FFD4 turned up in both the
-	// passed and the rejected set, which is the proof: the mirrored verdict
-	// follows the cycle pattern of whatever instruction did the reading, not
-	// the address.  An access preceded by a dead cycle - extended addressing
-	// is opcode, addr-hi, addr-lo, DEAD, data - read as rejected.
+	// AVMA from the pin, via the Q-rising handler's snapshot.  BE CLEAR ABOUT
+	// WHAT THIS TESTS: the pins are in-advance signals read past t_CD, so
+	// this asks "is the NEXT cycle a valid bus cycle", not "was this one".
+	// Neither source answers the question exactly - the mirror it replaced
+	// was a cycle behind the access, this is a cycle ahead of it - and the
+	// filter is belt-and-braces anyway, since the read DMA only completes
+	// when the guest really did read this window.
 	//
-	// The mirror is a DMA snapshot taken at E-falling and read here a quarter
-	// cycle later, so it is a whole cycle stale; the pin, read this early
-	// after Q-rising, still holds what the 6809 drove in the previous cycle,
-	// which for an "in advance" signal describes THIS one.  Same finding as
-	// the LIC-gated step in c53ac5f.
+	// What settles it is measurement, over a full acia_torture run each way:
+	// the mirrored AVMA was low on 92% of the completions this ISR saw and
+	// rejected 2 of 305 ACIA data reads, with offset $FFD4 turning up in both
+	// the passed and the rejected set - the verdict followed the cycle pattern
+	// of whatever instruction did the reading.  The pin is low on 1.1% of
+	// completions and has rejected ZERO ACIA reads in 610.  A rejection here
+	// costs no data either way: the for(;;) loop services the access, just
+	// not on the fast path.
 	if (MC6809.run_state >= RS_RUNNING && gpio_get(GPIO_AVMA)) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
 		const uint8_t loc = read_addr & registers::register_mask;
@@ -2848,18 +2834,11 @@ status_gather(status_snapshot_t *s)
 	s->rail_baseline = rail_baseline;
 	s->rail_good = rail_good_count;
 	s->busy_lic_avma = MC6809.get_busy_lic_avma();
-	s->mirror_raw = bus_status_mirror.word;
-	s->mirror_pc = (bus_status.sm < 0) ? 0xFFu : static_cast<uint8_t>(
-		pio_sm_get_pc(bus_status.pio, static_cast<uint>(bus_status.sm))
-		- static_cast<uint>(bus_status.offset));
-	s->mirror_fifo = (bus_status.sm < 0) ? 0xFFu : static_cast<uint8_t>(
-		pio_sm_get_rx_fifo_level(bus_status.pio, static_cast<uint>(bus_status.sm)));
-	s->mirror_dma_busy = dma_channel_is_busy(static_cast<uint>(bus_status.data_channel));
-	// Nobody consumes pio2 flag 1 while the bus_status SM is parked on its
-	// wait, so if the clock's "irq prev set 1" is arriving at all the flag
-	// must be LATCHED HIGH here.  Reading it clear means the flag never
-	// arrives and the fault is the irq routing, not the state machine.
-	s->pio2_irq = static_cast<uint8_t>(bus_status.pio->irq & 0xFFu);
+	// pio2 flag 1 is set by the clock at every E-falling and consumed by
+	// nothing since the BUSY/LIC/AVMA mirror went, so SET is now the expected
+	// reading and says only that the clock is running.  Flag 0 is the one
+	// that matters: bus_fault's wait clears it, so it should read clear.
+	s->pio2_irq = static_cast<uint8_t>(bus_fault.pio->irq & 0xFFu);
 	s->clock_pc = (pio_clock.sm < 0) ? 0xFFu : static_cast<uint8_t>(
 		pio_sm_get_pc(pio_clock.pio, static_cast<uint>(pio_clock.sm))
 		- static_cast<uint>(pio_clock.offset));
@@ -3057,29 +3036,15 @@ status_print(const status_snapshot_t *s)
 	// 3. LIC / RTI (DEBUG only)
 #ifdef DEBUG
 	// The live bits as well as the count: the count only moves while the guest
-	// is running, so under HALT the bits are the only way to see the mirror
-	// tracking - and LIC is HIGH when halted at an instruction boundary.
+	// is running, so under HALT the bits are the only way to see BUSY/LIC/AVMA
+	// at all - and LIC is HIGH when halted at an instruction boundary.
 	BLA live{}; live.byte = s->busy_lic_avma;
-	printf("LIC: %-10" PRIu32 "  RTI: %-10" PRIu32 "  mirror: %c%c%c\n",
+	printf("LIC: %-10" PRIu32 "  RTI: %-10" PRIu32 "  pins: %c%c%c\n",
 	       s->lic_count, s->rti_count,
 	       live.bit.BUSY ? 'B' : '.',
 	       live.bit.LIC  ? 'L' : '.',
 	       live.bit.AVMA ? 'V' : '.');
-	// Which stage is stuck, when the mirror is not tracking: a PC parked on
-	// the wait means the clock's E-falling flag is not arriving; a full FIFO
-	// means the state machine pushes but the DMA does not drain; an idle DMA
-	// means the endless transfer is not running at all.
-	printf("mirror raw %08" PRIX32 "  sm pc +%u  rx fifo %u  dma %s\n",
-	       s->mirror_raw, s->mirror_pc, s->mirror_fifo,
-	       s->mirror_dma_busy ? "busy" : "IDLE");
-	// Which stage is stuck, when the mirror is not tracking: a PC parked on
-	// the wait means the clock's E-falling flag is not arriving; a full FIFO
-	// means the state machine pushes but the DMA does not drain; an idle DMA
-	// means the endless transfer is not running at all.
-	printf("mirror raw %08" PRIX32 "  sm pc +%u  rx fifo %u  dma %s\n",
-	       s->mirror_raw, s->mirror_pc, s->mirror_fifo,
-	       s->mirror_dma_busy ? "busy" : "IDLE");
-	printf("pio2 irq flags %02X (flag1 %s)  clock pc +%u\n",
+	printf("pio2 irq flags %02X (flag1 %s - unconsumed, expected)  clock pc +%u\n",
 	       s->pio2_irq, (s->pio2_irq & 0x02u) ? "SET" : "clear", s->clock_pc);
 	if (s->lic_stalled)
 		printf("WARNING: LIC stalled at %" PRIu32 ", run state is %s\n",
@@ -4728,35 +4693,43 @@ status_done:
 		const uint32_t avail = have - start;
 		const uint32_t len = (cmd.tag == CMD_TRACE_LEN) ? MIN(cmd.trace.length, avail) : avail;
 		// B L V are the pins as the capture state machine saw them at this
-		// row's E-falling, so they are the raw in-advance signals: they
-		// describe the NEXT bus cycle.  b l v are what the Q-rising handler
-		// took from the DMA mirror for this row, which is the sample taken
-		// at the END of the previous row - that one-cycle re-phasing is the
-		// whole point of the mirror, and it is what makes LIC mean "opcode
-		// fetch" and AVMA mean "this cycle is a valid access".
+		// row's E-falling.  b l v are what the Q-rising handler read for the
+		// same row.  Both land after t_CD, so both carry the raw in-advance
+		// values and the two columns should be IDENTICAL: measured 0 rows
+		// differing in 512, against 446 differing from the previous row.
 		//
-		// So ! compares b l v against the PREVIOUS row's B L V, not this
-		// row's.  A clean column means the mirror carries the pins faithfully
-		// and lands them on the cycle they describe; a ! is a fault in the
-		// DMA path or a lost sample, not something the 6809 did.
-		const uint32_t mirrored = MC6809.trace_mirror_count();
-		uint32_t mirror_differs = 0u;
+		// ! is therefore not a phase check but a t_CD check - the only thing
+		// that can separate the columns is the handler reading before the
+		// 6809 has updated the pins, which would make b l v a cycle older.
+		// Everything that acts on these bits assumes it does not (the step
+		// gate, the read ISR's AVMA guard), so a ! column is the warning that
+		// the assumption has broken - worth re-reading after any change to
+		// this handler's cost, or at a higher E where t_CD is tighter.
+		const uint32_t blas = MC6809.trace_bla_count();
+		uint32_t bla_differs = 0u, bla_differs_prev = 0u;
 		printf("    #  EQ R/W  A  D  CS  bus-state    B L V  b l v !  "
 		       "H N F I  TSK Pg  FM\n");
 		for (uint32_t i = start; i < start + len; i++) {
 			bus_pins bp{}; bp.word = MC6809.trace_word(i);
 			high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(i);
 			BLA bla{}; bla.byte = static_cast<uint8_t>(bp.bits.BUSY_LIC_AVMA);
-			const bool have_mirror = i < mirrored;
-			BLA mir{}; mir.byte = have_mirror ? MC6809.trace_mirror_byte(i) : 0u;
-			// The pins from the row before: what this row's mirror value
-			// should be carrying.  Row 0 has no predecessor to check against.
+			const bool have_bla = i < blas;
+			BLA mir{}; mir.byte = have_bla ? MC6809.trace_bla_byte(i) : 0u;
+			// The pins from the row before: what this row's handler read
+			// should match.  Row 0 has no predecessor to check against.
 			BLA prev{};
 			bus_pins pbp{}; pbp.word = (i > 0u) ? MC6809.trace_word(i - 1u) : 0u;
 			prev.byte = static_cast<uint8_t>(pbp.bits.BUSY_LIC_AVMA);
-			const bool differs = have_mirror && i > 0u && mir.byte != prev.byte;
+			// Counted BOTH ways, because which row the handler's read
+			// belongs to is a measurement, not an argument: against this
+			// row's capture (same instant, if the read lands after t_CD)
+			// and against the previous row's (one cycle older, if it
+			// lands before).  The footer prints both.
+			const bool differs = have_bla && mir.byte != bla.byte;
 			if (differs)
-				mirror_differs++;
+				bla_differs++;
+			if (have_bla && i > 0u && mir.byte != prev.byte)
+				bla_differs_prev++;
 			printf("%5" PRIu32 "  %c%c  %c  %02X %02X  %c   %-11s  %c %c %c  "
 			       "%c %c %c %c  %c %c %c %c  "
 			       "%2u%c  %u  %c%c\n",
@@ -4771,9 +4744,9 @@ status_done:
 			       bla.bit.BUSY ? 'B' : '.',
 			       bla.bit.LIC  ? 'L' : '.',
 			       bla.bit.AVMA ? 'V' : '.',
-			       have_mirror ? (mir.bit.BUSY ? 'b' : '.') : '?',
-			       have_mirror ? (mir.bit.LIC  ? 'l' : '.') : '?',
-			       have_mirror ? (mir.bit.AVMA ? 'v' : '.') : '?',
+			       have_bla ? (mir.bit.BUSY ? 'b' : '.') : '?',
+			       have_bla ? (mir.bit.LIC  ? 'l' : '.') : '?',
+			       have_bla ? (mir.bit.AVMA ? 'v' : '.') : '?',
 			       differs ? '!' : '.',
 			       bp.bits.HALT ? '.' : 'H',	// active-low outputs: letter = asserted
 			       bp.bits.NMI  ? '.' : 'N',
@@ -4792,9 +4765,10 @@ status_done:
 		// on' those are the same moment; with a vector trigger the handler
 		// starts first, so expect a constant row offset and read the columns
 		// for agreement of values rather than row-for-row.
-		printf("mirror: %" PRIu32 " rows recorded, %" PRIu32
-		       " of %" PRIu32 " shown differ from the pins\n\n",
-		       mirrored, mirror_differs, len);
+		printf("handler reads: %" PRIu32 " rows recorded; of %" PRIu32
+		       " shown, %" PRIu32 " differ from THIS row's capture and %"
+		       PRIu32 " from the PREVIOUS row's\n\n",
+		       blas, len, bla_differs, bla_differs_prev);
 		break;
 	}
 
@@ -5396,15 +5370,6 @@ __no_inline_not_in_flash_func(main_core1)()
 	pio_sm_set_enabled(task_output.pio, task_output.sm, true);
 	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_output.pio), task_output.sm);
 
-	// After the clock program, which is what ticks it: this state machine
-	// does nothing but wait on the clock's E-falling flag.  Its DMA was
-	// started at configure time and is endless, so there is nothing else to
-	// arm; with the state machine disabled the mirror simply stayed at zero,
-	// which reads as BUSY/LIC/AVMA all low on every cycle.
-	pio_sm_set_enabled(bus_status.pio, bus_status.sm, true);
-	printf("Core1 bus status pio%d/sm%d started\n",
-	       PIO_NUM(bus_status.pio), bus_status.sm);
-
 	pio_sm_set_enabled(rti_detect.pio, rti_detect.sm, true);
 	pio_set_irq0_source_enabled(rti_detect.pio, RTI_PIO_IRQ_SOURCE, true);
 	irq_set_exclusive_handler(rti_detect.irq, pio_rti_irq_handler);
@@ -5928,44 +5893,6 @@ bus_pio_dma_init()
 	bus_fault.sm = pio_claim_unused_sm(bus_fault.pio, true);
 	bus_fault_program_init(bus_fault.pio, bus_fault.sm,
 			       static_cast<uint>(bus_fault.offset), GPIO_FAULT);
-
-	// BUSY/LIC/AVMA mirror, on pio2's last state machine.  Ticked at
-	// E-falling by the clock program's flag 1; the DMA pair below keeps the
-	// newest sample in bus_status_mirror for ever.
-	bus_status.offset = pio_add_program(bus_status.pio, &bus_status_program);
-	if (bus_status.offset < 0) {
-		printf("Core0 insufficient space for bus_status program\n");
-		panic("Unable to proceed");
-	}
-	bus_status.sm = pio_claim_unused_sm(bus_status.pio, true);
-	bus_status_program_init(bus_status.pio, static_cast<uint>(bus_status.sm),
-				static_cast<uint>(bus_status.offset), GPIO_BUSY);
-
-	// One channel in ENDLESS mode (RP2350 TRANS_COUNT MODE 0xF): the count
-	// never decrements, so it drains the state machine's RX FIFO into the one
-	// mirror word - no increment on either side - until an abort, raising no
-	// interrupt and triggering nothing.
-	//
-	// This was a pair of channels chained to each other, which does NOT run
-	// for ever: chaining fires ON completion, so after the first channel's
-	// 0xFFFFFF transfers it hands to the second, and when that one is spent
-	// it hands back to a channel whose count is now zero.  A channel
-	// triggered with a zero count transfers nothing, so the mirror froze
-	// after 2 x 16777215 E cycles - 33.5 s at 1 MHz, 11 s at 3 MHz - and
-	// set_busy_lic_avma() fed stale bits from then on with nothing to say so.
-	dma_channel_claim(static_cast<uint>(bus_status.data_channel));
-	dma_channel_config cfg = dma_channel_get_default_config(static_cast<uint>(bus_status.data_channel));
-	channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
-	channel_config_set_read_increment(&cfg, false);
-	channel_config_set_write_increment(&cfg, false);
-	channel_config_set_dreq(&cfg, pio_get_dreq(bus_status.pio,
-						   static_cast<uint>(bus_status.sm), false));
-	dma_channel_configure(static_cast<uint>(bus_status.data_channel), &cfg,
-			      const_cast<void *>(static_cast<volatile void *>(&bus_status_mirror)),
-			      &bus_status.pio->rxf[bus_status.sm],
-			      dma_encode_endless_transfer_count(), true);
-	printf("Core0 bus status pio%u sm%d configured, DMA %d endless -> mirror\n",
-	       PIO_NUM(bus_status.pio), bus_status.sm, bus_status.data_channel);
 
 	dma_channel_claim(trace_lo.data_channel);
 	dma_channel_claim(trace_hi.data_channel);

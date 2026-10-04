@@ -67,11 +67,7 @@ struct status_snapshot_t {
 	bool     lic_stalled;
 	float    rail_baseline;	// the cutout's slow reference, 0 = not established
 	uint32_t rail_good;	// consecutive healthy samples behind it
-	uint8_t  busy_lic_avma;	// live mirror bits, as the Q handler last used them
-	uint32_t mirror_raw;	// the whole mirror word, to see bits outside the low three
-	uint8_t  mirror_pc;	// bus_status SM's PC, relative to its program offset
-	uint8_t  mirror_fifo;	// its RX FIFO level
-	bool     mirror_dma_busy;
+	uint8_t  busy_lic_avma;	// the pins, as the Q handler last read them
 	uint8_t  pio2_irq;	// all eight of pio2's SM-visible IRQ flags
 	uint8_t  clock_pc;	// the E/Q clock SM's PC, to prove it is cycling
 #endif

@@ -141,9 +141,9 @@ private:
 	// state machine saw them; this one is what reached the software, so a
 	// disagreement between them is a fault in the mirror's DMA path rather
 	// than in the sampling.  Written by the CPU, not by DMA.
-	volatile uint8_t trace_mirror[trace_size];
+	volatile uint8_t trace_bla[trace_size];
 	// One past the highest row stored, for the dump's footer.
-	volatile uint32_t trace_mirror_index = 0u;
+	volatile uint32_t trace_bla_index = 0u;
 	volatile bool trace_armed = false;	// capture requested (may still be waiting on a trigger)
 	uint8_t trace_irq_trigger = 0u;		// bitmask of (1<<interrupt) vectors that arm capture
 	using trace_cb_t = void (*)();
@@ -197,7 +197,7 @@ public:
 	// --- Bus trace control (one-shot capture of one GPIO word per E cycle) ---
 	void set_trace_callbacks(trace_cb_t arm, trace_cb_t stop, trace_count_cb_t count)
 		{ trace_arm_callback = arm; trace_stop_callback = stop; trace_count_callback = count; }
-	void trace_arm() { trace_mirror_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); }
+	void trace_arm() { trace_bla_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); }
 	[[nodiscard]] bool trace_is_armed() const { return trace_armed; }
 	void trace_stop() { trace_armed = false; if (trace_stop_callback) trace_stop_callback(); }
 	void trace_clear() { trace_stop(); trace_irq_trigger = 0u; }
@@ -213,20 +213,20 @@ public:
 	[[nodiscard]] volatile uint16_t *trace_hi_base() { return trace_hi; }
 	[[nodiscard]] uint32_t trace_word(uint32_t i) const { return trace[i]; }
 	[[nodiscard]] uint16_t trace_hi_word(uint32_t i) const { return trace_hi[i]; }
-	[[nodiscard]] uint8_t trace_mirror_byte(uint32_t i) const { return trace_mirror[i]; }
-	[[nodiscard]] uint32_t trace_mirror_count() const { return trace_mirror_index; }
+	[[nodiscard]] uint8_t trace_bla_byte(uint32_t i) const { return trace_bla[i]; }
+	[[nodiscard]] uint32_t trace_bla_count() const { return trace_bla_index; }
 	// Store this cycle's mirror value at the row the capture DMA is about to
 	// fill, so the two columns line up whatever happened before the guest
 	// started.  An index of its own does NOT work: the E/Q clock runs while
 	// the guest is in reset, so a counter rewound at trace_arm() has already
 	// saturated by the time the guest executes anything, and the column then
 	// shows thousands of static reset-state samples against unrelated rows.
-	void trace_mirror_store(uint32_t i, uint8_t bla)
+	void trace_bla_store(uint32_t i, uint8_t bla)
 	{
 		if (i < trace_size) {
-			trace_mirror[i] = bla;
-			if (i + 1u > trace_mirror_index)
-				trace_mirror_index = i + 1u;
+			trace_bla[i] = bla;
+			if (i + 1u > trace_bla_index)
+				trace_bla_index = i + 1u;
 		}
 	}
 	void trace_irq_event(interrupt i)

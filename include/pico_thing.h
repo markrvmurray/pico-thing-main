@@ -150,38 +150,37 @@ union bus_pins {
 	uint32_t word;
 };
 
-// GPIO 32 upwards, as read from the SIO high input register.
-// BUSY, LIC and AVMA as a PIO state machine samples them at E-falling and a
-// DMA mirrors them into memory - see bus_status_mirror in pico_thing.cpp.
+// BUSY, LIC and AVMA are "in advance" signals: they describe the NEXT bus
+// cycle, and the datasheet makes them valid only t_CD after Q-rising (300 ns at
+// 1 MHz, 250 at 1.5, 200 at 2).
 //
-// All three are "in advance" signals: they describe the NEXT bus cycle, and the
-// datasheet makes them valid only t_CD after Q-rising (300 ns at 1 MHz, 250 at
-// 1.5, 200 at 2).  Sampling at Q-rising therefore reads the previous cycle's
-// values, which is what the firmware used to do.  Sampled at E-falling - the
-// last moment of a cycle, and well clear of t_CD at every supported E - and
-// read during the cycle that follows, they mean what one wants them to mean:
-// AVMA "this cycle is a valid bus cycle" and LIC "this cycle is the first cycle
-// of an instruction".  The conversion is done by the choice of sample point, so
-// no reader has to remember to shift it.
+// MEASURED, not assumed (2026-10-04): the Q-rising handler's gpio_get_all()
+// lands AFTER t_CD, so what it reads is already the next cycle's description -
+// byte-identical to what the trace's capture state machine records at
+// E-falling of the same cycle, 0 rows differing out of 512, where 446 of those
+// rows differ from the previous cycle's capture.  So a reader here gets raw
+// in-advance semantics: LIC means "the NEXT cycle is an opcode fetch", AVMA
+// "the NEXT cycle is a valid bus cycle".
 //
-// Named for bus_pins and high_bus_pins above, and NOT "bus_status": that is
-// the pio_dma instance's name, and a variable hides a union of the same name.
+// That is exactly what something acting a cycle ahead wants, and it is why the
+// single-stepper gates on these bits: arming NMI on a LIC edge leaves it
+// pending through the whole of the instruction about to be fetched, so the 6809
+// completes that one instruction and takes it (c53ac5f).
 //
-// Bit order matches union BLA, so the word's low three bits feed
-// mc6809::set_busy_lic_avma() unchanged.
+// A PIO sampler at E-falling feeding a DMA-maintained mirror word used to
+// re-phase them to "THIS cycle" instead (6b77bb3).  It worked for a display,
+// and it was wrong for acting: the mirror was written a quarter cycle before
+// the handler read it with nothing ordering the two, so what the handler got
+// was a cycle behind even that - two instructions per step, and a read ISR
+// whose AVMA guard rejected accesses preceded by a dead cycle (9106b91).  The
+// mirror is gone and the pins are the source; the trace's `!` column is what
+// watches the t_CD assumption above.
 //
-// READ IT ONCE.  Every bitfield read of a volatile is its own load, so testing
-// two fields in one expression can mix samples from adjacent E cycles.  Copy
-// `word` into a local and decode that.
-union bus_status_pins {
-	struct {
-		uint32_t BUSY : 1;	// 20
-		uint32_t LIC : 1;	// 21
-		uint32_t AVMA : 1;	// 22
-		uint32_t : 29;
-	} bits;
-	uint32_t word;
-};
+// Bit order matches union BLA, so the field feeds set_busy_lic_avma() unchanged.
+//
+// READ THE WORD ONCE.  Every bitfield read of a volatile is its own load, so
+// testing two fields in one expression can mix samples from adjacent E cycles.
+// Copy `word` into a local and decode that.
 
 union high_bus_pins {
 	struct {

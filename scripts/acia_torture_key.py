@@ -142,7 +142,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=40.0,
                     help="give up this long after starting the suite")
     ap.add_argument("--power", action="store_true",
-                    help="'power on' first, and let the rails settle")
+                    help="'power on' and 'run 0' first, then let it settle")
     ap.add_argument("--watch-only", action="store_true",
                     help="touch the console not at all: watch, press, report")
     ap.add_argument("--force", action="store_true",
@@ -173,6 +173,11 @@ def main():
                     return 2
                 if a.power:
                     command(ctrl, "power on", settle=3.0, limit=20.0)
+                    # DAT_INIT, and not optional: a freshly powered guest has
+                    # no identity mapping, so the S-records load into RAM the
+                    # CPU cannot then fetch from.  The symptom is a single
+                    # junk character on the guest port and no banner at all.
+                    command(ctrl, "run 0", settle=2.0, limit=20.0)
                 command(ctrl, "sp")
                 if not load_srec(ctrl, a.srec):
                     print("S-records were rejected - not starting")
