@@ -81,6 +81,13 @@ extern void            cmd_yy_reset_str_pool(void);
 #define SYS_CLK_DEFAULT 320000000
 #endif
 
+// The ADC clock, in kHz.  48000 is what the SDK sets and what everything here
+// was calibrated against; lower values lengthen each conversion and are a
+// diagnostic for a drooping reference - see the note at the clock_configure().
+#ifndef PICO_THING_ADC_CLK_KHZ
+#define PICO_THING_ADC_CLK_KHZ 48000u
+#endif
+
 // The Pico's command console, and the only one: stdio is wired to this UART
 // alone, while both USB CDC ports belong to the guest's ACIAs.  So this is
 // also the only real baud rate in the firmware - the CDC ports ignore the
@@ -6502,6 +6509,27 @@ main()
 	printf("successful!\n");
 	printf("Core0 console baudrate set to %d\n", CONSOLE_BAUDRATE);
 
+	// A CONVERSION TAKES 96 ADC CLOCKS, so this sets how long the SAR
+	// comparator spends drawing charge from ADC_VREF: 2 us at 48 MHz, 8 us
+	// at 12 MHz.  It is a diagnostic lever, not a tuning knob.
+	//
+	// Why it exists (2026-10-05): both ADC channels read as though the
+	// reference were 2.03V while a meter on A101 pin 53 says 3.2470V and the
+	// 3.3V rail says 3.2855V.  If the module's local decoupling on that pin
+	// has failed, the reference droops during the conversion while a DC meter
+	// still sees the unloaded value - and a slower ADC clock gives it more
+	// time to recover between bit trials, so the gain error should SHRINK.
+	// If the error does not move with this, the droop theory is dead and the
+	// fault is the module's internal ADC_AVDD (not brought out on a PGA2350)
+	// or the converter itself.
+	if (PICO_THING_ADC_CLK_KHZ != 48000u) {
+		clock_configure(clk_adc, 0,
+				CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+				48 * MHZ, PICO_THING_ADC_CLK_KHZ * 1000u);
+		printf("Core0 clk_adc set to %u kHz (conversion %.1f us)\n",
+		       PICO_THING_ADC_CLK_KHZ,
+		       96.0 / (double) PICO_THING_ADC_CLK_KHZ * 1000.0);
+	}
 	adc_init();
 #if PICO_THING_BOARD_VERSION >= 2
 	adc_gpio_init(GPIO_POWER_ADC);   // 5V divider, version 2 only

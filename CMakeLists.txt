@@ -295,6 +295,13 @@ set(PICO_THING_ISR_COST 1 CACHE STRING
 	"1 = measure the per-cycle ISR cost and report it in st, 0 = do not")
 message(STATUS "Pico-Thing ISR cost instrument: ${PICO_THING_ISR_COST}")
 
+# The ADC clock in kHz.  48000 is the SDK's value and what the ADC calibration
+# was taken against.  Lower it only to lengthen a conversion, which is how a
+# drooping ADC_VREF is distinguished from a broken one.
+set(PICO_THING_ADC_CLK_KHZ 48000 CACHE STRING
+	"ADC clock in kHz; 48000 is standard, lower lengthens each conversion")
+message(STATUS "Pico-Thing clk_adc ${PICO_THING_ADC_CLK_KHZ} kHz")
+
 # The ADC calibration - reference voltage, divider ratio and converter zero
 # error - is deliberately not settable here.  Those three are measurements of
 # one physical board, not choices about how to build it, and as cache
@@ -316,6 +323,7 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_CONSOLE_BAUD=${PICO_THING_CONSOLE_BAUD}
 	SYS_CLK_DEFAULT=${PICO_THING_SYS_CLK_HZ}
 	PICO_THING_ISR_COST=${PICO_THING_ISR_COST}
+	PICO_THING_ADC_CLK_KHZ=${PICO_THING_ADC_CLK_KHZ}u
 )
 
 target_link_libraries(pico-thing
