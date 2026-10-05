@@ -21,6 +21,7 @@
 #include "pico/util/queue.h"
 
 #include "hardware/clocks.h"
+#include "hardware/structs/systick.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
@@ -60,7 +61,25 @@ extern void            cmd_yy_reset_str_pool(void);
 #include "pico_thing.pio.h"
 
 // I'm really pushing my luck with this.
+//
+// Overridable from the build, because the ceiling on the guest's E clock is
+// now set by how many clk_sys cycles the per-cycle work needs, not by the
+// 6809: with the HD63C09E fitted the demand measured ~226 cycles per E cycle,
+// which is ~1.4 MHz at 320 MHz and scales directly with this number.
+//
+//     cmake -D PICO_THING_SYS_CLK_HZ=360000000 ...
+//
+// The regulator is already at VREG_VOLTAGE_1_30 before this is applied, and
+// set_sys_clock_hz() is called with panic=false so an unachievable target
+// falls back rather than hanging.  What this does NOT touch is the QMI
+// divider for XIP flash, so at a high enough clk_sys the flash clock goes out
+// of spec - the symptom would be a boot that dies as soon as it executes
+// anything not marked __time_critical_func or __no_inline_not_in_flash_func.
+// The owner has had 360 MHz reliable and 400 MHz with unreliable starts on a
+// different RP2350B module.
+#ifndef SYS_CLK_DEFAULT
 #define SYS_CLK_DEFAULT 320000000
+#endif
 
 // The Pico's command console, and the only one: stdio is wired to this UART
 // alone, while both USB CDC ports belong to the guest's ACIAs.  So this is
@@ -493,9 +512,127 @@ static volatile bool dat_fault_nmi_pending = false;
 extern "C" uint32_t __StackOneBottom;	// linker symbol (NOLINT: the name is the SDK's)
 extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK's)
 
+// ---------------------------------------------------------------------------
+// What the per-cycle ISRs actually cost, in clk_sys cycles.
+//
+// Why this exists: with the HD63C09E fitted the CPU stopped being the limit.
+// 1.5 MHz runs, 2.0 MHz starves Core 1's for(;;) loop - 178 iterations in 28
+// seconds, resuming the moment the clock drops back - so the budget is the
+// thing to know:
+//
+//     E        E period     clk_sys 320 MHz cycles per E cycle
+//     1.0 MHz   1000 ns      320
+//     1.5 MHz    667 ns      213   works
+//     2.0 MHz    500 ns      160   starves
+//
+// SysTick rather than DWT: it is per-core like the handler, always present
+// without a debugger, and the SDK uses it for nothing (checked).  It counts
+// DOWN from its reload, so a delta is (start - end) masked to 24 bits, which
+// is correct across the wrap.  24 bits at 320 MHz is 52 ms, far longer than
+// anything measured here.
+//
+// The instrument costs two SysTick reads and a few compares, so it INFLATES
+// what it reports by perhaps 10-15 cycles.  Read the numbers as an upper
+// bound, and mind that both ISRs land in the same E cycle whenever the guest
+// touches this window: their SUM is what has to fit.
+//
+// Its own switch rather than plain DEBUG, because it costs ~21 cycles per E
+// cycle - enough to move the ceiling by about 0.13 MHz, which is why 1.3 MHz
+// started failing the moment it went in.  Build with
+// -D PICO_THING_ISR_COST=0 to get those cycles back while keeping the rest of
+// DEBUG.
+#ifndef PICO_THING_ISR_COST
+#define PICO_THING_ISR_COST 1
+#endif
+#if defined(DEBUG) && PICO_THING_ISR_COST
+#define ISR_COST_ON 1
+#else
+#define ISR_COST_ON 0
+#endif
+
+#if ISR_COST_ON
+#define SYSTICK_MASK 0x00FFFFFFu
+struct isr_cost {
+	uint32_t last, min, max, n;
+	uint64_t sum;
+};
+static volatile isr_cost q_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
+static volatile isr_cost read_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
+
+static inline void
+isr_cost_init()		// Core 1 only: SysTick is per-core
+{
+	systick_hw->csr = 0u;			// off while reconfiguring
+	systick_hw->rvr = SYSTICK_MASK;		// free-run over the full 24 bits
+	systick_hw->cvr = 0u;			// any write reloads it
+	systick_hw->csr = 0x5u;			// ENABLE | CLKSOURCE=processor, no IRQ
+}
+
+static inline void
+isr_cost_note(volatile isr_cost &c, const uint32_t d)
+{
+	c.last = d;
+	if (d < c.min)
+		c.min = d;
+	if (d > c.max)
+		c.max = d;
+	c.sum += d;
+	c.n++;
+}
+
+// Every cycle spent in either per-cycle ISR, so Core 1's loop can subtract
+// what the ISRs took from its own wall time and report its OWN work.  32 bits
+// deliberately: a single load is atomic on this core, where the 64-bit sums
+// above could tear under an interrupt, and unsigned subtraction is correct
+// across the wrap.
+static volatile uint32_t isr_cycles_total = 0u;
+
+static inline void
+isr_cost_add(volatile isr_cost &c, const uint32_t start)
+{
+	const uint32_t d = (start - systick_hw->cvr) & SYSTICK_MASK;
+	isr_cycles_total += d;
+	isr_cost_note(c, d);
+}
+
+// Core 1's loop body, which the cliff position could only ever imply.  Timed
+// from the top of one iteration to the top of the next, less the ISR cycles
+// that landed in between - so this is the loop's OWN cost, not its wall time.
+//
+// Slightly overstated, and in a known direction: an ISR's measured span ends
+// at its second SysTick read, so the bookkeeping after that read is not
+// subtracted and lands here instead.
+static volatile isr_cost loop_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
+static volatile uint32_t loop_prev_stamp = 0u;
+static volatile uint32_t loop_prev_isr = 0u;
+static volatile bool loop_prev_valid = false;
+
+static inline void
+isr_cost_clear(volatile isr_cost &c)	// field by field: a volatile struct
+{					// cannot be assigned as a whole
+	c.last = 0u;
+	c.min = 0xFFFFFFFFu;
+	c.max = 0u;
+	c.n = 0u;
+	c.sum = 0u;
+}
+
+static void
+isr_cost_reset()
+{
+	isr_cost_clear(q_cost);
+	isr_cost_clear(read_cost);
+	isr_cost_clear(loop_cost);
+	loop_prev_valid = false;
+}
+#endif
+
 void __isr
 __time_critical_func(gpio_q_irq_handler())
 {
+#if ISR_COST_ON
+	const uint32_t q_cost_start = systick_hw->cvr;
+#endif
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
@@ -779,6 +916,9 @@ __time_critical_func(gpio_q_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, false); // scope timing
 #endif
+#if ISR_COST_ON
+	isr_cost_add(q_cost, q_cost_start);
+#endif
 }
 
 // ISR for the RTI opcode detector PIO program.
@@ -948,6 +1088,9 @@ static volatile uint32_t status_irq_nordrf = 0u;	// ... but S_RDRF CLEAR: the fa
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
 {
+#if ISR_COST_ON
+	const uint32_t read_cost_start = systick_hw->cvr;
+#endif
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
@@ -1023,6 +1166,9 @@ __time_critical_func(dma_bus_read_irq_handler())
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, false); // scope timing
+#endif
+#if ISR_COST_ON
+	isr_cost_add(read_cost, read_cost_start);
 #endif
 }
 
@@ -3007,6 +3153,48 @@ status_print(const status_snapshot_t *s)
 	printf("PICO TEMPERATURE: %.1fC (%u counts)%s\n",
 	       adc_die_celsius(s->temperature), s->temperature,
 	       adc_quiet ? "" : adc_warning);
+	// THE DIE SENSOR BOUNDS THE REFERENCE, which nothing else here can do.
+	//
+	// Every reading above is counts x ADC_VREF_VOLTS / 4096: a ratio against
+	// the reference, so a reference that is not what the constant says makes
+	// every voltage and every temperature wrong by that ratio, silently.  The
+	// die sensor is the one input whose true voltage is KNOWN and which
+	// nothing on the carrier board can touch - 0.706V at 27C, -1.721 mV/C -
+	// so over the chip's whole legal -40C..+125C its voltage must lie in
+	// 0.537V..0.821V.  Divide those by the counts and you have the reference,
+	// no assumption about the board and none about the temperature:
+	//
+	//     V_sensor = counts x VREF / 4096   =>   VREF = V_sensor x 4096 / counts
+	//
+	// A temperature outside that range therefore does not mean the die is
+	// impossibly hot or cold.  It means the REFERENCE IS WRONG, and this says
+	// so rather than printing -213C and leaving it to be puzzled over.
+	//
+	// Measured on 2026-10-05 after fitting the HD63C09E: 1414 counts, which
+	// puts the reference near 2.05V against the 3.2435V the constant claims -
+	// and the +5VP channel pinned at 4095, where no sag can be seen at all.
+	{
+		const float t = adc_die_celsius(s->temperature);
+		if (s->temperature != 0u && (t < -40.0f || t > 125.0f)) {
+			const float lo = 0.5374f * 4096.0f
+				       / (float) s->temperature;	// die at +125C
+			const float hi = 0.8213f * 4096.0f
+				       / (float) s->temperature;	// die at -40C
+			const float nominal = 0.706f * 4096.0f
+					    / (float) s->temperature;	// die at 27C
+			printf("*** ADC REFERENCE IS WRONG: the die sensor cannot "
+			       "read %.1fC ***\n", (double) t);
+			printf("    it bounds the reference at %.2f-%.2fV "
+			       "(%.2fV for a 27C die), not the %.4fV configured\n",
+			       (double) lo, (double) hi, (double) nominal,
+			       (double) ADC_VREF_VOLTS);
+			printf("    so EVERY voltage above is wrong by that ratio, "
+			       "and the supply cutout cannot be trusted\n");
+		}
+		if (s->voltage >= 4095u)
+			printf("*** +5VP CHANNEL IS CLIPPED at full scale: the "
+			       "reading is a floor, not a measurement ***\n");
+	}
 	const char part = s->qfn60 ? 'A' : 'B';
 	if (const chip_stepping_t *stepping = chip_stepping(s->rom_version)) {
 		if (stepping->revision == s->chip_revision)
@@ -3071,6 +3259,94 @@ status_print(const status_snapshot_t *s)
 	if (s->lic_stalled)
 		printf("WARNING: LIC stalled at %" PRIu32 ", run state is %s\n",
 		       s->lic_count, run_state_string[s->run_state]);
+#if ISR_COST_ON
+	// What the per-cycle ISRs cost against what an E cycle affords.  Both
+	// land in the same E cycle whenever the guest touches this window, so
+	// the two means added is the figure to compare with the budget.  The
+	// instrument itself adds ~12 cycles to each, so these are upper bounds.
+	{
+		// Read the fields out one at a time, for the same reason.
+		const uint32_t q_last = q_cost.last, q_min = q_cost.min,
+			       q_max = q_cost.max, q_n = q_cost.n;
+		const uint64_t q_sum = q_cost.sum;
+		const uint32_t r_last = read_cost.last, r_min = read_cost.min,
+			       r_max = read_cost.max, r_n = read_cost.n;
+		const uint64_t r_sum = read_cost.sum;
+		const float e_mhz = MC6809.get_e_frequency();	// MHz
+		const uint32_t budget = (e_mhz > 0.0f)
+			? (uint32_t) ((float) clock_get_hz(clk_sys)
+				      / (e_mhz * 1.0e6f))
+			: 0u;
+		const uint32_t l_last = loop_cost.last, l_min = loop_cost.min,
+			       l_max = loop_cost.max, l_n = loop_cost.n;
+		const uint64_t l_sum = loop_cost.sum;
+		const uint32_t qm = q_n ? (uint32_t) (q_sum / q_n) : 0u;
+		const uint32_t rm = r_n ? (uint32_t) (r_sum / r_n) : 0u;
+		const uint32_t lm = l_n ? (uint32_t) (l_sum / l_n) : 0u;
+		// Per E CYCLE, not per occurrence: the read ISR fires about 1.2
+		// times per cycle and the loop runs about once, so scale each by
+		// its own count against the Q-rising count, which is exactly one
+		// per E cycle.
+		const uint32_t per_cycle = q_n
+			? qm + (uint32_t) ((uint64_t) rm * r_n / q_n)
+			   + (uint32_t) ((uint64_t) lm * l_n / q_n)
+			: 0u;
+		printf("Per-cycle cost in clk_sys cycles (instrument adds ~6 to each):\n");
+		printf("  Q-rising  last %4" PRIu32 "  min %4" PRIu32 "  max %5" PRIu32
+		       "  mean %4" PRIu32 "  n %" PRIu32 "\n",
+		       q_last, q_n ? q_min : 0u, q_max, qm, q_n);
+		printf("  read DMA  last %4" PRIu32 "  min %4" PRIu32 "  max %5" PRIu32
+		       "  mean %4" PRIu32 "  n %" PRIu32 "\n",
+		       r_last, r_n ? r_min : 0u, r_max, rm, r_n);
+		printf("  Core1 loop last %4" PRIu32 "  min %4" PRIu32
+		       "  max %5" PRIu32 "  mean %4" PRIu32 "  n %" PRIu32
+		       "  (own work, ISRs subtracted)\n",
+		       l_last, l_n ? l_min : 0u, l_max, lm, l_n);
+		// WHERE THE READ SM SPENDS ITS TIME, by sampling its PC.  The DMA
+		// round trip - push the address, wait for the byte to arrive in
+		// the TX FIFO - is the one unmeasured number in the 3 MHz budget,
+		// and it is invisible from the CPU because the DMA runs on its
+		// own.  But the SM blocks on `pull block` while it waits, so the
+		// fraction of samples found at that instruction IS the fraction
+		// of an E cycle spent waiting for the DMA.
+		//
+		// Offsets in mc6809_bus_read, which the histogram prints raw:
+		//    +2/+3  wait for Q           +14  push the address
+		//    +4..13 sample and build     +15  PULL - the DMA round trip
+		//    +16    drive the byte       +17  wait for Q falling
+		//    +19    wait for E falling
+		//
+		// Reading a PIO register is non-intrusive: the SM does not know.
+		if (piodma_read.sm >= 0 && piodma_read.offset >= 0) {
+			static constexpr uint PC_SAMPLES = 20000u;
+			uint16_t hist[32] = {};
+			const uint pc_base = (uint) piodma_read.offset;
+			for (uint i = 0u; i < PC_SAMPLES; i++) {
+				const uint pc = pio_sm_get_pc(piodma_read.pio,
+							      (uint) piodma_read.sm);
+				hist[(pc - pc_base) & 31u]++;
+			}
+			printf("  read SM PC, %u samples:", PC_SAMPLES);
+			for (uint i = 0u; i < 32u; i++)
+				if (hist[i] * 200u >= PC_SAMPLES)	// >= 0.5%
+					printf("  +%u %.1f%%", i,
+					       100.0 * hist[i] / PC_SAMPLES);
+			printf("\n");
+			// +15 is the DMA wait.  Scaled by the cycles an E cycle
+			// affords, that is the round trip in clk_sys cycles.
+			if (budget)
+				printf("  DMA round trip ~%.0f clk_sys cycles "
+				       "(%.1f%% of an E cycle at %.1f MHz)\n",
+				       (double) hist[15] * budget / PC_SAMPLES,
+				       100.0 * hist[15] / PC_SAMPLES,
+				       (double) e_mhz);
+		}
+		printf("  budget %" PRIu32 " cycles per E cycle at %.1f MHz; "
+		       "demand %" PRIu32 " (%" PRIu32 "%%)\n",
+		       budget, (double) e_mhz, per_cycle,
+		       budget ? per_cycle * 100u / budget : 0u);
+	}
+#endif
 	printf("\n");
 #endif
 
@@ -4989,6 +5265,11 @@ status_done:
 			break;
 		MC6809.set_e_frequency(cmd.freq.mhz, pio_clock);
 		printf("Set E to %.1f MHz\n", MC6809.get_e_frequency());
+#if ISR_COST_ON
+		// The budget just changed, so the old samples describe a
+		// different question.
+		isr_cost_reset();
+#endif
 		break;
 
 	case CMD_USB: {
@@ -5341,6 +5622,9 @@ __no_inline_not_in_flash_func(main_core1)()
 		gpio_set_dir(p, GPIO_OUT);
 	}
 
+#if ISR_COST_ON
+	isr_cost_init();		// SysTick is per-core, so it must be here
+#endif
 	fast_serial.reset();
 	aux_serial.reset();
 	printf("Core1 console initialised/reset\n");
@@ -5442,7 +5726,22 @@ __no_inline_not_in_flash_func(main_core1)()
 	core1_initialised = true;
 
 	for (;;) {
-
+#if ISR_COST_ON
+		{
+			const uint32_t now = systick_hw->cvr;
+			const uint32_t isr_now = isr_cycles_total;
+			if (loop_prev_valid) {
+				const uint32_t wall =
+					(loop_prev_stamp - now) & SYSTICK_MASK;
+				const uint32_t isr = isr_now - loop_prev_isr;
+				isr_cost_note(loop_cost,
+					      (wall > isr) ? wall - isr : 0u);
+			}
+			loop_prev_stamp = now;
+			loop_prev_isr = isr_now;
+			loop_prev_valid = true;
+		}
+#endif
 		core1_loop_count++;
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {

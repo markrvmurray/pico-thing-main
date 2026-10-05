@@ -277,6 +277,24 @@ set(PICO_THING_CONSOLE_BAUD 115200 CACHE STRING
 	"UART console baud rate on GPIO 30/31 (the CDC ports ignore baud entirely)")
 message(STATUS "Pico-Thing UART console ${PICO_THING_CONSOLE_BAUD} baud")
 
+# How fast the Pico itself runs, which is what caps the guest's E clock: the
+# per-cycle work measured ~226 clk_sys cycles per E cycle, so the ceiling is
+# this number divided by that - about 1.4 MHz at 320 MHz.  The regulator is
+# already at VREG_VOLTAGE_1_30 before the clock is raised, and the raise is
+# attempted with panic=false so an unachievable target falls back instead of
+# hanging.  NOT adjusted here: the QMI divider for XIP flash, so a high enough
+# clk_sys puts the flash clock out of spec.
+set(PICO_THING_SYS_CLK_HZ 320000000 CACHE STRING
+	"clk_sys in Hz; 360000000 has been reliable on an RP2350B, 400000000 starts unreliably")
+message(STATUS "Pico-Thing clk_sys ${PICO_THING_SYS_CLK_HZ} Hz")
+
+# The per-cycle ISR cost instrument costs about 21 clk_sys cycles per E cycle,
+# which moves the E ceiling by roughly 0.13 MHz.  Set to 0 to get those back
+# while keeping the rest of DEBUG.
+set(PICO_THING_ISR_COST 1 CACHE STRING
+	"1 = measure the per-cycle ISR cost and report it in st, 0 = do not")
+message(STATUS "Pico-Thing ISR cost instrument: ${PICO_THING_ISR_COST}")
+
 # The ADC calibration - reference voltage, divider ratio and converter zero
 # error - is deliberately not settable here.  Those three are measurements of
 # one physical board, not choices about how to build it, and as cache
@@ -296,6 +314,8 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_DAT_FAULT_BLOCK_DELAY=${PICO_THING_DAT_FAULT_BLOCK_DELAY}u
 	PICO_THING_RTI_TASK_RESTORE=${PICO_THING_RTI_TASK_RESTORE}
 	PICO_THING_CONSOLE_BAUD=${PICO_THING_CONSOLE_BAUD}
+	SYS_CLK_DEFAULT=${PICO_THING_SYS_CLK_HZ}
+	PICO_THING_ISR_COST=${PICO_THING_ISR_COST}
 )
 
 target_link_libraries(pico-thing
@@ -314,6 +334,39 @@ target_link_libraries(pico-thing
 
 pico_enable_stdio_usb(pico-thing 0)
 pico_enable_stdio_uart(pico-thing 1)
+
+# Link-time optimisation, across OUR translation units only - the SDK's static
+# libraries are built without it and link normally alongside.
+#
+# WHERE THE GAIN IS, and is not.  The Q-rising handler is already fully
+# inlined: a disassembly of it shows 137 instructions and ZERO out-of-line
+# calls, because everything it touches (set_busy_lic_avma, count_lic, tick,
+# trace_bla_store) is defined in a header.  LTO cannot improve it.
+#
+# Core 1's for(;;) loop is the opposite: on every pass it calls
+# uart_port_pump() in uart_pump.cpp, mc6809::uart_task() in mc6809.cpp, and
+# sync_status()/has_interrupt()/guest_transmit() in mc6850.cpp, none of which
+# can inline today.  That loop costs roughly 77 clk_sys cycles per E cycle and
+# is the term that decides where the guest's clock ceiling falls, so this is
+# the place worth attacking.
+#
+# ThinLTO rather than full: for a tree this size it is as effective and builds
+# far quicker.  CHECK AFTER TURNING IT ON that the hot code is still in RAM -
+# the __time_critical_func and __no_inline_not_in_flash_func placements must
+# survive, or the per-cycle paths start running from XIP flash and everything
+# measured here becomes meaningless:
+#
+#   llvm-objdump -t pico-thing.elf | grep _Z18gpio_q_irq_handlerv
+#
+# should show it in .data, not .text.
+option(PICO_THING_LTO "Link-time optimisation across the project's own sources" OFF)
+if(PICO_THING_LTO)
+	message(STATUS "Pico-Thing LTO: ThinLTO enabled")
+	target_compile_options(pico-thing PRIVATE -flto=thin)
+	target_link_options(pico-thing PRIVATE -flto=thin)
+else()
+	message(STATUS "Pico-Thing LTO: off")
+endif()
 
 pico_add_extra_outputs(pico-thing)
 pico_set_binary_type(pico-thing copy_to_ram)
