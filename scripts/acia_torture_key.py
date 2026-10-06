@@ -129,8 +129,9 @@ def watch(guest, char, banner, timeout):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--console", default=console.PORT,
-                    help="the debug probe's UART bridge, for commands")
+    ap.add_argument("--console", default=None,
+                    help="the MAIN probe's UART bridge; found by adapter serial"
+                         " if not given, since the device node moves")
     ap.add_argument("--guest", default=GUEST_PORT,
                     help="CDC 0, where the suite's own output appears")
     ap.add_argument("--srec", default=SREC)
@@ -148,6 +149,12 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="drive the console even if the signature check fails")
     a = ap.parse_args()
+
+    if a.console is None:
+        a.console = console.find_console_port()
+        if a.console is None:
+            print("cannot find the main probe's console; see console.py --help")
+            return 2
 
     try:
         guest = serial.Serial(a.guest, console.BAUD, timeout=0.2)

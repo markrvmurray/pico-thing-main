@@ -7,7 +7,10 @@ reference, so a bad reference makes the board's own numbers wrong in exactly
 the way that hides the fault.  An outside meter has no such problem.
 
     P=/Users/markmurray/Documents/PICO/venv/bin/python
-    $P scripts/dmm.py --list                       what serial ports exist
+    $P scripts/dmm.py --scan                       which meter is on which port
+    $P scripts/dmm.py --meter MY51050035:PIN53 \
+                      --meter MY49410013:TP110 --duration 30
+    $P scripts/dmm.py --list                       every serial port
     $P scripts/dmm.py --port /dev/cu.usbserial-A --id
     $P scripts/dmm.py --port /dev/cu.usbserial-A:3V3 \
                       --port /dev/cu.usbserial-B:5VP --duration 30
@@ -41,6 +44,20 @@ import time
 import serial
 from serial.tools import list_ports
 
+# THE DEVICE NODE IS NOT AN IDENTITY.  On 2026-10-06 the two meters' nodes
+# swapped between one reading and the next - /dev/cu.usbserial-20242330 was the
+# U1252B in the afternoon and the U1252A in the evening - so a label attached
+# to a node silently moved to the other meter and nearly produced a wrong
+# conclusion about which circuit node had been measured.  Match on the serial
+# in *IDN? instead, with --meter, and the label cannot transpose.
+#
+# The IR-USB cables are Prolific PL2303 (067B:2303), and ONLY those are probed:
+# probing means WRITING (*IDN?), and one FT230X on this bench is a serial
+# console into another machine, where a stray byte once landed in somebody's
+# pager.  Belt and braces - the VID:PID filter, plus an explicit deny.
+METER_VID_PID = "067B:2303"
+NEVER_OPEN = ("DO02DCPC",)	# the FT230X: not ours, never write to it
+
 
 def ask(ser, cmd, settle=0.35):
     """Send one SCPI command and return its reply, or '' if it does not answer."""
@@ -60,10 +77,47 @@ def ask(ser, cmd, settle=0.35):
     return buf.decode("utf-8", "replace").strip()
 
 
+def candidate_ports():
+    """Serial ports that look like an Agilent IR-USB cable, and nothing else."""
+    out = []
+    for p in sorted(list_ports.comports(), key=lambda p: p.device):
+        hwid = (p.hwid or "").upper()
+        if METER_VID_PID not in hwid:
+            continue
+        if any(bad.upper() in hwid for bad in NEVER_OPEN):
+            continue
+        out.append(p.device)
+    return out
+
+
+def scan_meters(idn_cmd, baud):
+    """serial number -> (device, model, idn), by asking each candidate who it is."""
+    found = {}
+    for dev in candidate_ports():
+        try:
+            ser = serial.Serial(dev, baud, timeout=0.3)
+        except serial.SerialException:
+            continue
+        with ser:
+            idn = ask(ser, idn_cmd)
+        if not idn:
+            continue
+        parts = [f.strip() for f in idn.split(",")]
+        serial_no = parts[2] if len(parts) > 2 else dev
+        model = parts[1] if len(parts) > 1 else "?"
+        found[serial_no] = (dev, model, idn)
+    return found
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", action="append", default=[], metavar="PORT[:LABEL]",
-                    help="repeatable; one per meter")
+                    help="repeatable; by device node, which can move between"
+                         " meters - prefer --meter")
+    ap.add_argument("--meter", action="append", default=[], metavar="SERIAL[:LABEL]",
+                    help="repeatable; by the serial in *IDN?, which cannot move")
+    ap.add_argument("--scan", action="store_true",
+                    help="show which meter is on which port, and exit")
     ap.add_argument("--baud", type=int, default=9600,
                     help="most bench meters default to 9600 (default 9600)")
     ap.add_argument("--idn", default="*IDN?")
@@ -86,8 +140,27 @@ def main():
             print(f"{p.device}  {p.description}  {p.hwid}")
         return 0
 
+    if a.scan:
+        found = scan_meters(a.idn, a.baud)
+        if not found:
+            print("no SCPI meter answered on any Prolific port")
+            return 2
+        for serial_no, (dev, model, idn) in sorted(found.items()):
+            print(f"{serial_no}  {model}  {dev}  ({idn})")
+        return 0
+
+    if a.meter:
+        found = scan_meters(a.idn, a.baud)
+        for spec in a.meter:
+            serial_no, _, label = spec.partition(":")
+            if serial_no not in found:
+                print(f"no meter with serial {serial_no}; seen:"
+                      f" {', '.join(sorted(found)) or 'none'}")
+                return 2
+            a.port.append(f"{found[serial_no][0]}:{label or serial_no}")
+
     if not a.port:
-        print("no --port given; try --list")
+        print("no --port or --meter given; try --scan")
         return 2
 
     meters = []

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Drive the Pico-Thing UART console, echoing everything verbatim.
 
-The console is the debug probe's UART bridge, not the FT230X - that one is a
-serial console into another machine entirely.
+The console is the MAIN debug probe's UART bridge, not the FT230X - that one is
+a serial console into another machine entirely - and not the video board's
+probe either.  The port is found by the probe's adapter serial, because the
+device node moves when things are replugged.
 
     P=/Users/markmurray/Documents/PICO/venv/bin/python
     $P scripts/console.py --listen 5            read only, writes nothing
@@ -30,8 +32,24 @@ import sys
 import time
 
 import serial
+from serial.tools import list_ports
 
-PORT = "/dev/cu.usbmodem202423102"
+# WHICH PROBE, BY SERIAL.  There are two CMSIS-DAP probes on this bench and the
+# device node shuffles with replugging: on 2026-10-06 /dev/cu.usbmodem202423102
+# was the VIDEO board's probe, where it had been the main board's earlier the
+# same day.  Talking to the wrong one is not harmless - the video board has its
+# own session - so the port is found by matching the adapter serial, which does
+# not move.  probe_main.cfg pins flashing by the same serial.
+MAIN_PROBE_SERIAL = "E6647C7403512C2E"	# main board; prompt ">>> "
+VIDEO_PROBE_SERIAL = "E6633861A3266938"	# video board; prompt "==> " - NOT this one
+
+
+def find_console_port():
+    """The main probe's UART bridge, by adapter serial rather than node name."""
+    for p in list_ports.comports():
+        if MAIN_PROBE_SERIAL.lower() in (p.hwid or "").lower():
+            return p.device
+    return None
 BAUD = 115200
 SIGNATURE = (b">>>", b"Pico2 MC6809E", b"POWER:", b"Core0", b"Core1",
              b"Bus State", b"Run State")
@@ -62,7 +80,9 @@ def show(label, data):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default=PORT)
+    ap.add_argument("--port", default=None,
+                    help="override; by default the main probe is found by its"
+                         " adapter serial, since the device node moves")
     ap.add_argument("--listen", type=float, metavar="S",
                     help="READ ONLY for S seconds, then exit")
     ap.add_argument("--ping", action="store_true",
@@ -80,6 +100,16 @@ def main():
                          " break, which waits for the stacked frame to settle")
     ap.add_argument("command", nargs="*")
     a = ap.parse_args()
+
+    if a.port is None:
+        a.port = find_console_port()
+        if a.port is None:
+            print(f"no serial port carries the main probe's adapter serial"
+                  f" {MAIN_PROBE_SERIAL}. Ports seen:")
+            for p in sorted(list_ports.comports(), key=lambda p: p.device):
+                print(f"  {p.device}  {p.description}  {p.hwid}")
+            return 2
+        print(f"main probe {MAIN_PROBE_SERIAL} -> {a.port}")
 
     print(f"opening {a.port} at {BAUD} 8N1, no flow control")
     try:
