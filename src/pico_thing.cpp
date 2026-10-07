@@ -680,6 +680,14 @@ isr_cost_add(volatile isr_cost &c, const uint32_t start)
 // at its second SysTick read, so the bookkeeping after that read is not
 // subtracted and lands here instead.
 static volatile isr_cost loop_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
+
+// THE GAP BETWEEN PASSES, which is a different quantity from loop_cost and the
+// one Core 1's DEADLINE is actually about.  loop_cost holds the loop's own WORK
+// - the instrument subtracts ISR time from it - whereas what matters for the
+// write ring is the WALL-CLOCK interval between drains, because the write ISR
+// keeps filling the ring throughout, ISR time included.  Reporting the own-work
+// figure as "worst period" understated the gap; this bucket is the real thing.
+static volatile isr_cost loop_period = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
 static volatile uint32_t loop_prev_stamp = 0u;
 static volatile uint32_t loop_prev_isr = 0u;
 static volatile bool loop_prev_valid = false;
@@ -700,6 +708,7 @@ isr_cost_reset()
 	isr_cost_clear(q_cost);
 	isr_cost_clear(read_cost);
 	isr_cost_clear(loop_cost);
+	isr_cost_clear(loop_period);
 	loop_prev_valid = false;
 }
 #endif
@@ -3331,13 +3340,28 @@ status_print(const status_snapshot_t *s)
 		const uint32_t qm = q_n ? (uint32_t) (q_sum / q_n) : 0u;
 		const uint32_t rm = r_n ? (uint32_t) (r_sum / r_n) : 0u;
 		const uint32_t lm = l_n ? (uint32_t) (l_sum / l_n) : 0u;
-		// Per E CYCLE, not per occurrence: the read ISR fires about 1.2
-		// times per cycle and the loop runs about once, so scale each by
-		// its own count against the Q-rising count, which is exactly one
-		// per E cycle.
-		const uint32_t per_cycle = q_n
+		// PER E CYCLE, NOT PER OCCURRENCE, and the two kinds of work are
+		// kept APART, which is the whole point of this instrument.
+		//
+		// The ISRs have a DEADLINE: they must finish inside the E cycle
+		// they belong to, so their total against the budget is what decides
+		// how fast E can go.  Scale each by its own count against the
+		// Q-rising count, which is exactly one per E cycle - the read ISR's
+		// rate is no longer about 1.0, since the address filter stopped it
+		// firing for anything but a device register.
+		//
+		// Core 1's loop has NO deadline and must not be added in.  It is a
+		// SPINNER: it takes whatever the ISRs leave, so its share rises as
+		// theirs falls and the total sits near 100% for ever.  Adding it is
+		// what made this line read 99% across two changes that each removed
+		// real work - 318 of 320 before and after - and look broken.  Its
+		// passes went from 754k to 116M over the same two changes while
+		// reporting the same utilisation, which is the giveaway.
+		const uint32_t isr_demand = q_n
 			? qm + (uint32_t) ((uint64_t) rm * r_n / q_n)
-			   + (uint32_t) ((uint64_t) lm * l_n / q_n)
+			: 0u;
+		const uint32_t loop_share = q_n
+			? (uint32_t) ((uint64_t) lm * l_n / q_n)
 			: 0u;
 		printf("Per-cycle cost in clk_sys cycles (instrument adds ~6 to each):\n");
 		printf("  Q-rising  last %4" PRIu32 "  min %4" PRIu32 "  max %5" PRIu32
@@ -3358,11 +3382,13 @@ status_print(const status_snapshot_t *s)
 		// fraction of samples found at that instruction IS the fraction
 		// of an E cycle spent waiting for the DMA.
 		//
-		// Offsets in mc6809_bus_read, which the histogram prints raw:
-		//    +2/+3  wait for Q           +14  push the address
-		//    +4..13 sample and build     +15  PULL - the DMA round trip
-		//    +16    drive the byte       +17  wait for Q falling
-		//    +19    wait for E falling
+		// The histogram prints raw offsets into mc6809_bus_read.  THEY MOVE
+		// WHENEVER THAT PROGRAM IS EDITED: the DMA wait sat at +15 until
+		// the address filter made the program 25 words, after which this
+		// read "out null 4" and called it the round trip.  So the one
+		// offset the arithmetic depends on is now taken from the assembler
+		// as mc6809_bus_read_offset_dma_wait, declared "public" on the
+		// instruction itself, and cannot drift again.
 		//
 		// Reading a PIO register is non-intrusive: the SM does not know.
 		if (piodma_read.sm >= 0 && piodma_read.offset >= 0) {
@@ -3380,19 +3406,66 @@ status_print(const status_snapshot_t *s)
 					printf("  +%u %.1f%%", i,
 					       100.0 * hist[i] / PC_SAMPLES);
 			printf("\n");
-			// +15 is the DMA wait.  Scaled by the cycles an E cycle
-			// affords, that is the round trip in clk_sys cycles.
+			// The SM blocks at dma_wait, so the share of samples found
+			// there is the share of an E cycle spent waiting for the
+			// DMA.  Scaled by the budget, that is the round trip.
+			static constexpr uint DMA_WAIT_PC =
+				mc6809_bus_read_offset_dma_wait;
 			if (budget)
 				printf("  DMA round trip ~%.0f clk_sys cycles "
 				       "(%.1f%% of an E cycle at %.1f MHz)\n",
-				       (double) hist[15] * budget / PC_SAMPLES,
-				       100.0 * hist[15] / PC_SAMPLES,
+				       (double) hist[DMA_WAIT_PC] * budget / PC_SAMPLES,
+				       100.0 * hist[DMA_WAIT_PC] / PC_SAMPLES,
 				       (double) e_mhz);
 		}
-		printf("  budget %" PRIu32 " cycles per E cycle at %.1f MHz; "
-		       "demand %" PRIu32 " (%" PRIu32 "%%)\n",
-		       budget, (double) e_mhz, per_cycle,
-		       budget ? per_cycle * 100u / budget : 0u);
+		printf("  ISR demand %" PRIu32 " of %" PRIu32 " cycles per E cycle"
+		       " at %.1f MHz (%" PRIu32 "%%) - THE DEADLINE\n",
+		       isr_demand, budget, (double) e_mhz,
+		       budget ? isr_demand * 100u / budget : 0u);
+		// What the ISRs alone allow, which is the number to watch as the
+		// redesign proceeds: it falls as they get cheaper, where the old
+		// combined figure could not.
+		if (isr_demand)
+			printf("    so the ISRs alone cap E at %.2f MHz\n",
+			       (double) clock_get_hz(clk_sys)
+			       / (double) isr_demand / 1.0e6);
+		// CORE 1'S LOOP HAS A DEADLINE TOO - it is just longer than an
+		// ISR's, and set by how deep the write ring is rather than by the
+		// E cycle.  The ring holds WRITE_RING_SIZE entries and the write
+		// ISR fills one per guest write to this window, so the loop has to
+		// complete a drain within that many writes or the oldest dispatch
+		// is dropped.  The label here used to read "NOT demand: it spins,
+		// so it absorbs whatever is left", which was wrong: it IS demand,
+		// against a longer deadline.
+		//
+		// The runway in E CYCLES depends on how fast the guest can store
+		// into the window.  Extended addressing is five cycles and indexed
+		// no quicker, so four is a conservative floor - it cannot sustain
+		// one write per cycle.
+		static constexpr uint32_t MIN_WRITE_SPACING_CYCLES = 4u;
+		const uint32_t runway = (uint32_t) WRITE_RING_SIZE
+				      * MIN_WRITE_SPACING_CYCLES;
+		// THE GAP BETWEEN PASSES, from loop_period - the wall-clock
+		// interval, ISR time included, because the write ISR fills the
+		// ring throughout it.  loop_cost would have been the wrong bucket:
+		// it is the loop's own work with ISR time subtracted, so it
+		// understates the gap.
+		//
+		// Printed with a decimal because at 1 MHz a real 1.8 E cycles
+		// truncated to "1" and both columns read the same.
+		const uint32_t p_n = loop_period.n, p_max = loop_period.max;
+		const uint64_t p_sum = loop_period.sum;
+		const double e_per = budget ? (double) budget : 1.0;
+		const double gap_mean = p_n
+			? (double) p_sum / (double) p_n / e_per : 0.0;
+		const double gap_max = (double) p_max / e_per;
+		printf("  Core1 loop gap: mean %.1f, worst %.1f E cycles;"
+		       " own work %" PRIu32 " cycles per E cycle\n",
+		       gap_mean, gap_max, loop_share);
+		printf("    its DEADLINE is %u ring entries, about %" PRIu32
+		       " E cycles%s\n", WRITE_RING_SIZE, runway,
+		       (gap_max > (double) runway)
+			       ? "  *** WORST GAP EXCEEDS THE RUNWAY ***" : "");
 	}
 #endif
 	printf("\n");
@@ -5816,6 +5889,17 @@ __no_inline_not_in_flash_func(main_core1)()
 		       stack_free);
 	}
 
+#if ISR_COST_ON
+	// INVALIDATE THE LOOP TIMER'S PREVIOUS STAMP.  Core 1 is reset and
+	// relaunched on every "power on", and loop_prev_valid is a file-scope
+	// static that survives that - so the first pass afterwards measured
+	// against a stamp from the previous run and planted one enormous bogus
+	// delta in loop_cost.max, which never leaves because max is monotonic.
+	// That is where the 8.7-million-cycle "worst case" came from, and it
+	// hid the number Core 1's own deadline is judged against.
+	// isr_cost_reset() clears this too, but it is only called from CMD_FREQ.
+	loop_prev_valid = false;
+#endif
 	core1_initialised = true;
 
 	for (;;) {
@@ -5829,6 +5913,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				const uint32_t isr = isr_now - loop_prev_isr;
 				isr_cost_note(loop_cost,
 					      (wall > isr) ? wall - isr : 0u);
+				isr_cost_note(loop_period, wall);
 			}
 			loop_prev_stamp = now;
 			loop_prev_isr = isr_now;

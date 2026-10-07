@@ -199,6 +199,7 @@ wait_q:
 	push	block		side 1	; Send full address = registers[] + A5-0
 	out	null 4		side 1	; discard A0-A3; GPIO3 is A0, NOT A5
 	out	x 2		side 1	; A4,A5 - grabbed BEFORE the pull overwrites the OSR
+public dma_wait:
 	pull	block		side 1	; Wait for data byte reply
 	out	pins 8		side 0	; Set D7-0 output values
 	jmp	x-- no_notify	side 0	; A5 or A4 set: plain memory, tell the CPU nothing
