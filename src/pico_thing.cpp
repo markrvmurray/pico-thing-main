@@ -113,23 +113,36 @@ volatile bool verbose = false;
 // line live together in one pio_dma so they cannot drift apart; -1 means not
 // claimed, or none of that kind.  See the PIO IRQ flag map further down for
 // which flag each program raises.
-#define BUS_CLOCK_PIO	pio0		// E/Q quadrature clock
+//
+// WHY THE BLOCKS ARE DIVIDED THIS WAY.  pio2's GPIO base is 16, so only the
+// three programs that need pins above 31 can live there and none of them can
+// see E or Q.  pio0 and pio1 keep base 0.  That makes pio0 and pio1 the only
+// homes for anything watching the bus, and pio0 is the scarce one: the read
+// program alone is 21 of its 32 words.
+//
+// The clock moved pio0 -> pio1 on 2026-10-07 for exactly that reason, freeing
+// 4 words for the address filter the per-cycle redesign needs.  It costs no
+// CPU wherever it sits - it is an autonomous state machine - so instruction
+// space is the only thing that decides.  Moving it DID require changing its
+// two "irq prev set" to "irq next set"; see the note on the program itself.
+#define BUS_CLOCK_PIO	pio1		// E/Q quadrature clock (4 words)
 #define BUS_READ_PIO	pio0		// guest reads of the register block
 #define BUS_WRITE_PIO	pio1		// guest writes to the register block
 #define TASK_OUTPUT_PIO	pio2		// task pins, GPIO base 16
 #define TRACE_LO_PIO	pio0		// bus trace, GPIO 0-31
 #define TRACE_HI_PIO	pio2		// bus trace, GPIO 32-47
 #define BUS_FAULT_PIO	pio2		// DAT fault sampler, needs GPIO_FAULT
-#define BUS_STATUS_PIO	pio2		// BUSY/LIC/AVMA mirror, GPIO 20-22
+#define INT_PINS_PIO	pio2		// !NMI/!FIRQ/!IRQ driver, GPIO 24-26
 
 //                                    pio             sm  off  addr data  irq
 static pio_dma pio_clock     = { BUS_CLOCK_PIO,       -1, -1,  -1,  -1, IO_IRQ_BANK0 };
-static pio_dma piodma_read   = { BUS_READ_PIO,        -1, -1,   0,   1, DMA_IRQ_0 };
+static pio_dma piodma_read   = { BUS_READ_PIO,        -1, -1,   0,   1, PIO0_IRQ_0 };
 static pio_dma piodma_write  = { BUS_WRITE_PIO,       -1, -1,   4,   5, DMA_IRQ_1 };
 static pio_dma task_output   = { TASK_OUTPUT_PIO,     -1, -1,  -1,  -1, -1 };
 static pio_dma trace_lo      = { TRACE_LO_PIO,        -1, -1,  -1,   2, -1 };
 static pio_dma trace_hi      = { TRACE_HI_PIO,        -1, -1,  -1,   3, -1 };
 static pio_dma bus_fault     = { BUS_FAULT_PIO,       -1, -1,  -1,  -1, PIO2_IRQ_0 };
+static pio_dma int_pins      = { INT_PINS_PIO,        -1, -1,  -1,  -1, -1 };
 
 
 static inline void
@@ -170,13 +183,35 @@ static volatile bool watchpoint_fired = false;
 // and left the request behind it; this puts the request back in front.
 static volatile bool dat_fault_nmi_request = false;
 
-// How many Q-risings the NMI pin is held low for.  The datasheet asks for a
-// pulse width of at least one E cycle, and a one-shot assert - one Q-rising to
-// the next - is one E cycle minus however late the two ISR entries were,
-// which only just meets it.  NMI is edge-triggered, so a wider pulse costs
-// nothing: the edge is latched once and a longer low cannot re-trigger it.
-static constexpr uint8_t NMI_ASSERT_CYCLES = 2u;
-static volatile uint8_t nmi_assert_cycles = 0u;
+// NMI REQUESTED FROM AN ISR, COUNTED RATHER THAN FLAGGED.  The Q-rising handler
+// used to OR PEND_NMI straight into pending_interrupts and consume it in the
+// same pass, so it never had to survive anywhere.  Now the pin is driven from
+// Core 1, which OVERWRITES pending_interrupts with the device-derived levels on
+// every pass - so a bit left there by an ISR is destroyed, and since Core 1
+// observes only about every second Q-rising it is usually destroyed unseen.
+// That cost the E-cycle countdown its NMI entirely.
+//
+// A counter rather than a bool for the reason this file gives for rx_read_count:
+// a flag set twice before the loop drains it is one event, and worse, a flag
+// read-then-cleared can lose a request that lands between the two.  Requests
+// collapsing into a single pulse is fine and always was; losing one is not.
+static volatile uint8_t nmi_request_count = 0u;		// ISRs increment
+static uint8_t nmi_request_done = 0u;			// Core 1 follows
+
+// How many of Core 1's passes the NMI pin is held low for.  THIS USED TO COUNT
+// Q-RISINGS, in the handler that drove the pins directly; the int_pins state
+// machine holds whatever it was last given, so the hold is now counted where
+// the value is produced.
+//
+// The width is therefore no longer exact.  Core 1 observes roughly every second
+// Q-rising (the starvation ratio, see st), so two passes is about four E cycles
+// against a datasheet minimum of one, and the figure drifts with load.  That is
+// safe rather than sloppy: NMI is EDGE-triggered, so the edge is latched once
+// and a longer low cannot re-trigger it - which is why the old comment here
+// already said a wider pulse costs nothing.  What would be unsafe is a
+// SHORTER one, and the floor is one whole pass.
+static constexpr uint8_t NMI_HOLD_PASSES = 2u;
+static volatile uint8_t nmi_hold_passes = 0u;
 
 // Set by the Q-rising handler on an NMI vector fetch - the bus event BS_IRQ
 // reports, and the point by which the 6809 has stacked its whole register
@@ -241,8 +276,12 @@ watchpoint_disarm()
 // The three open-collector interrupt pins, driven together from the Q-rising
 // handler.  Asserting one means enabling its output; the output value is
 // already low, so the direction register is the drive.
-static constexpr uint32_t INTERRUPT_PIN_MASK =
-	(1u << GPIO_NMI) | (1u << GPIO_FIRQ) | (1u << GPIO_IRQ);
+// The three interrupt pins are consecutive from GPIO_NMI, which is what lets
+// int_pins drive all three with a single "out pindirs 3".  There is no mask
+// constant any more: nothing on the CPU side writes these pins once the state
+// machine owns them.
+static_assert(GPIO_FIRQ == GPIO_NMI + 1 && GPIO_IRQ == GPIO_NMI + 2,
+	      "int_pins drives !NMI/!FIRQ/!IRQ as three consecutive pins");
 
 static volatile bool q_rising_edge = false;
 static volatile bool core1_initialised = false;
@@ -397,6 +436,24 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 //   pio2 flag 2  bus_capture_lo -> bus_capture_hi handshake, SM to SM
 //   pio2 flag 3  bus_fault, the DAT fault signal to the CPU
 
+// Raised in pio0 by the read program when the guest reads $FFC0-$FFCF, which
+// is the only range either this ISR or Core 1's follow-up switch acts on.  It
+// REPLACES the read DMA's completion interrupt: that fired on every served
+// read, and the hottest reads in the window - vector fetches, and snippet
+// instruction fetches at $FFE0 - need no CPU work at all.
+static constexpr uint READ_DEVICE_PIO_IRQ = 4u;
+static constexpr pio_interrupt_source READ_DEVICE_PIO_IRQ_SOURCE = pis_interrupt4;
+
+// The clock program's Q-RISING tick, raised in pio2 by "irq next set 5", and
+// consumed by the int_pins driver's wait.  Like flag 0 it should never be seen
+// standing set; if it is, that driver has stopped and the guest's interrupt
+// lines are frozen at whatever they last held.
+static constexpr uint INT_PINS_TICK_PIO_IRQ = 5u;
+
+// The clock program's Q-falling tick, raised in pio2 by "irq next set 0".
+// Consumed by the bus_fault sampler's wait, so it should never be seen
+// standing set - if "st" shows pio2 flag 0 set, that sampler has stalled.
+static constexpr uint CLOCK_TICK_PIO_IRQ = 0u;
 static constexpr uint BUS_FAULT_PIO_IRQ = 3u;
 static constexpr pio_interrupt_source BUS_FAULT_PIO_IRQ_SOURCE = pis_interrupt3;
 
@@ -837,10 +894,11 @@ __time_critical_func(gpio_q_irq_handler())
 						// That edge ended a long gap, so it
 						// is the RTI finishing and the
 						// guest's own instruction is next.
-						// PEND_NMI reaches the pin later in
-						// this same pass, so it is pending
-						// through that one instruction.
-						pending_interrupts |= PEND_NMI;
+						// The request goes to Core 1, which
+						// drives the pin; it is pending
+						// within a pass or two, so still
+						// through the next instruction.
+						nmi_request_count++;
 						step_armed_edge = step_edges;
 						step_state = STEP_IDLE;
 					} else {
@@ -869,57 +927,25 @@ __time_critical_func(gpio_q_irq_handler())
 		// reason recorded.  Re-enabled 2026-10-04 and proved on the board;
 		// if it misbehaves, the first suspect is that PEND_NMI is shared
 		// with the DAT fault, the watchpoint and break, all of which funnel
-		// through the one nmi_assert_cycles pulse below - two requests in
+		// through the one nmi_hold_passes pulse - two requests in
 		// the same pass collapse into a single pulse, and only break has a
 		// way (break_vector_fetched) to confirm its own was the one taken.
 		if (system_tick.tick())
-			pending_interrupts |= PEND_NMI;
+			nmi_request_count++;
 
-		// Assert/deassert all interrupt pins from cached pending state.
-		// NMI is edge-triggered (one-shot): assert once and clear flag.
-		// IRQ/FIRQ are level-triggered: assert when pending, deassert
-		// when not.  The DMA read ISR clears PEND_IRQ after
-		// rx_read_fast_path() and timer reads, keeping stale assertion
-		// windows short.
+		// THE PINS ARE NOT DRIVEN FROM HERE ANY MORE.  The int_pins state
+		// machine on pio2 re-applies them at every Q rising by itself, and
+		// Core 1 sends it a new word only when the pending set changes -
+		// see interrupt_pins_update().  What used to happen here was a
+		// three-bit mask being recomputed and rewritten a million times a
+		// second, almost always to the value it already held.
 		//
-		// The three pins are driven with one pair of SIO writes rather than
-		// an ASSERT/DEASSERT each: the pins are open-collector, so the
-		// direction register IS the drive, and gpio_set_dir_masked() sets the
-		// output-enables of all three from one mask.  Three stores become
-		// two, and they are unconditional, so nothing here depends on a
-		// shadow copy staying in step with mc6809::init() and deinit(),
-		// which drive the same pins from Core 0.
-		{
-			const uint8_t pend = pending_interrupts;
-			if (pend & PEND_IRQ)
-				pend_irq_cycles++;
-			uint32_t oe = 0u;
-			if ((pend & PEND_NMI) || watchpoint_nmi_pending
-			    || dat_fault_nmi_request) {
-				if (watchpoint_nmi_pending) {
-					reg[REGISTER_BUFFER_OFFSET] = static_cast<uint8_t>(0u);
-					reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
-					reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
-					watchpoint_fired = true;
-				}
-				nmi_assert_cycles = NMI_ASSERT_CYCLES;
-				pending_interrupts = pend & ~PEND_NMI;
-				watchpoint_nmi_pending = false;
-				dat_fault_nmi_request = false;
-			}
-			// Hold it for the full width, then let it go.  Each request
-			// restarts the count, so a second NMI during the pulse does not
-			// shorten it.
-			if (nmi_assert_cycles > 0u) {
-				oe |= 1u << GPIO_NMI;
-				nmi_assert_cycles--;
-			}
-			if (pend & PEND_FIRQ)
-				oe |= 1u << GPIO_FIRQ;
-			if (pend & PEND_IRQ)
-				oe |= 1u << GPIO_IRQ;
-			gpio_set_dir_masked(INTERRUPT_PIN_MASK, oe);
-		}
+		// This counter stays because it is a per-E-cycle measure and there
+		// is nowhere else to take it: the E cycles during which /IRQ was
+		// asserted, which st divides by the vector count to report how long
+		// each interrupt was held.
+		if (pending_interrupts & PEND_IRQ)
+			pend_irq_cycles++;
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, false); // scope timing
@@ -1081,7 +1107,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, true); // scope timing
 #endif
-	dma_channel_acknowledge_irq0(piodma_read.data_channel);
+	pio_interrupt_clear(piodma_read.pio, READ_DEVICE_PIO_IRQ);
 	// AVMA from the pin, via the Q-rising handler's snapshot.  BE CLEAR ABOUT
 	// WHAT THIS TESTS: the pins are in-advance signals read past t_CD, so
 	// this asks "is the NEXT cycle a valid bus cycle", not "was this one".
@@ -3383,6 +3409,18 @@ status_print(const status_snapshot_t *s)
 	       s->tick_enabled ? "yes" : "no",
 	       s->tick_irq_pending ? "yes" : "no");
 	printf("Core 1:\n");
+	// READ IRQ AND "Last Read" ONLY SEE $FFC0-$FFCF NOW, and a zero in that
+	// column is normal rather than broken.  The read program's address filter
+	// notifies the CPU for device registers only, so reads of the shared
+	// buffer, the snippet area and the vectors - which are most of the traffic
+	// - never reach the ISR at all.  On top of that the ISR handles the five
+	// hottest device registers in branches of their own that do not set
+	// read_irq_received, so this counts only the remainder.  Said here because
+	// a column of zeros was read as a bug once before, in the console ACIA's
+	// "Status" count, and went unexplained for weeks.
+	//
+	// Loop against ISR is the pair worth watching: it is the starvation ratio.
+	// 12.7:1 before the filter, 1.95:1 after it.
 	printf("       Loop     Q Rise   IRQ Asrt   Wrt Ring   Read IRQ        ISR\n");
 	printf("  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32
 	       "  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32 "\n",
@@ -5594,6 +5632,53 @@ init_pins_range(const uint8_t base, const uint8_t count)
 		gpio_init(base + i);
 }
 
+// Hand the int_pins state machine a new mask, but only when it differs from the
+// one it already holds.  That "only" is the whole point of moving the pins into
+// the PIO: the machine re-applies its last value at every Q rising by itself, so
+// a pending set that has not changed - which is almost every pass, since
+// devices change on human and 50 Hz timescales - costs nothing at all.
+//
+// PEND_NMI, PEND_FIRQ and PEND_IRQ are bits 0, 1 and 2, and the program's
+// "out pindirs 3" maps bit 0 to !NMI, bit 1 to !FIRQ and bit 2 to !IRQ.  So the
+// level lines need no translation whatsoever - the byte IS the word - and only
+// NMI has to be substituted, because it is a one-shot held for a few passes
+// rather than a level.
+static uint32_t int_pins_held = 0u;	// what the state machine was last sent
+
+static inline void
+interrupt_pins_update()
+{
+	const uint8_t pend = pending_interrupts;
+	// A request from any of the three sources starts the hold.  Taken here
+	// rather than in the Q handler, which no longer looks at them; the cost is
+	// that a request waits for Core 1's next pass instead of the next
+	// Q-rising, a couple of E cycles later.
+	const bool isr_nmi = nmi_request_count != nmi_request_done;
+	if (isr_nmi || (pend & PEND_NMI) || watchpoint_nmi_pending
+	    || dat_fault_nmi_request) {
+		nmi_request_done = nmi_request_count;
+		if (watchpoint_nmi_pending) {
+			reg[REGISTER_BUFFER_OFFSET] = static_cast<uint8_t>(0u);
+			reg[REGISTER_BUFFER_OFFSET + 10] = static_cast<uint8_t>(0u);
+			reg[REGISTER_BUFFER_OFFSET + 11] = static_cast<uint8_t>(0u);
+			watchpoint_fired = true;
+		}
+		nmi_hold_passes = NMI_HOLD_PASSES;
+		pending_interrupts = pend & ~PEND_NMI;
+		watchpoint_nmi_pending = false;
+		dat_fault_nmi_request = false;
+	}
+	uint32_t oe = pend & (PEND_FIRQ | PEND_IRQ);
+	if (nmi_hold_passes > 0u) {
+		oe |= PEND_NMI;
+		nmi_hold_passes--;
+	}
+	if (oe != int_pins_held) {
+		int_pins_held = oe;
+		pio_sm_put(int_pins.pio, static_cast<uint>(int_pins.sm), oe);
+	}
+}
+
 static void
 __no_inline_not_in_flash_func(main_core1)()
 {
@@ -5642,7 +5727,12 @@ __no_inline_not_in_flash_func(main_core1)()
 	irq_set_exclusive_handler(piodma_read.irq, dma_bus_read_irq_handler);
 	irq_set_priority(piodma_read.irq, 0);
 	irq_set_enabled(piodma_read.irq, true);
-	dma_channel_set_irq0_enabled(piodma_read.data_channel, true);
+	// The read program's address filter is the interrupt source now, NOT the
+	// DMA completing - see READ_DEVICE_PIO_IRQ.  Cleared before enabling for
+	// the same reason the fault sampler's tick is: the state machine may
+	// already have raised it.
+	pio_interrupt_clear(piodma_read.pio, READ_DEVICE_PIO_IRQ);
+	pio_set_irq0_source_enabled(piodma_read.pio, READ_DEVICE_PIO_IRQ_SOURCE, true);
 	dma_channel_start(piodma_read.address_channel);
 	pio_sm_put(piodma_read.pio, piodma_read.sm, registers::read_address() >> 6); // Six bits for A0-5
 	printf("Core1 Main read DMA chain configured\n");
@@ -5666,7 +5756,30 @@ __no_inline_not_in_flash_func(main_core1)()
 	pio_sm_set_enabled(task_output.pio, task_output.sm, true);
 	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_output.pio), task_output.sm);
 
+	// Clear the Q-rising tick before starting, for the same reason the fault
+	// sampler's is cleared: the clock has been free-running since Core 1 came
+	// up, so flag 5 is already standing set and a wait satisfied by that stale
+	// flag would apply the pins half a cycle out of phase.
+	pio_interrupt_clear(int_pins.pio, INT_PINS_TICK_PIO_IRQ);
+	pio_sm_set_enabled(int_pins.pio, int_pins.sm, true);
+	printf("Core1 interrupt pins pio%d/sm%d started\n",
+	       PIO_NUM(int_pins.pio), int_pins.sm);
 
+
+	// CLEAR THE CLOCK'S TICK BEFORE STARTING, so the first wait blocks until a
+	// REAL Q-falling.  The clock SM was enabled further up and has been
+	// free-running ever since, so flag 0 is already standing set; a wait
+	// satisfied by that stale flag samples GPIO_FAULT at an arbitrary phase
+	// instead of in the settled window Q-falling gives, and can read a fault
+	// that is not there.  Measured 2026-10-07: one spurious fault latched into
+	// $FFCC on every power-on, with the mask then raised against a fault that
+	// never happened.  The identical hazard is documented for flag 1 on the
+	// clock program itself - "the first wait is satisfied immediately".
+	//
+	// The FIFO goes too: a spurious sample will have pushed an address into it,
+	// and nothing drains it until a real fault is reported.
+	pio_interrupt_clear(bus_fault.pio, CLOCK_TICK_PIO_IRQ);
+	pio_sm_clear_fifos(bus_fault.pio, static_cast<uint>(bus_fault.sm));
 	pio_sm_set_enabled(bus_fault.pio, bus_fault.sm, true);
 	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, true);
 	irq_set_exclusive_handler(bus_fault.irq, pio_bus_fault_irq_handler);
@@ -5744,6 +5857,7 @@ __no_inline_not_in_flash_func(main_core1)()
 			if (pend & PEND_IRQ)
 				core1_irq_assert_count++;
 			pending_interrupts = pend;
+			interrupt_pins_update();
 		}
 
 		// Console writes into the register block, carried out as the guest's
@@ -6159,6 +6273,23 @@ bus_pio_dma_init()
 	task_output_program_init(task_output.pio, task_output.sm, task_output.offset);
 	printf("Core0 task output pio%u sm%d configured\n", PIO_NUM(task_output.pio), task_output.sm);
 
+	// SM: interrupt pin driver, on the same base-16 block so it can reach
+	// GPIO 24-26.  MUST come after MC6809.init(), which does gpio_init() on
+	// these pins and would take them back from the PIO - set_power() calls
+	// them in that order.
+	int_pins.offset = pio_add_program(int_pins.pio, &int_pins_program);
+	if (int_pins.offset < 0) {
+		printf("Core0 insufficient space for int_pins program\n");
+		panic("Unable to proceed");
+	}
+	int_pins.sm = pio_claim_unused_sm(int_pins.pio, true);
+	int_pins_program_init(int_pins.pio, int_pins.sm, int_pins.offset, GPIO_NMI);
+	// Nothing asserted, and say so, so the first real change is always sent.
+	int_pins_held = 0u;
+	nmi_hold_passes = 0u;
+	printf("Core0 interrupt pin driver pio%u sm%d configured\n",
+	       PIO_NUM(int_pins.pio), int_pins.sm);
+
 	// SM pair: bus trace capture.  pio0 -> pio2 via "irq prev", which wraps
 	// across the three blocks.  pio1 would be the tidier neighbour but has
 	// no instruction memory left.
@@ -6224,8 +6355,12 @@ pio_shutdown()
 	// belong to Core 1, which has already been reset - so the IRQ cannot be
 	// taken.  The handler stays registered for the next launch; see main_core1.
 
-	// DMA read IRQ
-	dma_channel_set_irq0_enabled(piodma_read.data_channel, false);
+	// Read notification IRQ.  The source is the read program's address filter
+	// on pio0, not the DMA completing - so this disables the PIO source, and
+	// clears any flag the state machine raised on its way down, which would
+	// otherwise be waiting to fire the instant the handler is re-registered.
+	pio_set_irq0_source_enabled(piodma_read.pio, READ_DEVICE_PIO_IRQ_SOURCE, false);
+	pio_interrupt_clear(piodma_read.pio, READ_DEVICE_PIO_IRQ);
 	irq_set_enabled(piodma_read.irq, false);
 	irq_remove_handler(piodma_read.irq, dma_bus_read_irq_handler);
 
@@ -6233,6 +6368,18 @@ pio_shutdown()
 	dma_channel_set_irq1_enabled(piodma_write.data_channel, false);
 	irq_set_enabled(piodma_write.irq, false);
 	irq_remove_handler(piodma_write.irq, dma_bus_write_irq_handler);
+
+	// Interrupt pin driver (pio2).  Stopped and the pins handed back to SIO as
+	// inputs, which is deasserted for an open collector line; mc6809::deinit()
+	// releases them properly just afterwards.
+	if (int_pins.sm >= 0) {
+		int_pins_program_deinit(int_pins.pio, static_cast<uint>(int_pins.sm),
+					GPIO_NMI);
+		pio_remove_program(int_pins.pio, &int_pins_program, int_pins.offset);
+		int_pins.sm = -1;
+		int_pins.offset = -1;
+	}
+	int_pins_held = 0u;
 
 	// Bus fault detect IRQ (pio2)
 	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, false);
@@ -6375,7 +6522,7 @@ set_power()
 		// here with the rest of the per-run state.
 		dat_fault_block_countdown = 0u;
 		dat_fault_nmi_request = false;
-		nmi_assert_cycles = 0u;
+		nmi_hold_passes = 0u;
 		gpio_put(GPIO_NMI_BLOCK, false);
 		reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(0u);
 		reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(0u);

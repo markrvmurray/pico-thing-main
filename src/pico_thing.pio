@@ -30,7 +30,7 @@
 ; 4-cycle quadrature clock loop. Q leads E by 90 deg.
 ; Side-set bits [Q:E] as Q is 0b10, E is 0b01.
 ;
-; Two of the four instructions carry an "irq prev set" as well as their
+; Two of the four instructions carry an "irq next set" as well as their
 ; side-set, which costs nothing: all four were nop placeholders for the
 ; side-set, and the loop is still four PIO clocks, so E's frequency and duty are
 ; untouched.  Both ticks go to pio2, one per E cycle each.
@@ -70,15 +70,26 @@
 ; where the registered signal and the live bus pins are both settled and both
 ; describe the same cycle.
 ;
-; "prev" from pio0 is pio2 because the three blocks wrap.  If this program is
-; ever moved to another block, the tick lands somewhere else without a word.
+; THIS PROGRAM LIVES ON pio1, AND THE DIRECTION OF THOSE TICKS DEPENDS ON IT.
+; The three blocks wrap, so "next" from pio1 is pio2 - which is where the
+; bus_fault sampler waiting on flag 0 lives.  It was on pio0 until 2026-10-07,
+; where the same tick was reached with "irq PREV set" (prev from pio0 is also
+; pio2).  It moved to free 4 of pio0's 32 words for the address filter that the
+; per-cycle redesign needs: pio0 is the only base-0 block with room for the
+; read program, and clock + read + capture_lo had it at 30 of 32.
+;
+; So if this program is moved again, the ticks land in a different block WITHOUT
+; A WORD OF WARNING - nothing fails to assemble, the sampler simply never runs.
+; The flag NUMBERS are unaffected: a flag is set in the TARGET block, so pio2's
+; flags 0 and 1 are the same two either way, and bus_fault's "wait 1 irq 0"
+; needed no change.
 .program	mc6809_clock
 .side_set	2
 .wrap_target
-	irq	prev set 1	side 0b00	; Q=0, E=0 - E FALLS here: flag 1, now unused
-	nop			side 0b10	; Q=1, E=0
+	irq	next set 1	side 0b00	; Q=0, E=0 - E FALLS here: flag 1, now unused
+	irq	next set 5	side 0b10	; Q=1, E=0 - Q RISES: tick the interrupt pins
 	nop			side 0b11	; Q=1, E=1
-	irq	prev set 0	side 0b01	; Q=0, E=1 - Q falls: tick bus_fault
+	irq	next set 0	side 0b01	; Q=0, E=1 - Q falls: tick bus_fault
 .wrap
 
 % c-sdk {
@@ -121,6 +132,48 @@ mc6809_clock_program_deinit(PIO pio, uint sm)
 ; To consider: Don't auto-return the read byte ASAP, instead give the
 ; Pico a chance to decide what to send.
 ;
+; THE ADDRESS FILTER, AND WHY IT IS HERE RATHER THAN IN THE ISR.  Only
+; $FFC0-$FFCF needs the CPU told about a read: those are the device registers,
+; and they are the only addresses either the read ISR or Core 1's follow-up
+; switch branches on.  $FFD0 upwards - shared buffer, snippet area, vectors - is
+; plain memory that the DMA serves by itself, and it carries the HOTTEST traffic
+; there is: every vector fetch, and every instruction fetch of a snippet running
+; at $FFE0.  A guest held in reset reads $FFFE/$FFFF on every single cycle.
+;
+; So the DMA completion interrupt is off, and this program raises IRQ 4 instead,
+; only for the addresses that need it.  The predicate is (A5|A4)==0, so X is
+; zero exactly when both are clear and "jmp x--" skips the notify when either
+; is set.
+;
+; MIND THE PIN ORDER, WHICH IS THE OPPOSITE OF WHAT THIS FILE'S "A5-0" SUGGESTS.
+; That names the set of lines, not their order: GPIO_A_BASE (3) carries **A0**
+; and GPIO 8 carries A5, which is what union bus_pins' "A : 6" bitfield encodes
+; and what lets bits.A be compared against a register offset directly (see the
+; DAT-fault test in the Q handler).  So after the R/!W bit the OSR holds A0
+; first, and A5/A4 are the LAST two of the six - hence the "out null 4" to
+; discard A0-A3 before taking them.
+;
+; Getting this wrong fails QUIETLY AND PLAUSIBLY, which is worth a warning: an
+; "out x 2" straight after the R/!W reads A0 and A1 instead, so the notify
+; fires on every fourth address rather than on the bottom sixteen.  Reads of
+; $FFFE/$FFFF then raise nothing, interrupts appear to drop by 99.5%, and it
+; looks exactly like success - until the ACIA's receive fast path stops being
+; told about $FFC5 and RDRF never clears.
+;
+; THE PLACEMENT COSTS NOTHING, which is the point.  "out x 2" sits between the
+; push and the pull, where the state machine is stalled waiting for the DMA
+; round trip anyway (~11 clk_sys cycles, measured).  The test and the irq sit
+; after D7-0 is driven and before the wait for Q to fall, which is most of a Q
+; half-cycle of slack - 26 PIO cycles even at 3 MHz.  Neither is on the path
+; that has to finish inside the E cycle.
+;
+; X is free to use: it is reloaded by "mov x isr" on the next served read, so
+; jmp x--'s decrement is discarded.  The verdict has to be captured before the
+; pull because the pull replaces the OSR with the data byte - but X survives it,
+; which is what lets the notify happen AFTER the DMA has run.  That ordering is
+; required: the ISR recovers the address from the DMA's own read_addr register,
+; so a notify raised before the transfer completed would hand it a stale one.
+;
 ; IN  pins:    (7) A5-0, R/!W
 ; OUT pins:    (8) D7-0
 ; JMP pin:     !CS
@@ -144,8 +197,13 @@ wait_q:
 	mov	x y		side 1  ; Get registers[] address
 	in	x 26		side 1  ; MSBs of registers[], R/!W falls off the end
 	push	block		side 1	; Send full address = registers[] + A5-0
+	out	null 4		side 1	; discard A0-A3; GPIO3 is A0, NOT A5
+	out	x 2		side 1	; A4,A5 - grabbed BEFORE the pull overwrites the OSR
 	pull	block		side 1	; Wait for data byte reply
 	out	pins 8		side 0	; Set D7-0 output values
+	jmp	x-- no_notify	side 0	; A5 or A4 set: plain memory, tell the CPU nothing
+	irq	set 4		side 0	; $FFC0-$FFCF is a device register: notify
+no_notify:
 	wait	0 gpio GPIO_Q	side 0	; Q trailing edge
 	mov	pindirs !null	side 1	; Set D7-0 to outz                                                                                                                                                                                                                                                                                                                                                                                                                      cput
 	wait	0 gpio GPIO_E	[7] side 1	; E trailing edge plus a bit
@@ -394,6 +452,80 @@ static inline void
 bus_capture_hi_program_deinit(PIO pio, uint sm)
 {
 	pio_sm_set_enabled(pio, sm, false);
+	pio_sm_unclaim(pio, sm);
+}
+
+%}
+
+; Interrupt pin driver - !NMI, !FIRQ and !IRQ, applied at Q rising.
+;
+; These pins are OPEN COLLECTOR, so the direction register IS the drive: output
+; enabled pulls low (asserted), input is hi-Z and the external pull-up takes it
+; high.  The pin VALUES are driven low once when the program is initialised and
+; never touched again, so "out pindirs" alone asserts and deasserts.  That is
+; the same trick the CPU handler used with gpio_set_dir_masked().
+;
+; WHY THIS IS NOT IN A CPU ISR ANY MORE.  It used to run on every Q rising, and
+; on almost every one of those it wrote the same three bits it wrote last time -
+; the pending set only changes when a device's state does, which is human or
+; 50 Hz timescales.  Here the state machine re-applies the value by itself and
+; the CPU writes the FIFO only when something actually changes.
+;
+; "pull noblock" is the whole trick: on an empty TX FIFO it behaves as
+; MOV OSR, X, so the value written LAST TIME is reloaded and re-applied.  X is
+; refreshed from the OSR each pass, so a new word from the CPU becomes the value
+; that persists from then on.
+;
+; Q RISING IS THE PHASE ON PURPOSE.  The 6809 samples its interrupt inputs
+; around Q falling, so applying a change at Q rising puts it as far from the
+; sampling instant as the cycle allows.  That was the reason the CPU version was
+; tied to the Q-rising interrupt, and it is why this waits on the clock's flag 5
+; rather than free-running.
+;
+; NOT HALT.  GPIO 23 stays with Core 0, which asserts it from the console; only
+; the three interrupt lines are driven here.
+.program int_pins
+.wrap_target
+	wait	1 irq 5		; Q rising, from the clock program on pio1
+	pull	noblock		; new mask, or X again when the CPU has sent nothing
+	mov	x osr		; remember it, so the next pass re-applies it
+	out	pindirs 3	; bit0 !NMI, bit1 !FIRQ, bit2 !IRQ
+.wrap
+
+% c-sdk {
+
+// The pins are open collector: value low once, then direction is the drive.
+static inline void
+int_pins_program_init(PIO pio, uint sm, uint offset, uint pin_base)
+{
+	for (uint i = 0; i < 3; i++) {
+		pio_gpio_init(pio, pin_base + i);
+		gpio_set_drive_strength(pin_base + i, GPIO_DRIVE_STRENGTH_8MA);
+	}
+	pio_sm_config c = int_pins_program_get_default_config(offset);
+	sm_config_set_out_pins(&c, pin_base, 3);
+	sm_config_set_out_shift(&c, true, false, 32);	// shift right, no autopull
+	pio_sm_init(pio, sm, offset, &c);
+	// Drive the three pin VALUES low while they are still inputs, so that
+	// enabling a direction later asserts the line.  Nothing writes them again.
+	pio_sm_exec(pio, sm, pio_encode_mov(pio_pins, pio_null));
+	// Start deasserted - all three hi-Z - and seed X with it, so the first
+	// "pull noblock" on an empty FIFO reloads "nothing asserted" rather than
+	// whatever X powered up holding.
+	pio_sm_set_consecutive_pindirs(pio, sm, pin_base, 3, false);
+	pio_sm_exec(pio, sm, pio_encode_set(pio_x, 0));
+}
+
+static inline void
+int_pins_program_deinit(PIO pio, uint sm, uint pin_base)
+{
+	pio_sm_set_enabled(pio, sm, false);
+	// Hand the pins back to SIO as inputs, which is deasserted for an open
+	// collector line.  mc6809::deinit() releases them properly afterwards.
+	for (uint i = 0; i < 3; i++) {
+		gpio_set_dir(pin_base + i, GPIO_IN);
+		gpio_set_function(pin_base + i, GPIO_FUNC_SIO);
+	}
 	pio_sm_unclaim(pio, sm);
 }
 
