@@ -100,28 +100,17 @@ private:
 	volatile enum bus_state bus_state;
 	volatile enum run_state run_state;
 	volatile BLA busy_lic_avma{};
-	static constexpr uint8_t MAX_INT_NEST_DEPTH = 16u;
+	// The interrupt-nesting depth, the task history and the deferred task
+	// restore all lived here until 2026-10-06.  They were driven by the RTI
+	// opcode detector, which was removed to reclaim its 13 words on pio1 for
+	// the per-cycle redesign; without it nothing can unwind a depth count, so
+	// counting one would only ever climb.
 	volatile uint8_t task;
-	volatile uint8_t nesting_depth = 0;
-	// Where the depth count goes wrong, counted rather than hidden.  Neither
-	// was visible before: a push dropped at MAX_INT_NEST_DEPTH used to skip
-	// the depth increment as well, so the count silently stopped rising
-	// while every RTI kept lowering it, and an RTI with no matching push did
-	// nothing at all.
-	volatile uint32_t depth_overflows = 0;	// task history full, push dropped
-	volatile uint32_t depth_underflows = 0;	// RTI with the depth already 0
-	volatile uint32_t depth_declares = 0;	// times the OS resynchronised us
-	volatile uint8_t rti_task_countdown = 0;	// E-cycle countdown for deferred task restore
-	uint8_t rti_pending_task = 0;			// task to restore when countdown expires
-	void rti_task_expired();			// the countdown reached zero: put the task back
-	volatile uint8_t task_stack[MAX_INT_NEST_DEPTH]{};
-	std::atomic<uint16_t> task_stack_ptr{0u};
 	volatile bool busy, lic, vma;
 	using task_pin_cb_t = void(*)(uint8_t);
 	task_pin_cb_t task_pin_callback = nullptr;
 #ifdef DEBUG
 	volatile uint32_t _count_lic;
-	volatile uint32_t _count_rti;
 #endif
 	// Interrupt acknowledge (vector fetch) counts.  Not DEBUG-only: the
 	// interrupt tests hold each request asserted until its count moves, so
@@ -238,9 +227,6 @@ public:
 	void clear_lic_count() { _count_lic = 0u; }
 	[[nodiscard]] uint32_t get_lic_count() const { return _count_lic; }
 	void count_lic() { if (lic && bus_state == BUS_RUNNING) _count_lic++; }
-	void clear_rti_count() { _count_rti = 0u; }
-	[[nodiscard]] uint32_t get_rti_count() const { return _count_rti; }
-	void count_rti() { _count_rti++; }
 #endif
 	void clear_irq_ack_count() { for (auto &c : _count_irq_ack) c = 0u; }
 	[[nodiscard]] uint32_t get_irq_ack_count(interrupt i) const { return _count_irq_ack[i]; }
@@ -259,19 +245,6 @@ public:
 		return new_task;
 	}
 	void set_task_pin_callback(task_pin_cb_t cb) { task_pin_callback = cb; }
-	void apply_rti();
-	// Called once per Q-rising from the ISR - two million times a second at
-	// 1 MHz E - so the idle test is inline here and only the expiry, which
-	// happens once per RTI at most, is a call.  With
-	// PICO_THING_RTI_TASK_RESTORE off the countdown is never armed at all,
-	// and this is one load and one branch.
-	void tick_rti_countdown()
-	{
-		if (rti_task_countdown == 0u)
-			return;
-		if (--rti_task_countdown == 0u)
-			rti_task_expired();
-	}
 
 	[[nodiscard]] bool assert_powered() const;
 	[[nodiscard]] bool assert_stopped() const;
@@ -286,7 +259,6 @@ public:
 	void restore_state();
 	void set_e_frequency(float target_mhz, const pio_dma &pio_clock);
 	[[nodiscard]] bool is_running() const { return run_state == RS_RUNNING || run_state == RS_IN_IRQ; }
-	[[nodiscard]] bool is_in_irq() const { return run_state == RS_IN_IRQ; }
 	[[nodiscard]] bool is_synced() const { return run_state == RS_SYNCED; }
 	[[nodiscard]] bool is_halted() const { return run_state == RS_HALTED; }
 	[[nodiscard]] bool is_stopped() const { return run_state == RS_RESET; }
@@ -296,23 +268,6 @@ public:
 	[[nodiscard]] enum bus_state get_bus_state() const { return bus_state; }
 	[[nodiscard]] enum bus_state get_old_bus_state() const { return old_bus_state; }
 	[[nodiscard]] uint8_t get_task() const { return task; }
-	[[nodiscard]] uint8_t get_nesting_depth() const { return nesting_depth; }
-	struct depth_errors { uint32_t overflows, underflows, declares; };
-	[[nodiscard]] depth_errors get_depth_errors() const
-		{ return { depth_overflows, depth_underflows, depth_declares }; }
-	// The OS declaring where it really is.  Trims the task history to match:
-	// entries above the declared depth describe interrupts that, as far as
-	// the OS is concerned, are over.
-	void declare_depth(uint8_t depth)
-	{
-		nesting_depth = depth;
-		task_stack_ptr = (depth < MAX_INT_NEST_DEPTH) ? depth : MAX_INT_NEST_DEPTH;
-		depth_declares++;
-		if (depth == 0u && rti_task_countdown == 0u)
-			run_state = RS_RUNNING;
-	}
-	[[nodiscard]] uint16_t get_task_stack_ptr() const { return task_stack_ptr; }
-	[[nodiscard]] uint8_t get_task_history(uint16_t i) const { return (i < MAX_INT_NEST_DEPTH) ? task_stack[i] : 0u; }
 	friend void gpio_q_irq_handler();
 	friend void dma_bus_read_irq_handler();
 	friend void dma_bus_write_irq_handler();

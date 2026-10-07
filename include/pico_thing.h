@@ -250,15 +250,6 @@ union high_bus_pins {
 
 // System registers relative to REGISTER_DEVICES
 #define SYSTEM_TASK		uint16_t(0x00u)
-// Write-only: a guest tells the Pico it is executing an RTI, so the task stack
-// can be unwound and the interrupted task restored.  This is an ALTERNATIVE to
-// the rti_detect PIO program, which spots every RTI opcode fetch on the bus
-// unaided - never both.  Two sources count one RTI twice: harmless while a
-// single interrupt is outstanding, since the unwind is skipped once the nesting
-// depth reaches zero, but with interrupts nested two deep it pops the task
-// stack twice and restores the wrong task.  Nothing in this tree writes it; the
-// detector does the work, including inside snippets.
-#define SYSTEM_RTI_SIGNAL	uint16_t(0x01u)
 
 #define SYSTEM_REQUEST		uint16_t(0x02u) // Write-only
 #define SYSTEM_REQUEST_STATUS	uint16_t(0x02u) // Read-only
@@ -325,19 +316,6 @@ union high_bus_pins {
 // ever observed it means the fault flag and the address pins have come from
 // different bus cycles — see the sampling note in the Q-falling ISR.
 #define SYSTEM_DAT_FAULT_LOC	uint16_t(0x0Du) // Read ($FFCD)
-
-// Interrupt nesting depth ($FFCE).  Read: the depth the Pico believes it is
-// at, counted from interrupt vector fetches and RTI opcode fetches.  Write:
-// DECLARE the depth, which is the OS resynchronising the Pico to the truth.
-//
-// The declaration exists because the count cannot be made perfect from the
-// bus alone: the RTI detector can be fooled (LIC is high while stacking too),
-// and the task history is only MAX_INT_NEST_DEPTH deep.  Rather than pretend
-// otherwise, the OS gets a way to say "I am at depth N" - typically 0, from
-// its idle loop - and the Pico believes it.  A write also trims the task
-// history to match, since entries above the declared depth are no longer
-// about anything.
-#define SYSTEM_INT_DEPTH	uint16_t(0x0Eu) // Read/Write ($FFCE)
 
 // SYSTEM_DAT_FAULT bits
 #define DAT_FAULT_FAULT		uint8_t(1u << 0) // set when GPIO_FAULT is sampled high

@@ -32,7 +32,6 @@ struct acia_status_t {
 #endif
 };
 
-#define STATUS_MAX_INT_NEST_DEPTH 16u
 
 struct status_snapshot_t {
 	// Processor state
@@ -40,9 +39,6 @@ struct status_snapshot_t {
 	enum bus_state  bus_state;
 	enum bus_state  old_bus_state;
 	uint8_t         task;
-	uint8_t         nesting_depth;
-	uint16_t        task_stack_ptr;
-	uint8_t         task_history[STATUS_MAX_INT_NEST_DEPTH];
 	// Guest writes to the task register that no kernel path makes: from a
 	// non-zero task, to a different non-zero task.  Expected to stay 0.
 	uint32_t        task_write_odd_count;
@@ -62,11 +58,12 @@ struct status_snapshot_t {
 
 #ifdef DEBUG
 	uint32_t lic_count;
-	uint32_t rti_count;
 	uint32_t last_lic;
 	bool     lic_stalled;
 	float    rail_baseline;	// the cutout's slow reference, 0 = not established
 	uint32_t rail_good;	// consecutive healthy samples behind it
+	bool     rail_clipped;	// supply channel at full scale: no measurement
+	bool     rail_floor_only;	// serving: absolute floor only, baseline frozen
 	uint8_t  busy_lic_avma;	// the pins, as the Q handler last read them
 	uint8_t  pio2_irq;	// all eight of pio2's SM-visible IRQ flags
 	uint8_t  clock_pc;	// the E/Q clock SM's PC, to prove it is cycling

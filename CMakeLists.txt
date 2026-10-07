@@ -235,16 +235,6 @@ set(PICO_THING_DAT_FAULT_BLOCK_DELAY 32 CACHE STRING
 message(STATUS "Pico-Thing DAT fault auto-block ${PICO_THING_DAT_FAULT_AUTO_BLOCK}, "
 	"block delay ${PICO_THING_DAT_FAULT_BLOCK_DELAY} cycles")
 
-# Whether the Pico restores the interrupted task itself, about 15 E cycles after
-# it sees an RTI.  That is right for an interrupt which resumes what it
-# interrupted and wrong for one which does not: a DAT fault handler that kills
-# the faulting process finds the dead task forced back under it a moment after
-# its RTI.  Off by default, so the task register belongs to the guest.  The task
-# stack and the nesting depth are maintained either way, and the DAT fault's own
-# switch to task 0 at the NMI vector fetch is separate and always happens.
-set(PICO_THING_RTI_TASK_RESTORE 0 CACHE STRING
-	"Restore the interrupted task ~15 E cycles after an RTI (0 = the guest owns the task register)")
-message(STATUS "Pico-Thing RTI task restore ${PICO_THING_RTI_TASK_RESTORE}")
 
 # The UART console's baud rate, on GPIO 30/31.  This is the ONLY real baud rate
 # in the firmware, and the UART is the ONLY console: stdio is wired to the UART
@@ -291,7 +281,10 @@ message(STATUS "Pico-Thing clk_sys ${PICO_THING_SYS_CLK_HZ} Hz")
 # The per-cycle ISR cost instrument costs about 21 clk_sys cycles per E cycle,
 # which moves the E ceiling by roughly 0.13 MHz.  Set to 0 to get those back
 # while keeping the rest of DEBUG.
-set(PICO_THING_ISR_COST 1 CACHE STRING
+# Default OFF: it is an instrument, and 0.13 MHz of E ceiling is the very thing
+# the per-cycle redesign is trying to win back.  Turn it on for a measurement,
+# not for a working build.
+set(PICO_THING_ISR_COST 0 CACHE STRING
 	"1 = measure the per-cycle ISR cost and report it in st, 0 = do not")
 message(STATUS "Pico-Thing ISR cost instrument: ${PICO_THING_ISR_COST}")
 
@@ -319,7 +312,6 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_POWER_RAIL_SETTLE_MS=${PICO_THING_POWER_RAIL_SETTLE_MS}u
 	PICO_THING_DAT_FAULT_AUTO_BLOCK=${PICO_THING_DAT_FAULT_AUTO_BLOCK}
 	PICO_THING_DAT_FAULT_BLOCK_DELAY=${PICO_THING_DAT_FAULT_BLOCK_DELAY}u
-	PICO_THING_RTI_TASK_RESTORE=${PICO_THING_RTI_TASK_RESTORE}
 	PICO_THING_CONSOLE_BAUD=${PICO_THING_CONSOLE_BAUD}
 	SYS_CLK_DEFAULT=${PICO_THING_SYS_CLK_HZ}
 	PICO_THING_ISR_COST=${PICO_THING_ISR_COST}

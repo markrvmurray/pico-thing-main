@@ -23,12 +23,6 @@
 #include "mc6850.h"
 #include "uart_pump.h"
 
-// Set from CMake with -DPICO_THING_RTI_TASK_RESTORE=1 to have the Pico put the
-// interrupted task back after an RTI.  Off by default: see apply_rti().
-#ifndef PICO_THING_RTI_TASK_RESTORE
-#define PICO_THING_RTI_TASK_RESTORE 0
-#endif
-
 const char *bus_state_string[] = {
 	foreach_busstate(enum_list_strings)
 };
@@ -47,14 +41,9 @@ mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
 	bus_state = BUS_RUNNING;
 	run_state = RS_UNPOWERED;
 	busy_lic_avma.byte = 0x00u;
-	task_stack_ptr = 0u;
-	nesting_depth = 0u;
-	rti_task_countdown = 0u;
-	rti_pending_task = 0u;
 	e_freq = GUEST_CLK_DEFAULT;
 #ifdef DEBUG
 	_count_lic = 0u;
-	_count_rti = 0u;
 #endif
 	for (auto &c : _count_irq_ack) c = 0u;
 }
@@ -64,7 +53,6 @@ void
 mc6809::task_initialise()
 {
 	reg[SYSTEM_TASK] = static_cast<uint8_t>(0u);
-	task_stack_ptr = 0x00u;
 	task = 0u;
 }
 
@@ -98,14 +86,9 @@ mc6809::setup(enum run_state rs)
 	old_bus_state = BUS_RUNNING;
 	bus_state = BUS_RUNNING;
 	busy_lic_avma.byte = 0x00u;
-	task_stack_ptr = 0u;
-	nesting_depth = 0u;
-	rti_task_countdown = 0u;
-	rti_pending_task = 0u;
 	vma = false;
 #ifdef DEBUG
 	_count_lic = 0u;
-	_count_rti = 0u;
 #endif
 	for (auto &c : _count_irq_ack) c = 0u;
 	// If a one-shot trace is armed for this run, restart its fill cleanly.
@@ -225,7 +208,6 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 	setup(RS_RESET);
 #ifdef DEBUG
 	uint32_t lic_start = _count_lic;
-	uint32_t rti_start = _count_rti;
 #endif
 	RESET_DEASSERT;
 	for (i = 0; i < 1000u*timeout_ms; i++) {
@@ -245,7 +227,6 @@ mc6809::start_with_timeout(const uint32_t timeout_ms, bool sync_means_stop)
 		printf("MC6809 run took %u iterations\n", i);
 #ifdef DEBUG
 		printf("%" PRIu32 " LICs were counted\n", _count_lic - lic_start);
-		printf("%" PRIu32 " RTIs were counted\n", _count_rti - rti_start);
 #endif
 		if (i == 1000u*timeout_ms)
 			printf("Timeout was reached\n");
@@ -277,69 +258,12 @@ mc6809::release()
 	HALT_DEASSERT;
 }
 
-// The PIO RTI detector has spotted an RTI opcode fetch.  The RTI has not
-// executed yet, so the interrupt is unwound here - nesting depth and task
-// stack - but any task restore has to wait out the instruction: 15 E cycles
-// for a full frame, 6 for FIRQ, so 15 covers both.
-//
-// SETTLED, not pending (the owner, 2026-10-04): leave this as it is.  The
-// alternatives were a universal switch to task 0 on entry with the guest
-// restoring, or restoring here unless the handler had written the task
-// register itself.  Both change the environment every guest interrupt handler
-// runs in, and the arrangement below is the only one proven to boot NitrOS-9.
-//
-// With PICO_THING_RTI_TASK_RESTORE off, which is the default, no restore is
-// armed and the task register stays where the handler left it.  Putting the
-// interrupted task back suits an interrupt that resumes what it interrupted,
-// but not a handler that does not: a DAT fault cannot be retried, so its
-// handler kills the faulting process, and an automatic restore would force the
-// dead task back under it about 15 E cycles after its RTI - too late to
-// pre-empt by writing the task register first, and racing it afterwards.
-void
-mc6809::apply_rti()
-{
-#ifdef DEBUG
-	count_rti();
-#endif
-	if (nesting_depth == 0u) {
-		// An RTI with nothing to unwind: either a vector fetch was missed,
-		// or the detector was fooled - LIC is high while stacking too, so
-		// it cannot be made exact.  Counted so the OS's declaration has
-		// something to be judged against.
-		depth_underflows++;
-		return;
-	}
-	{
-		nesting_depth--;
-		if (task_stack_ptr > 0u) {
-			const uint8_t interrupted_task =
-				task_stack[task_stack_ptr.fetch_sub(1u, std::memory_order_relaxed) - 1u];
-#if PICO_THING_RTI_TASK_RESTORE
-			rti_pending_task = interrupted_task;
-			rti_task_countdown = 15u;
-#else
-			(void) interrupted_task;	// the guest owns the task register
-#endif
-		}
-		if (nesting_depth == 0u && rti_task_countdown == 0u)
-			run_state = RS_RUNNING;
-	}
-}
-
-// The deferred task restore's countdown has expired: put the interrupted task
-// back.  Reached from tick_rti_countdown(), which is inline in the header
-// because it runs on every Q-rising; this half runs once per RTI at most, so
-// it stays out of line and out of the ISR's instruction footprint.
-void
-mc6809::rti_task_expired()
-{
-	task = rti_pending_task;
-	reg[SYSTEM_TASK] = rti_pending_task;
-	if (task_pin_callback)
-		task_pin_callback(rti_pending_task);
-	if (nesting_depth == 0u)
-		run_state = RS_RUNNING;
-}
+// The interrupt-nesting depth, the task history and the deferred task restore
+// were all removed on 2026-10-06 with the RTI opcode detector that drove them;
+// its 13 words on pio1 were needed for the per-cycle redesign.  The decision
+// they encoded still stands and is recorded at the vector-fetch site: only a
+// DAT fault switches to task 0, and nothing restores the task afterwards, so
+// every other handler runs under the interrupted task's own mapping.
 
 static uart_port_state port_state[2];
 

@@ -116,7 +116,6 @@ volatile bool verbose = false;
 #define BUS_CLOCK_PIO	pio0		// E/Q quadrature clock
 #define BUS_READ_PIO	pio0		// guest reads of the register block
 #define BUS_WRITE_PIO	pio1		// guest writes to the register block
-#define RTI_DETECT_PIO	pio1		// RTI opcode detector
 #define TASK_OUTPUT_PIO	pio2		// task pins, GPIO base 16
 #define TRACE_LO_PIO	pio0		// bus trace, GPIO 0-31
 #define TRACE_HI_PIO	pio2		// bus trace, GPIO 32-47
@@ -127,7 +126,6 @@ volatile bool verbose = false;
 static pio_dma pio_clock     = { BUS_CLOCK_PIO,       -1, -1,  -1,  -1, IO_IRQ_BANK0 };
 static pio_dma piodma_read   = { BUS_READ_PIO,        -1, -1,   0,   1, DMA_IRQ_0 };
 static pio_dma piodma_write  = { BUS_WRITE_PIO,       -1, -1,   4,   5, DMA_IRQ_1 };
-static pio_dma rti_detect    = { RTI_DETECT_PIO,      -1, -1,  -1,  -1, PIO1_IRQ_0 };
 static pio_dma task_output   = { TASK_OUTPUT_PIO,     -1, -1,  -1,  -1, -1 };
 static pio_dma trace_lo      = { TRACE_LO_PIO,        -1, -1,  -1,   2, -1 };
 static pio_dma trace_hi      = { TRACE_HI_PIO,        -1, -1,  -1,   3, -1 };
@@ -291,6 +289,19 @@ static volatile bool step_active = false;	// restore the spin on NMI entry
 // cycle is an opcode fetch", so raising NMI there leaves it pending through
 // the instruction being fetched, and the 6809 finishes that one and takes it.
 //
+// Two states.  The snippet's own RTI has to be stepped over first, and the
+// RTI is found by the GAP BETWEEN LIC EDGES rather than by the RTI opcode
+// detector, which is being removed to free its 13 words on pio1.
+//
+// Why a gap and not a count of edges: releasing the spin means clearing the
+// BRA's offset byte, and if the 6809 has already read that byte the current
+// BRA still loops.  So an unknown number of further spin iterations follow,
+// each with its own LIC edge, and counting edges from the release is not
+// reliable.  The INTERVALS are unambiguous though - while spinning on
+// `BRA B@1` the edges are 3 E cycles apart, and the RTI with a full frame is
+// 15 - so the first edge that ends a gap of RTI_GAP_MIN or more IS the RTI
+// completing, however many times the spin went round.
+//
 // Three states, because the snippet's own RTI has to be stepped over first.
 // The detector fires on the RTI's OPCODE FETCH (LIC=1 then $3B at E-fall), so
 // at that moment the RTI has not run yet; the first LIC rising edge after it is
@@ -309,7 +320,12 @@ static volatile bool step_active = false;	// restore the spin on NMI entry
 // cycle stale - and a cycle is precisely what the gate cannot spare.  The
 // mirror's re-phasing exists to make a trace readable (6b77bb3); acting one
 // cycle ahead needs the "in advance" signal as the 6809 drives it.
-enum : uint8_t { STEP_IDLE = 0u, STEP_RELEASED = 1u, STEP_AFTER_RTI = 2u };
+enum : uint8_t { STEP_IDLE = 0u, STEP_RELEASED = 1u };
+// A gap this long between LIC edges is the RTI rather than the spin: the spin
+// is 3 E cycles and a full-frame RTI is 15, so anything in between separates
+// them with room to spare.
+static constexpr uint8_t RTI_GAP_MIN = 8u;
+static volatile uint8_t step_gap = 0u;	// E cycles since the last LIC edge
 static volatile uint8_t step_state = STEP_IDLE;
 static volatile bool step_request = false;	// Core 0 asks; the handler acts
 static volatile bool step_prev_lic = false;	// for the rising-edge test
@@ -361,18 +377,17 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 // (it must see E on GPIO 0 and the whole bus) and the high half needs the
 // base-16 one, so they hand off with the RP2350 cross-block IRQ.  PREV/NEXT
 // wrap across the three blocks, so pio0's "prev" is pio2 — which matters,
-// because pio1 is full to the word (bus_write 19 + rti_detect 13 = 32) and
-// pio0 is the only base-0 block with room.
+// because pio0 is the only base-0 block with room.  (pio1 was full to the word
+// until rti_detect's 13 were reclaimed; bus_write leaves 13 free there now.)
 // PIO IRQ flags, which the instruction streams in pico_thing.pio raise and
 // this file consumes.  They are named here because the two sides are edited
 // independently and a silent mismatch is expensive: a renumbering on
 // 2026-10-01 left the RTI detector raising one flag while this file enabled
-// and cleared another, which killed RTI detection outright - and with it the
-// nesting unwind, so the run state stuck in RS_IN_IRQ - without a word.
+// and cleared another, which killed RTI detection outright without a word.
+// That detector is gone now, and pio1 raises nothing at all.
 //
 // Flags are per block.  pio1 and pio2 each have their own set of eight.
 //
-//   pio1 flag 1  rti_detect        -> PIO1_IRQ_0 -> pio_rti_irq_handler()
 //   pio2 flag 0  mc6809_clock's "irq prev set 0", once per E cycle at Q-fall
 //                (prev from pio0 wraps to pio2), consumed by bus_fault's wait
 //   pio2 flag 1  mc6809_clock's "irq prev set 1", once per E cycle at E-fall,
@@ -381,8 +396,6 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 //                ever used again: a satisfied wait clears the flag
 //   pio2 flag 2  bus_capture_lo -> bus_capture_hi handshake, SM to SM
 //   pio2 flag 3  bus_fault, the DAT fault signal to the CPU
-static constexpr uint RTI_PIO_IRQ = 1u;
-static constexpr pio_interrupt_source RTI_PIO_IRQ_SOURCE = pis_interrupt1;
 
 static constexpr uint BUS_FAULT_PIO_IRQ = 3u;
 static constexpr pio_interrupt_source BUS_FAULT_PIO_IRQ_SOURCE = pis_interrupt3;
@@ -549,7 +562,7 @@ extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK
 // -D PICO_THING_ISR_COST=0 to get those cycles back while keeping the rest of
 // DEBUG.
 #ifndef PICO_THING_ISR_COST
-#define PICO_THING_ISR_COST 1
+#define PICO_THING_ISR_COST 0	// match CMake's default; it is an instrument
 #endif
 #if defined(DEBUG) && PICO_THING_ISR_COST
 #define ISR_COST_ON 1
@@ -694,10 +707,8 @@ __time_critical_func(gpio_q_irq_handler())
 		MC6809.count_lic();
 #endif
 		if (reset_now) {
-			if (MC6809.run_state != RS_RESET) {
+			if (MC6809.run_state != RS_RESET)
 				MC6809.run_state = RS_RESET;
-				MC6809.task_stack_ptr = 0;
-			}
 			// Keep the reported state honest while the guest is held: this
 			// branch used to leave bus_state frozen at whatever it was when
 			// the reset pin went low, and status reported that as current.
@@ -724,20 +735,6 @@ __time_critical_func(gpio_q_irq_handler())
 				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
 				if (eirq <= INTERRUPT_RESET)
 					MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
-				if (eirq < INTERRUPT_RESET) {
-					// The depth counts every interrupt; only the task
-					// HISTORY is bounded.  These used to share one guard,
-					// so at MAX_INT_NEST_DEPTH the depth stopped rising
-					// while every RTI kept lowering it - the count went
-					// permanently out of step, and nothing said so.
-					if (MC6809.task_stack_ptr < mc6809::MAX_INT_NEST_DEPTH)
-						MC6809.task_stack[MC6809.task_stack_ptr.fetch_add(
-							1u, std::memory_order_relaxed)] = MC6809.task;
-					else
-						MC6809.depth_overflows++;
-					if (MC6809.nesting_depth < 0xFFu)
-						MC6809.nesting_depth++;
-				}
 				// Both the break command and the watchpoint point the NMI
 				// vector at the BREAK snippet, and the vector fetch is the
 				// point at which the frame is on the stack and the copy is
@@ -787,22 +784,12 @@ __time_critical_func(gpio_q_irq_handler())
 				// count, so it has to be maintained in every build.
 				if (eirq <= INTERRUPT_RESET)
 					MC6809.count_irq_ack(eirq);
-				// Reset fetches its vector through here too, and that is the
-				// guest starting rather than the guest taking an interrupt.
-				// Counting it as one stuck: nesting_depth is not incremented
-				// for reset - the task stack push above is guarded the same
-				// way - so apply_rti() had nothing to unwind, BUS_RUNNING
-				// deliberately will not undo RS_IN_IRQ, and every guest read
-				// as being in an interrupt from the moment it started.
-				if (eirq < INTERRUPT_RESET)
-					MC6809.run_state = RS_IN_IRQ;
 				break;
 			}
 			case BUS_SYNC:  MC6809.run_state = RS_SYNCED; break;
 			case BUS_HALT:  MC6809.run_state = RS_HALTED; break;
 			case BUS_RUNNING:
-				if (MC6809.run_state != RS_IN_IRQ)
-					MC6809.run_state = RS_RUNNING;
+				MC6809.run_state = RS_RUNNING;
 				break;
 			default:
 				break;
@@ -814,8 +801,6 @@ __time_critical_func(gpio_q_irq_handler())
 			gpio_put(GPIO_NMI_BLOCK, true);
 			reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
 		}
-		// Deferred task restore after RTI detection
-		MC6809.tick_rti_countdown();
 		// LIC-gated step.  Release and gate are both here for the same
 		// reason the cycle-count path is: from Core 0 the two would be a
 		// millisecond apart, which is not a step.
@@ -828,7 +813,14 @@ __time_critical_func(gpio_q_irq_handler())
 				// "branch to the next byte", which is the RTI.
 				reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
 				step_state = STEP_RELEASED;
+				step_gap = 0u;
 				step_request = false;
+				if (step_active) {	// restart the edge log
+					step_pass = 0u;
+					step_edges = 0u;
+					step_armed_edge = 0u;
+					step_logging = true;
+				}
 			}
 			if (step_logging) {
 				if (step_pass < 0xFFu)
@@ -837,15 +829,24 @@ __time_critical_func(gpio_q_irq_handler())
 				    && step_edges < STEP_EDGE_MAX)
 					step_edge[step_edges++] = step_pass;
 			}
-			if (step_state == STEP_AFTER_RTI
-			    && lic_now && !step_prev_lic) {
-				// The RTI has ended and the guest's own
-				// instruction is this cycle.  PEND_NMI reaches the
-				// pin later in this same pass, so it is pending
-				// through that one instruction.
-				pending_interrupts |= PEND_NMI;
-				step_armed_edge = step_edges;
-				step_state = STEP_IDLE;
+			if (step_state == STEP_RELEASED) {
+				if (step_gap < 0xFFu)
+					step_gap++;
+				if (lic_now && !step_prev_lic) {
+					if (step_gap >= RTI_GAP_MIN) {
+						// That edge ended a long gap, so it
+						// is the RTI finishing and the
+						// guest's own instruction is next.
+						// PEND_NMI reaches the pin later in
+						// this same pass, so it is pending
+						// through that one instruction.
+						pending_interrupts |= PEND_NMI;
+						step_armed_edge = step_edges;
+						step_state = STEP_IDLE;
+					} else {
+						step_gap = 0u;	// still spinning
+					}
+				}
 			}
 			step_prev_lic = lic_now;
 		}
@@ -926,27 +927,6 @@ __time_critical_func(gpio_q_irq_handler())
 #if ISR_COST_ON
 	isr_cost_add(q_cost, q_cost_start);
 #endif
-}
-
-// ISR for the RTI opcode detector PIO program.
-// Fires when the PIO detects LIC=1 followed by D[7:0]=$3B at E-fall.
-void __isr
-__time_critical_func(pio_rti_irq_handler())
-{
-	pio_interrupt_clear(rti_detect.pio, RTI_PIO_IRQ);
-	MC6809.apply_rti();
-	// During a LIC-gated step this is the BREAK snippet's own RTI: from the
-	// next opcode fetch onwards the guest is running its own code again.
-	if (step_state == STEP_RELEASED)
-		step_state = STEP_AFTER_RTI;
-	// Both gates log, so the cycle count that works can be read against the
-	// edges it falls between.
-	if (step_active) {
-		step_pass = 0u;
-		step_edges = 0u;
-		step_armed_edge = 0u;
-		step_logging = true;
-	}
 }
 
 // ISR for the DAT fault sampler PIO program.
@@ -1255,12 +1235,6 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		reg[SYSTEM_TASK] = new_task;
 		task_pins_update(new_task);
 	}
-	else if (wloc == SYSTEM_RTI_SIGNAL)
-		// For a guest that signals its own RTIs instead of being watched; see
-		// pico_thing.h.  The rti_detect PIO program catches every RTI opcode
-		// fetch by itself, so a guest that does both has each RTI counted
-		// twice.  Nothing in this tree writes it.
-		MC6809.apply_rti();
 	// CONSOLE_CONTROL / AUX_CONTROL: full guest_control() is deferred
 	// to the write_ring so mode changes are sequenced after pending TX
 	// data.  But RTS must take effect immediately — otherwise
@@ -1276,10 +1250,6 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		aux_serial.write_received();
 	else if (wloc == SYSTEM_TIMER_CONTROL_13)
 		system_tick.control(wval);
-	else if (wloc == SYSTEM_INT_DEPTH)
-		// The OS telling us where it really is; see the note in
-		// pico_thing.h for why this exists at all.
-		MC6809.declare_depth(wval);
 	else if (wloc == SYSTEM_WATCHPOINT) {
 		// Arm/disarm deferred to write ring handler (needs snippet_code[])
 	}
@@ -2809,6 +2779,21 @@ static repeating_timer rail_timer;
 static volatile uint16_t rail_raw = 0u;		// counts, external 5V through the divider
 static volatile uint16_t rail_trip_raw = 0u;	// the sample that opened the switch
 static volatile uint16_t die_raw = 0u;		// counts, internal temperature sensor
+// A SAMPLE AT FULL SCALE IS NOT A MEASUREMENT.  When the ADC reference sags
+// under bus switching (2026-10-06: 3.24V down to ~2.03V) this channel clips,
+// and a clipped 4095 reads as 6.49V - HIGH, so it happily seeds the baseline.
+// Then the bus goes quiet, the reference recovers, the reading falls to a
+// correct 5.00V, and the relative detector sees a 1.49V collapse that never
+// happened.  That powered the board down twice on 2026-10-06, mid-test.
+//
+// So a clipped sample is excluded from the decision ENTIRELY: it cannot seed
+// the baseline, cannot move it, and cannot trip.  The cutout reports itself
+// disabled instead, which is the honest answer - while the channel is
+// saturated a real sag is invisible until the rail falls over 20%.
+static constexpr uint16_t RAIL_CLIP_COUNTS = 4090u;
+static volatile bool rail_clipped = false;	// last sample was at full scale
+static volatile bool rail_floor_only = false;	// serving: floor judged, baseline frozen
+
 static volatile uint32_t rail_low_count = 0u;	// consecutive samples below the cutout
 static volatile float rail_baseline = 0.0f;	// slow average of a healthy +5VP
 static volatile uint32_t rail_good_count = 0u;	// consecutive healthy samples seen
@@ -2878,10 +2863,48 @@ power_rail_monitor(repeating_timer *)
 		rail_baseline,
 		rail_good_count,
 	};
-	const rail_judgement rj = rail_judge(rs, rail_cfg);
-	rail_low_count = rj.low_count;
-	rail_baseline = rj.baseline;
-	rail_good_count = rj.good_count;
+	// THREE TIERS, because the ADC is only calibrated in two run states.
+	//
+	// A clipped sample tells us nothing at all: 4095 reads as 6.49V, which is
+	// HIGH, so it would happily seed the baseline - and then the bus goes
+	// quiet, the reference recovers, the reading falls to a correct 5.00V and
+	// the relative detector sees a collapse that never happened.  That
+	// powered the board down twice on 2026-10-06.
+	//
+	// Short of clipping, a sample taken while the bus is being served is
+	// still inflated - 0.17 to 0.5V in September, far more since the
+	// reference fault of 2026-10-07 - and the inflation is NOT constant, so
+	// a baseline seeded from one makes the next quiet sample look like a
+	// collapse by the same mechanism.  So while the guest is running the
+	// baseline is FROZEN and only the absolute floor is judged.
+	//
+	// That is not a loss of protection, because there was none to lose: with
+	// the reading inflated by 10% a real sag to 4.5V reports 5.0V and is
+	// invisible.  The floor is kept because a TOTAL loss of +VDC drives the
+	// reading to zero, and a gain error cannot hide that.  Full judging
+	// resumes in the two states the calibration was derived in.
+	rail_clipped = raw >= RAIL_CLIP_COUNTS;
+	const bool adc_calibrated = MC6809.is_halted() || MC6809.is_unpowered();
+	rail_floor_only = !rail_clipped && !adc_calibrated;
+
+	rail_judgement rj = { false, rail_low_count, rail_baseline,
+			      rail_good_count };
+	if (rail_floor_only) {
+		// fall_volts of zero disables the relative test by contract, so
+		// this judges the floor alone.  The debounce counter is kept, but
+		// the baseline and its good_count are deliberately NOT written
+		// back, which is what freezes them.
+		rail_limits floor_cfg = rail_cfg;
+		floor_cfg.fall_volts = 0.0f;
+		const rail_judgement floor_rj = rail_judge(rs, floor_cfg);
+		rj.trip = floor_rj.trip;
+		rail_low_count = floor_rj.low_count;
+	} else if (!rail_clipped) {
+		rj = rail_judge(rs, rail_cfg);
+		rail_low_count = rj.low_count;
+		rail_baseline = rj.baseline;
+		rail_good_count = rj.good_count;
+	}
 	if (rj.trip) {
 		// Keep the sample that decided it.  By the time the console loop
 		// reports this the switch is open, the load is gone and the rail
@@ -2962,10 +2985,6 @@ status_gather(status_snapshot_t *s)
 	s->task_write_odd_count = task_write_odd_count;
 	s->task_write_odd_from = task_write_odd_from;
 	s->task_write_odd_to = task_write_odd_to;
-	s->nesting_depth = MC6809.get_nesting_depth();
-	s->task_stack_ptr = MC6809.get_task_stack_ptr();
-	for (uint16_t i = 0; i < s->task_stack_ptr && i < STATUS_MAX_INT_NEST_DEPTH; i++)
-		s->task_history[i] = MC6809.get_task_history(i);
 
 	s->power = POWER_IS_ASSERTED;
 	// Both readings come from the supply monitor's cache; nothing else may
@@ -3008,6 +3027,8 @@ status_gather(status_snapshot_t *s)
 	s->lic_count = MC6809.get_lic_count();
 	s->rail_baseline = rail_baseline;
 	s->rail_good = rail_good_count;
+	s->rail_clipped = rail_clipped;
+	s->rail_floor_only = rail_floor_only;
 	s->busy_lic_avma = MC6809.get_busy_lic_avma();
 	// pio2 flag 1 is set by the clock at every E-falling and consumed by
 	// nothing since the BUSY/LIC/AVMA mirror went, so SET is now the expected
@@ -3017,7 +3038,6 @@ status_gather(status_snapshot_t *s)
 	s->clock_pc = (pio_clock.sm < 0) ? 0xFFu : static_cast<uint8_t>(
 		pio_sm_get_pc(pio_clock.pio, static_cast<uint>(pio_clock.sm))
 		- static_cast<uint>(pio_clock.offset));
-	s->rti_count = MC6809.get_rti_count();
 	s->last_lic = last_LIC;
 	s->lic_stalled = false;
 	if (MC6809.is_running()) {
@@ -3146,7 +3166,14 @@ status_print(const status_snapshot_t *s)
 	// The baseline as well as the sample: without it there is no way to see
 	// whether the relative detector is armed, which is what the bench test
 	// for the cutout has to watch while it sags the sense node at J107.
-	if (s->rail_baseline > 0.0f)
+	if (s->rail_clipped)
+		printf("  cutout DISABLED - supply channel at full scale, so the"
+		       " rail cannot be seen\n");
+	else if (s->rail_floor_only)
+		printf("  cutout FLOOR ONLY (%.2fV) - the bus is served, so the"
+		       " reading is inflated and the baseline is frozen\n",
+		       (double) POWER_RAIL_DROP_VOLTS);
+	else if (s->rail_baseline > 0.0f)
 		printf("  cutout baseline %.2fV (%" PRIu32 " good)%s\n",
 		       (double) s->rail_baseline, s->rail_good,
 		       s->rail_good >= 50u ? ", armed"
@@ -3228,23 +3255,11 @@ status_print(const status_snapshot_t *s)
 	// 2. Bus state, run state
 	printf("Bus State: %-16s  Prev: %-16s\n",
 	       bus_state_string[s->bus_state], bus_state_string[s->old_bus_state]);
-	printf("Run State: %s  Nesting: %u\n", run_state_string[s->run_state], s->nesting_depth);
-	{
-		// Only worth a line when something has actually gone wrong, or the
-		// OS has had to put us right.  A clean run says nothing.
-		const mc6809::depth_errors d = MC6809.get_depth_errors();
-		if (d.overflows || d.underflows || d.declares)
-			printf("  depth: %" PRIu32 " overflows (history full), %" PRIu32
-			       " underflows (RTI at 0), %" PRIu32 " OS declarations\n",
-			       d.overflows, d.underflows, d.declares);
-	}
-	printf("Task: %u  History:", s->task);
-	if (s->task_stack_ptr == 0)
-		printf(" -");
-	else
-		for (uint16_t i = 0; i < s->task_stack_ptr; i++)
-			printf(" %u", s->task_history[i]);
-	printf("  Odd task writes: %" PRIu32, s->task_write_odd_count);
+	printf("Run State: %s\n", run_state_string[s->run_state]);
+	// The interrupt-nesting depth and the task history that went with it are
+	// gone with the RTI detector: without it there is nothing to unwind them,
+	// so a count could only ever climb.
+	printf("Task: %u  Odd task writes: %" PRIu32, s->task, s->task_write_odd_count);
 	if (s->task_write_odd_count > 0u)
 		printf("   <- last was task %u -> %u!",
 		       s->task_write_odd_from, s->task_write_odd_to);
@@ -3256,8 +3271,8 @@ status_print(const status_snapshot_t *s)
 	// is running, so under HALT the bits are the only way to see BUSY/LIC/AVMA
 	// at all - and LIC is HIGH when halted at an instruction boundary.
 	BLA live{}; live.byte = s->busy_lic_avma;
-	printf("LIC: %-10" PRIu32 "  RTI: %-10" PRIu32 "  pins: %c%c%c\n",
-	       s->lic_count, s->rti_count,
+	printf("LIC: %-10" PRIu32 "  pins: %c%c%c\n",
+	       s->lic_count,
 	       live.bit.BUSY ? 'B' : '.',
 	       live.bit.LIC  ? 'L' : '.',
 	       live.bit.AVMA ? 'V' : '.');
@@ -3456,15 +3471,9 @@ status_json(const status_snapshot_t *s)
 	printf(R"json({"run_state":"%s","bus_state":"%s","old_bus_state":"%s")json",
 	       run_state_string[s->run_state], bus_state_string[s->bus_state],
 	       bus_state_string[s->old_bus_state]);
-	printf(R"json(,"task":%u,"nesting_depth":%u,"task_stack_ptr":%u)json", s->task, s->nesting_depth, s->task_stack_ptr);
+	printf(R"json(,"task":%u)json", s->task);
 	printf(R"json(,"task_write_odd":{"count":%)json" PRIu32 R"json(,"from":%u,"to":%u})json",
 	       s->task_write_odd_count, s->task_write_odd_from, s->task_write_odd_to);
-	printf(R"json(,"task_history":[)json");
-	for (uint16_t i = 0; i < s->task_stack_ptr; i++) {
-		if (i > 0) printf(",");
-		printf("%u", s->task_history[i]);
-	}
-	printf("]");
 	printf(R"json(,"power":%s,"reset":%s,"halt":%s,"nmi":%s,"firq":%s,"irq":%s)json",
 	       s->power ? "true" : "false", s->reset ? "true" : "false",
 	       s->halt ? "true" : "false", s->nmi ? "true" : "false",
@@ -3489,8 +3498,8 @@ status_json(const status_snapshot_t *s)
 	       R"(,"clk_usb_khz":%)" PRIu32 R"(,"clk_adc_khz":%)" PRIu32,
 	       s->clk_sys_khz, s->clk_peri_khz, s->clk_usb_khz, s->clk_adc_khz);
 #ifdef DEBUG
-	printf(",\"lic_count\":%" PRIu32 ",\"rti_count\":%" PRIu32 ",\"lic_stalled\":%s",
-	       s->lic_count, s->rti_count, s->lic_stalled ? "true" : "false");
+	printf(",\"lic_count\":%" PRIu32 ",\"lic_stalled\":%s",
+	       s->lic_count, s->lic_stalled ? "true" : "false");
 #endif
 	printf(",");
 	status_json_regs("write_regs", s->write_regs);
@@ -4258,7 +4267,6 @@ status_done:
 		const char *test_name = nullptr;
 		const uint8_t hexnum = cmd.irq.testnum;
 #ifdef DEBUG
-		uint32_t expected_rti_count = 0u;
 		uint32_t expected_irq_ack_count = 0u;
 #endif
 
@@ -4282,7 +4290,6 @@ status_done:
 			break;
 		}
 #ifdef DEBUG
-		MC6809.clear_rti_count();
 		MC6809.clear_irq_ack_count();
 #endif
 
@@ -4378,26 +4385,6 @@ status_done:
 #ifdef DEBUG
 			expected_irq_ack_count = 1u;
 #endif
-		} else if (hexnum == 5) {
-			static constexpr const char *testname = "RTI";
-			static constexpr uint16_t stack_result_length = 12u;
-			static constexpr uint8_t stack_result[stack_result_length] = {
-				0x80, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x90, 0xFF, 0xE7
-			};
-			printf("RTI Test\n");
-#ifdef DEBUG
-			expected_rti_count = 2u;
-			expected_irq_ack_count = 1u;
-#endif
-			reg[REGISTER_VECTOR_SWI_OFFSET] = static_cast<uint16_t>(REGISTER_SNIPPET + 9);
-			for (uint16_t i = 0; i < stack_result_length; i++)
-				reg[REGISTER_BUFFER_OFFSET + (16u - stack_result_length) + i] = stack_result[i];
-			reg[REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN - 1] = static_cast<uint8_t>(0xE6);
-			snippet_copy(TEST_RTI);
-			MC6809.start();
-			while (!MC6809.is_synced()) { sleep_us(1); if (++timeout > 1000000u) break; }
-			MC6809.stop();
-			test_name = testname; final_stack_length = stack_result_length; final_stack = stack_result;
 		} else if (hexnum == 7) {
 			// NMIBlock write-to-effect latency.  The snippet arms the trace
 			// and then sets and clears NMIBlock; we read back how many E
@@ -4790,7 +4777,6 @@ status_done:
 				break;
 			reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
 #ifdef DEBUG
-			MC6809.clear_rti_count();
 #endif
 			MC6809.clear_irq_ack_count();
 			MC6809.start();
@@ -4882,7 +4868,7 @@ status_done:
 				if (c > 0u)
 					printf(" %s=%" PRIu32, irq_names[i], c);
 			}
-			printf(" ]  RTI: %" PRIu32 "\n", MC6809.get_rti_count());
+			printf(" ]\n");
 #endif
 			printf("Interrupt test: %s\n", success ? "PASS" : "FAIL");
 
@@ -4976,13 +4962,6 @@ status_done:
 					printf(" %s=%" PRIu32, irq_names[i], c);
 			}
 			printf(" ]\n");
-			const uint32_t rti_caught = MC6809.get_rti_count();
-			const bool rti_ok = (rti_caught == expected_rti_count);
-			if (!rti_ok)
-				success = false;
-			printf("%s: RTI capture: %s (expected %" PRIu32 ", got %" PRIu32 ")\n",
-			       test_name, rti_ok ? "PASS" : "FAIL",
-			       expected_rti_count, rti_caught);
 #endif
 		}
 		break;
@@ -5687,12 +5666,6 @@ __no_inline_not_in_flash_func(main_core1)()
 	pio_sm_set_enabled(task_output.pio, task_output.sm, true);
 	printf("Core1 task pio%d/sm%d started\n", PIO_NUM(task_output.pio), task_output.sm);
 
-	pio_sm_set_enabled(rti_detect.pio, rti_detect.sm, true);
-	pio_set_irq0_source_enabled(rti_detect.pio, RTI_PIO_IRQ_SOURCE, true);
-	irq_set_exclusive_handler(rti_detect.irq, pio_rti_irq_handler);
-	irq_set_priority(rti_detect.irq, 1);
-	irq_set_enabled(rti_detect.irq, true);
-	printf("Core1 RTI detect pio%d/sm%d started\n", PIO_NUM(rti_detect.pio), rti_detect.sm);
 
 	pio_sm_set_enabled(bus_fault.pio, bus_fault.sm, true);
 	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, true);
@@ -6186,16 +6159,6 @@ bus_pio_dma_init()
 	task_output_program_init(task_output.pio, task_output.sm, task_output.offset);
 	printf("Core0 task output pio%u sm%d configured\n", PIO_NUM(task_output.pio), task_output.sm);
 
-	// SM: RTI opcode detector (pio1, needs GPIO 0-21 visibility)
-	rti_detect.offset = pio_add_program(rti_detect.pio, &rti_detect_program);
-	if (rti_detect.offset < 0) {
-		printf("Core0 insufficient space for rti_detect program\n");
-		panic("Unable to proceed");
-	}
-	rti_detect.sm = pio_claim_unused_sm(rti_detect.pio, true);
-	rti_detect_program_init(rti_detect.pio, rti_detect.sm, rti_detect.offset);
-	printf("Core0 RTI detect pio%u sm%d configured\n", PIO_NUM(rti_detect.pio), rti_detect.sm);
-
 	// SM pair: bus trace capture.  pio0 -> pio2 via "irq prev", which wraps
 	// across the three blocks.  pio1 would be the tidier neighbour but has
 	// no instruction memory left.
@@ -6271,11 +6234,6 @@ pio_shutdown()
 	irq_set_enabled(piodma_write.irq, false);
 	irq_remove_handler(piodma_write.irq, dma_bus_write_irq_handler);
 
-	// RTI detect IRQ (pio1)
-	pio_set_irq0_source_enabled(rti_detect.pio, RTI_PIO_IRQ_SOURCE, false);
-	irq_set_enabled(rti_detect.irq, false);
-	irq_remove_handler(rti_detect.irq, pio_rti_irq_handler);
-
 	// Bus fault detect IRQ (pio2)
 	pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, false);
 	irq_set_enabled(bus_fault.irq, false);
@@ -6308,10 +6266,6 @@ pio_shutdown()
 		bus_fault.offset = -1;
 	}
 	bus_fault.sm = -1;
-
-	// --- RTI detect (pio1) ---
-	rti_detect_program_deinit(rti_detect.pio, rti_detect.sm);
-	pio_remove_program(rti_detect.pio, &rti_detect_program, rti_detect.offset);
 
 	// --- Task output (pio2) ---
 	task_output_program_deinit(task_output.pio, task_output.sm);
@@ -6375,6 +6329,14 @@ power_rail_enable()
 	// and that dip is not a collapse.
 	rail_collapsed = false;
 	rail_low_count = 0u;
+	// The BASELINE has to go too, not just the counter.  It is a slow average
+	// of how the rail looked under the last load, and the load is about to
+	// change; worse, if the reference was faulty when it established, it holds
+	// an inflated number that the next healthy reading falls away from.  A
+	// stale 6.49V baseline survived a trip and a power cycle on 2026-10-06 and
+	// re-killed the board on the following quiet sample.
+	rail_baseline = 0.0f;
+	rail_good_count = 0u;
 	rail_settle_until = time_us_64() + (RAIL_SETTLE_MS * 1000ull);
 	POWER_ASSERT;
 	sleep_ms(RAIL_SETTLE_MS);
