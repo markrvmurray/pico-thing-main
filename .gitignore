@@ -34,3 +34,9 @@ cmake-*
 *.exe
 *.out
 *.app
+
+### Python
+# Bytecode caches from the bench scripts in scripts/.  One of these was
+# committed by accident and then showed as modified on every run.
+__pycache__/
+*.pyc
