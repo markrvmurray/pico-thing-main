@@ -198,6 +198,11 @@ static volatile bool dat_fault_nmi_request = false;
 static volatile uint8_t nmi_request_count = 0u;		// ISRs increment
 static uint8_t nmi_request_done = 0u;			// Core 1 follows
 
+// What the int_pins state machine was last sent.  Written by Core 1 in the
+// ordinary way, and by the single-step gate directly - see there for why - so
+// volatile and declared up here rather than beside interrupt_pins_update().
+static volatile uint32_t int_pins_held = 0u;
+
 // How many of Core 1's passes the NMI pin is held low for.  THIS USED TO COUNT
 // Q-RISINGS, in the handler that drove the pins directly; the int_pins state
 // machine holds whatever it was last given, so the hold is now counted where
@@ -764,14 +769,68 @@ __time_critical_func(gpio_q_irq_handler())
 		// to write, so the columns line up.  Only while armed: this reads a
 		// DMA register, which is not something to do on every E cycle for
 		// nothing.
-		if (MC6809.trace_is_armed())
-			MC6809.trace_bla_store(trace_hw_count(), bla);
 		auto address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
 		const auto new_bs = static_cast<enum bus_state>(bus_pins.bits.BS_BA & 0x03u);
 		const bool reset_now = RESET_IS_ASSERTED;
 #ifdef DEBUG
 		MC6809.count_lic();
 #endif
+		// THE GATE.  Everything below is either a reaction to the bus state
+		// CHANGING, or work that only one of a handful of armed features
+		// needs - and in steady running neither applies, so on almost every
+		// E cycle this handler now ends here.  Measured: the body is 90 of
+		// the handler's 131 clk_sys cycles, and the floor without it is 41,
+		// which is what lifts the ISR-imposed E ceiling from 2.4 MHz to
+		// comfortably past 3.
+		//
+		// WHAT IS *NOT* IN THE ARMED LIST, AND WHY THAT IS SAFE.  Vector
+		// fetches, the break/watchpoint confirmation, the trace's interrupt
+		// triggers, irq_vectors and the DAT fault's switch to task 0 all hang
+		// off BUS_IRQ - and BUS_IRQ *is* a bus state change, so the first
+		// condition catches every one of them structurally.  They cannot be
+		// missed by someone forgetting to add a flag here, which is the
+		// failure mode this arrangement is chosen to avoid.
+		//
+		// The armed list is therefore only the things that need EVERY cycle
+		// rather than every transition: the trace's BUSY/LIC/AVMA column, the
+		// single-step LIC gate, and the E-cycle countdown.
+		const bool bus_changed = new_bs != MC6809.bus_state
+				      || reset_now != (MC6809.run_state == RS_RESET);
+		// HOW TO CHECK THIS LIST AFTER CHANGING THE BODY, because getting
+		// it wrong fails silently and two conditions were missed on the
+		// way in.  List every file-scope volatile the gated region READS,
+		// and for each ask where it is WRITTEN:
+		//
+		//   written inside BUS_IRQ, or only consulted on a state change
+		//     -> already covered, because BUS_IRQ *is* a bus state change
+		//        and the first condition catches every transition;
+		//   written by Core 0 or another ISR, and the handler has to react
+		//     -> IT MUST BE NAMED HERE.
+		//
+		// The two that were missed, and what each looked like:
+		//   dat_fault_block_countdown (set by the fault ISR) - the delayed
+		//     NMI block never came on, so $FFCC read 03 instead of 83;
+		//   step_request ("Core 0 asks; the handler acts") - the console's
+		//     request was never seen, so "irq 9" reported "no NMI came
+		//     back" and stalled after one step.
+		//
+		// acia_torture passed throughout BOTH of those, which is why it
+		// alone cannot clear a change to this handler.  The DAT fault test
+		// and "irq 9" are what found them.
+		const bool armed = MC6809.trace_is_armed()
+				|| step_state != STEP_IDLE
+				|| step_request
+				|| step_arm_cycles != 0u
+				|| dat_fault_block_countdown != 0u
+				|| system_tick.get_nmi_countdown() != 0u;
+		if (!bus_changed && !armed) {
+			if (pending_interrupts & PEND_IRQ)
+				pend_irq_cycles++;
+			goto q_done;
+		}
+
+		if (MC6809.trace_is_armed())
+			MC6809.trace_bla_store(trace_hw_count(), bla);
 		if (reset_now) {
 			if (MC6809.run_state != RS_RESET)
 				MC6809.run_state = RS_RESET;
@@ -903,11 +962,36 @@ __time_critical_func(gpio_q_irq_handler())
 						// That edge ended a long gap, so it
 						// is the RTI finishing and the
 						// guest's own instruction is next.
-						// The request goes to Core 1, which
-						// drives the pin; it is pending
-						// within a pass or two, so still
-						// through the next instruction.
-						nmi_request_count++;
+						// ASSERT IT HERE, NOT VIA CORE 1.
+						// The edge has to land inside this
+						// E cycle: the entire point of the
+						// gate is that the guest executes
+						// exactly ONE more instruction, and
+						// Core 1 is a pass or two away -
+						// which is one or more instructions.
+						// Going through it broke stepping in
+						// d954a2b: "irq 9" fell from ONE
+						// INSTRUCTION PER STEP to 3/5.
+						//
+						// Core 1 deasserts on its next pass,
+						// because its own computed mask has
+						// no NMI in it.  That is fine: NMI is
+						// edge-triggered, so what matters is
+						// when the edge arrives, not how long
+						// the line then stays low.
+						// The hold matters as much as the
+						// edge: without it Core 1's very
+						// next pass recomputes a mask with
+						// no NMI in it and lets the line go,
+						// possibly inside one E cycle, which
+						// is too short for the 6809 to latch
+						// anything.  Asserting without this
+						// gave "no NMI came back".
+						nmi_hold_passes = NMI_HOLD_PASSES;
+						int_pins_held |= PEND_NMI;
+						pio_sm_put(int_pins.pio,
+							   static_cast<uint>(int_pins.sm),
+							   int_pins_held);
 						step_armed_edge = step_edges;
 						step_state = STEP_IDLE;
 					} else {
@@ -955,6 +1039,7 @@ __time_critical_func(gpio_q_irq_handler())
 		// each interrupt was held.
 		if (pending_interrupts & PEND_IRQ)
 			pend_irq_cycles++;
+q_done:;
 	}
 #ifdef DEBUG
 	gpio_put(GPIO_TRACE_C, false); // scope timing
@@ -5716,8 +5801,6 @@ init_pins_range(const uint8_t base, const uint8_t count)
 // level lines need no translation whatsoever - the byte IS the word - and only
 // NMI has to be substituted, because it is a one-shot held for a few passes
 // rather than a level.
-static uint32_t int_pins_held = 0u;	// what the state machine was last sent
-
 static inline void
 interrupt_pins_update()
 {

@@ -53,16 +53,6 @@ tick_timer::control(uint8_t val)
 		nmi_countdown = countdown;
 }
 
-bool
-tick_timer::tick()
-{
-	if (nmi_countdown == 0u)
-		return false;
-	if (--nmi_countdown == 0u)
-		return true;
-	return false;
-}
-
 void
 tick_timer::acknowledge()
 {

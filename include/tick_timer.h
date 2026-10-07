@@ -53,7 +53,16 @@ public:
 
 	// Called once per E-cycle (Q-rising ISR).  Returns true when the
 	// NMI countdown expires, signalling the caller to set PEND_NMI.
-	bool tick();
+	// INLINE ON PURPOSE.  This is called from the Q-rising handler on every
+	// single E cycle and returns false on the first test almost every time,
+	// so an out-of-line call in another translation unit was paying call
+	// overhead a million times a second to look at one byte.
+	bool tick()
+	{
+		if (nmi_countdown == 0u)
+			return false;
+		return --nmi_countdown == 0u;
+	}
 
 	// Simulate a hardware timer fire (calls the SDK callback path).
 	// Used by unit tests; in production the SDK alarm calls callback() directly.
