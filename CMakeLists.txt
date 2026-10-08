@@ -288,6 +288,50 @@ set(PICO_THING_ISR_COST 0 CACHE STRING
 	"1 = measure the per-cycle ISR cost and report it in st, 0 = do not")
 message(STATUS "Pico-Thing ISR cost instrument: ${PICO_THING_ISR_COST}")
 
+# ---------------------------------------------------------------------------
+# THE DIAGNOSTIC SWITCHES, split by WHAT THEY COST rather than by what they are.
+#
+# DEBUG is defined unconditionally above, and that is deliberate: it marks the
+# things a plain user of a Pico-Thing would not care about - extra st sections,
+# internal state variables, counters kept on Core 1's for(;;) loop and in rare
+# error branches.  **The rule is that DEBUG must stay FREE on the per-cycle
+# paths**, which is exactly what makes it safe to leave on; anything that costs
+# cycles every E cycle gets its own switch below and defaults OFF.
+#
+#   DEBUG                    reporting surface        no per-cycle cost   ON
+#   PICO_THING_TESTPOINTS    GPIO markers for a scope SIO write per ISR   off
+#   PICO_THING_DIAG          per-cycle counters       ~9 cycles/E cycle   off
+#   PICO_THING_ISR_COST      SysTick cost instrument  12-16 accesses/ISR  off
+#
+# Counters that are MECHANISM rather than statistics are never gated by any of
+# these, however statistical they sound: rx_read_count/rx_processed_count and
+# nmi_request_count/nmi_request_done carry work from an ISR to its consumer so
+# a second event cannot be lost, _count_irq_ack[] is what the interrupt tests
+# wait on, and core1_isr_count is Core 0's watchdog input - gating that would
+# leave it unable to tell thread starvation from a hard fault.
+#
+# AND A GATED-OFF COUNTER MUST REPORT "off", NEVER 0.  An absent count has been
+# read as a fault three times (the console ACIA Status column, st's Read IRQ
+# after the address filter, and the LIC count), so a zero has to mean zero.
+# ---------------------------------------------------------------------------
+
+# Scope marker pins, driven high on entry to an ISR and low on exit, so a
+# scope can see when each one ran and for how long.  Two SIO writes per entry
+# on paths that run every E cycle, for a signal nobody needs unless they have
+# probes on the board.
+set(PICO_THING_TESTPOINTS 0 CACHE STRING
+	"1 = drive the GPIO scope marker pins from the ISRs, 0 = do not")
+message(STATUS "Pico-Thing ISR testpoints: ${PICO_THING_TESTPOINTS}")
+
+# Per-cycle diagnostic counting: the LIC count, the E cycles with /IRQ
+# asserted, and the console ACIA's status-read count.  About 9 of the Q-rising
+# handler's ~110 clk_sys cycles, every E cycle, for numbers only a human
+# reading st ever looks at.  Turn it on to debug, at a low guest clock where
+# those cycles do not matter.
+set(PICO_THING_DIAG 0 CACHE STRING
+	"1 = keep the per-cycle diagnostic counters, 0 = leave them out")
+message(STATUS "Pico-Thing per-cycle diagnostics: ${PICO_THING_DIAG}")
+
 # The ADC clock in kHz.  48000 is the SDK's value and what the ADC calibration
 # was taken against.  Lower it only to lengthen a conversion, which is how a
 # drooping ADC_VREF is distinguished from a broken one.
@@ -315,6 +359,8 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_CONSOLE_BAUD=${PICO_THING_CONSOLE_BAUD}
 	SYS_CLK_DEFAULT=${PICO_THING_SYS_CLK_HZ}
 	PICO_THING_ISR_COST=${PICO_THING_ISR_COST}
+	PICO_THING_DIAG=${PICO_THING_DIAG}
+	PICO_THING_TESTPOINTS=${PICO_THING_TESTPOINTS}
 	PICO_THING_ADC_CLK_KHZ=${PICO_THING_ADC_CLK_KHZ}u
 )
 

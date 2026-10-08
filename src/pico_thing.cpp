@@ -632,6 +632,58 @@ extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK
 #define ISR_COST_ON 0
 #endif
 
+// PER-CYCLE DIAGNOSTIC COUNTING.  Separate from DEBUG, which is defined
+// unconditionally (CMakeLists.txt) and therefore gates what st can REPORT
+// rather than what anything COSTS.  This decides whether the Q-rising handler
+// keeps counters at all: on the ungated path they are three volatile
+// read-modify-writes, about 20-25 of its ~110 clk_sys cycles, every E cycle,
+// for numbers only a human reading st ever looks at.
+//
+// COUNTERS THAT ARE MECHANISM ARE NEVER GATED BY THIS, however statistical
+// their names sound.  rx_read_count/rx_processed_count,
+// nmi_request_count/nmi_request_done and _count_irq_ack[] all carry work
+// between an ISR and its consumer - the first two so a second event cannot be
+// lost, the third because the interrupt tests hold a request asserted until
+// its count moves, which its own declaration says in as many words.  Gating
+// any of those loses interrupts rather than statistics.
+#ifndef PICO_THING_DIAG
+#define PICO_THING_DIAG 0	// match CMake's default
+#endif
+#if defined(DEBUG) && PICO_THING_DIAG
+#define DIAG_ON 1
+#else
+#define DIAG_ON 0
+#endif
+
+// GPIO SCOPE MARKERS.  Driven high on entry to an ISR and low on exit so a
+// scope can see when each ran and for how long.  Two SIO writes per entry on
+// paths that run every E cycle, for a signal that is worthless without probes
+// on the board - hence its own switch, defaulting off.
+//
+// THE PIN ALLOCATION, WHICH IS NOT ARBITRARY.
+//
+// TRACE_C is the two DMA handlers, read and write.  They can share one pin
+// because a bus cycle is either a read or a write, never both, so they are
+// MUTUALLY EXCLUSIVE - and being the same IRQ priority they cannot nest within
+// each other either.  The cost is only that the scope cannot tell which of the
+// two it is looking at, and the address lines say that anyway.
+//
+// TRACE_D is the Q-rising handler, ON ITS OWN.  It must not share, because it
+// runs at IRQ priority 1 while the DMA handlers run at 0, so they PREEMPT it.
+// Until 2026-10-08 the read handler shared TRACE_C with it, and a read
+// notification landing inside a Q pass drove the pin low on its own exit and
+// truncated the width being measured - so the one measurement these pins exist
+// for, a scope against Q for handler latency, was corrupted in exactly the case
+// it is most wanted in.
+#ifndef PICO_THING_TESTPOINTS
+#define PICO_THING_TESTPOINTS 0	// match CMake's default
+#endif
+#if defined(DEBUG) && PICO_THING_TESTPOINTS
+#define TESTPOINTS_ON 1
+#else
+#define TESTPOINTS_ON 0
+#endif
+
 #if ISR_COST_ON
 #define SYSTICK_MASK 0x00FFFFFFu
 struct isr_cost {
@@ -724,8 +776,8 @@ __time_critical_func(gpio_q_irq_handler())
 #if ISR_COST_ON
 	const uint32_t q_cost_start = systick_hw->cvr;
 #endif
-#ifdef DEBUG
-	gpio_put(GPIO_TRACE_C, true); // scope timing
+#if TESTPOINTS_ON
+	gpio_put(GPIO_TRACE_D, true);
 #endif
 	// Q-RISING ONLY.  The falling edge used to be enabled as well, purely to
 	// poll GPIO_FAULT once per cycle - a million entries a second to read one
@@ -753,6 +805,13 @@ __time_critical_func(gpio_q_irq_handler())
 		// rising edge.  The pair is the starvation ratio that diagnosed the
 		// Core 1 livelock of 2026-09-15 - if this climbs while core1_qrise
 		// and core1_loop stand still, the ISRs are eating the loop.
+		// NOT GATED BY DIAG_ON, though it looks like a statistic.  Core 0's
+		// watchdog compares it against core1_loop_count to tell "the loop
+		// stalled but the ISRs are alive" - thread starvation - from "the
+		// ISRs stopped too" - a hard fault or deadlock.  Gating it would
+		// leave that watchdog permanently reporting the second, which is a
+		// silent loss of the diagnosis that found the 2026-09-15 livelock.
+		// One load and one store is cheap insurance.
 		core1_isr_count++;
 		q_rising_edge = true;
 		bus_pins bus_pins{};
@@ -771,8 +830,22 @@ __time_critical_func(gpio_q_irq_handler())
 		// nothing.
 		auto address_lsb = static_cast<uint8_t>(bus_pins.bits.A);
 		const auto new_bs = static_cast<enum bus_state>(bus_pins.bits.BS_BA & 0x03u);
-		const bool reset_now = RESET_IS_ASSERTED;
-#ifdef DEBUG
+		// Out of the snapshot above rather than its own gpio_get().  The
+		// union's RESET bit IS GPIO_RESET's bit - the fields are laid out
+		// to match the pin map exactly, which is what lets .A, .BS_BA and
+		// .BUSY_LIC_AVMA be taken from it too - so this is the same value
+		// for one fewer SIO read on a path that runs every E cycle.  The
+		// input register reflects the pad even for an output pin, so
+		// reading our own !RESET back is sound.
+		static_assert(GPIO_RESET == 29,
+			      "union bus_pins' RESET bit is bit 29; if the pin "
+			      "moves, the bitfield has to move with it");
+		const bool reset_now = !bus_pins.bits.RESET;
+#if DIAG_ON
+		// Diagnostic only: st's LIC display and the stall warning.
+		// start_with_timeout() verdicts on run_state == RS_SYNCED and
+		// its lic_start only feeds a printf, so nothing depends on this
+		// count.  Two volatile loads and a conditional store per E cycle.
 		MC6809.count_lic();
 #endif
 		// THE GATE.  Everything below is either a reaction to the bus state
@@ -1037,12 +1110,14 @@ __time_critical_func(gpio_q_irq_handler())
 		// is nowhere else to take it: the E cycles during which /IRQ was
 		// asserted, which st divides by the vector count to report how long
 		// each interrupt was held.
+#if DIAG_ON
 		if (pending_interrupts & PEND_IRQ)
 			pend_irq_cycles++;
+#endif
 q_done:;
 	}
-#ifdef DEBUG
-	gpio_put(GPIO_TRACE_C, false); // scope timing
+#if TESTPOINTS_ON
+	gpio_put(GPIO_TRACE_D, false);
 #endif
 #if ISR_COST_ON
 	isr_cost_add(q_cost, q_cost_start);
@@ -1186,11 +1261,14 @@ static          uint8_t aux_rx_processed_count = 0;
 // that flaw and is a lower bound; this one is exact.
 static volatile unsigned CONSOLE_STATUS_READS = 0u;
 
-#define STATUS_SEEN_LEN 16u
-static volatile uint8_t status_seen[STATUS_SEEN_LEN];
-static volatile uint32_t status_seen_n = 0u;	// reads with S_IRQ set
-static volatile uint32_t status_irq_rdrf = 0u;	// ... and S_RDRF set too: correct
-static volatile uint32_t status_irq_nordrf = 0u;	// ... but S_RDRF CLEAR: the fault
+// The status_seen[] / status_irq_rdrf / status_irq_nordrf instruments that used
+// to live here are GONE (2026-10-08).  They existed to answer "why is the ACIA
+// handler entered 300 times for 24 real events", which was answered in 27cf7d2
+// - it is not, that was a cumulative counter read against a per-test one, and
+// the real figures are 301 bytes / 301 interrupts / 301 entries with zero
+// spurious - and the test bug behind it was fixed in 3b0473c.  They were six
+// volatile accesses, including an array store, in the hottest branch of the
+// read ISR, for a question that is closed.
 
 void __isr
 __time_critical_func(dma_bus_read_irq_handler())
@@ -1198,8 +1276,8 @@ __time_critical_func(dma_bus_read_irq_handler())
 #if ISR_COST_ON
 	const uint32_t read_cost_start = systick_hw->cvr;
 #endif
-#ifdef DEBUG
-	gpio_put(GPIO_TRACE_C, true); // scope timing
+#if TESTPOINTS_ON
+	gpio_put(GPIO_TRACE_C, true);
 #endif
 	pio_interrupt_clear(piodma_read.pio, READ_DEVICE_PIO_IRQ);
 	// AVMA from the pin, via the Q-rising handler's snapshot.  BE CLEAR ABOUT
@@ -1237,20 +1315,16 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// Clearing here would briefly deassert /IRQ even if another
 			// device still has a pending interrupt.
 		} else if (loc == CONSOLE_STATUS) {
+#if DIAG_ON
+			// Counted HERE because the generic notification path
+			// cannot see it: this branch does not set
+			// read_irq_received, so Core 1's switch never reaches
+			// CONSOLE_STATUS.  That is what left st's console
+			// "Status" column a permanent zero from 1527983 until
+			// 2026-10-04 - and why a gated-off counter must print
+			// "off" rather than 0.
 			CONSOLE_STATUS_READS++;
-			// registers::read() is what the DMA served from.
-			const uint8_t served =
-				*reinterpret_cast<volatile uint8_t *>(
-					registers::read_address() + CONSOLE_STATUS);
-			if (served & 0x80u) {		// S_IRQ
-				if (status_seen_n < STATUS_SEEN_LEN)
-					status_seen[status_seen_n] = served;
-				status_seen_n++;
-				if (served & 0x01u)	// S_RDRF
-					status_irq_rdrf++;
-				else
-					status_irq_nordrf++;
-			}
+#endif
 		} else if (loc == AUX_RX_DATA) {
 			aux_rx_read_count++;
 			aux_serial.rx_read_fast_path();
@@ -1271,8 +1345,8 @@ __time_critical_func(dma_bus_read_irq_handler())
 			read_irq_received = true;
 		}
 	}
-#ifdef DEBUG
-	gpio_put(GPIO_TRACE_C, false); // scope timing
+#if TESTPOINTS_ON
+	gpio_put(GPIO_TRACE_C, false);
 #endif
 #if ISR_COST_ON
 	isr_cost_add(read_cost, read_cost_start);
@@ -1300,7 +1374,15 @@ static volatile write_entry write_ring[WRITE_RING_SIZE];
 static volatile uint8_t write_ring_head = 0u;    // written by ISR
 static volatile uint8_t write_ring_tail = 0u;    // read by for(;;) loop
 #ifdef DEBUG
-static uint32_t write_ring_overflow = 0u;
+// WRITE RING OVERFLOW: a guest write whose dispatch was DROPPED because Core 1
+// did not drain the ring in time.  That is real loss, not a statistic, which is
+// why it is reported in st and why a non-zero value is called out rather than
+// printed as just another column.  volatile: written in the write ISR.
+//
+// This is the only visible symptom of Core 1's loop missing ITS deadline.  The
+// loop has one - it is just longer than an ISR's, set by how deep this ring is
+// rather than by the E cycle - so "the loop has no deadline" is wrong.
+static volatile uint32_t write_ring_overflow = 0u;
 #endif
 
 // Register-block writes from the console, for Core 1 to carry out as though
@@ -1435,8 +1517,8 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
-#ifdef DEBUG
-	gpio_put(GPIO_TRACE_D, true); // scope timing
+#if TESTPOINTS_ON
+	gpio_put(GPIO_TRACE_C, true);
 #endif
 	dma_channel_acknowledge_irq1(piodma_write.data_channel);
 	if (MC6809.run_state >= RS_RUNNING) {
@@ -1445,8 +1527,8 @@ __time_critical_func(dma_bus_write_irq_handler())
 		const uint8_t wval = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
 		bus_write_followup(wloc, wval);
 	}
-#ifdef DEBUG
-	gpio_put(GPIO_TRACE_D, false); // scope timing
+#if TESTPOINTS_ON
+	gpio_put(GPIO_TRACE_C, false);
 #endif
 }
 
@@ -3160,12 +3242,20 @@ status_gather(status_snapshot_t *s)
 		- static_cast<uint>(pio_clock.offset));
 	s->last_lic = last_LIC;
 	s->lic_stalled = false;
+	// Only meaningful when the count is actually being kept.  count_lic() is
+	// behind DIAG_ON, so without it lic_count never leaves 0, "unchanged since
+	// last time" is true on every call, and st printed WARNING: LIC stalled
+	// every time the guest ran.  A false alarm that says the CPU has died is
+	// worse than no alarm: it cost a diagnosis in this session, which is the
+	// third time this counter has misled - see the "prints off, never 0" note.
+#if DIAG_ON
 	if (MC6809.is_running()) {
 		if (last_LIC != s->lic_count)
 			last_LIC = s->lic_count;
 		else
 			s->lic_stalled = true;
 	}
+#endif
 #endif
 
 	registers::copy_out_write(s->write_regs, 0, 64);
@@ -3178,6 +3268,11 @@ status_gather(status_snapshot_t *s)
 	s->core1_qrise = core1_qrise_count;
 	s->core1_irq_assert = core1_irq_assert_count;
 	s->core1_write_ring = core1_write_ring_count;
+#ifdef DEBUG
+	// Guarded to match the field, which lives in status.h's DEBUG section -
+	// as do the increment and the report, so all three agree.
+	s->write_ring_overflow = write_ring_overflow;
+#endif
 	s->core1_read_irq = core1_read_irq_count;
 	s->core1_last_write = core1_last_write_loc;
 	s->core1_last_read = core1_last_read_loc;
@@ -3366,6 +3461,15 @@ status_print(const status_snapshot_t *s)
 	printf("CLOCKS: sys %" PRIu32 "  peri %" PRIu32 "  usb %" PRIu32 "  adc %" PRIu32 " kHz%s\n",
 	       s->clk_sys_khz, s->clk_peri_khz, s->clk_usb_khz, s->clk_adc_khz,
 	       s->clk_adc_khz == 48000u ? "" : "   <- adc is not 48000!");
+	// WHICH DIAGNOSTICS ARE COMPILED IN.  Printed because the alternative is
+	// reading a zero and wondering: an absent count has been mistaken for a
+	// fault three times on this firmware.  DEBUG is not listed - it is on in
+	// every build by design and costs nothing on the per-cycle paths.
+	printf("DIAG: counters %s  testpoints %s  ISR cost %s"
+	       "  (-D PICO_THING_{DIAG,TESTPOINTS,ISR_COST}=1)\n",
+	       DIAG_ON ? "ON" : "off",
+	       TESTPOINTS_ON ? "ON" : "off",
+	       ISR_COST_ON ? "ON" : "off");
 	printf("  NMI: %-12s FIRQ: %-12s  IRQ: %s\n",
 	       s->nmi ? "OUTPUT LOW" : "hi-z",
 	       s->firq ? "OUTPUT LOW" : "hi-z",
@@ -3391,8 +3495,13 @@ status_print(const status_snapshot_t *s)
 	// is running, so under HALT the bits are the only way to see BUSY/LIC/AVMA
 	// at all - and LIC is HIGH when halted at an instruction boundary.
 	BLA live{}; live.byte = s->busy_lic_avma;
+#if DIAG_ON
 	printf("LIC: %-10" PRIu32 "  pins: %c%c%c\n",
 	       s->lic_count,
+#else
+	// NOT "0": a gated-off count that prints a number reads as a dead CPU.
+	printf("LIC: %-10s  pins: %c%c%c\n", "off",
+#endif
 	       live.bit.BUSY ? 'B' : '.',
 	       live.bit.LIC  ? 'L' : '.',
 	       live.bit.AVMA ? 'V' : '.');
@@ -3584,6 +3693,19 @@ status_print(const status_snapshot_t *s)
 	       "  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32 "\n",
 	       s->core1_loop, s->core1_qrise, s->core1_irq_assert,
 	       s->core1_write_ring, s->core1_read_irq, s->core1_isr);
+#ifdef DEBUG
+	// THE RING OVERFLOW, called out rather than tabulated.  Each one is a
+	// guest write whose dispatch was dropped because the loop did not drain
+	// the ring within its 32 entries - the loop's own deadline.  It was
+	// counted and never reported until 2026-10-08, so the loss was silent.
+	if (s->write_ring_overflow)
+		printf("  *** WRITE RING OVERFLOW x%" PRIu32 " - guest write"
+		       " dispatches were DROPPED; Core 1's loop missed its"
+		       " deadline ***\n", s->write_ring_overflow);
+	else
+		printf("  Write ring overflow: none (%u entries of runway)\n",
+		       WRITE_RING_SIZE);
+#endif
 	printf("  Last Write: %02X   Last Read: %02X\n",
 	       s->core1_last_write, s->core1_last_read);
 	printf("  Stack Total: %" PRIu32 "  Free (min): %" PRIu32
@@ -3602,22 +3724,24 @@ status_print(const status_snapshot_t *s)
 	       s->console_acia.status_count, s->console_acia.rx_data_count);
 	status_print_flow("Console", &s->console_acia);
 	status_print_rdrf("Console", fast_serial.why_rdrf());
-	{
-		const uint32_t n = status_seen_n;
-		const uint32_t show = (n < STATUS_SEEN_LEN) ? n : STATUS_SEEN_LEN;
-		printf("    IRQ taken %" PRIu32 " times; /IRQ asserted %" PRIu32
-		       " E cycles (%.1f cycles per taken interrupt)\n",
-		       irq_vectors, pend_irq_cycles,
-		       irq_vectors ? (double) pend_irq_cycles / (double) irq_vectors
-				   : 0.0);
-		printf("    Console S_IRQ status reads: %" PRIu32
-		       " (with RDRF %" PRIu32 ", WITHOUT RDRF %" PRIu32
-		       "); first %" PRIu32 ":", n, status_irq_rdrf,
-		       status_irq_nordrf, show);
-		for (uint32_t i = 0; i < show; i++)
-			printf(" %02X", status_seen[i]);
-		printf("\n");
-	}
+#if !DIAG_ON
+	printf("    (Status column is OFF, not zero - build with"
+	       " -D PICO_THING_DIAG=1)\n");
+#endif
+	// A GATED-OFF COUNTER PRINTS "off", NEVER 0.  Three times in one session
+	// an absent or zeroed count was read as a fault - this console "Status"
+	// column, st's "Read IRQ" after the address filter, and the LIC count -
+	// so a zero here has to mean zero.
+#if DIAG_ON
+	printf("    IRQ taken %" PRIu32 " times; /IRQ asserted %" PRIu32
+	       " E cycles (%.1f cycles per taken interrupt)\n",
+	       irq_vectors, pend_irq_cycles,
+	       irq_vectors ? (double) pend_irq_cycles / (double) irq_vectors
+			   : 0.0);
+#else
+	printf("    IRQ taken %" PRIu32 " times; /IRQ asserted: off"
+	       " (build with -D PICO_THING_DIAG=1)\n", irq_vectors);
+#endif
 	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
 	       s->aux_acia.interrupt_status,
 	       s->aux_acia.tx_level, s->aux_acia.rx_level,
@@ -5842,12 +5966,14 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	// Trace pins - ISR set.  Named individually rather than as a run: they
 	// sit on 37-38 on version 1 but 38-39 on version 2, where 37 is TASK0.
+#if TESTPOINTS_ON
 	static constexpr uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
 	for (const uint8_t p : trace_pins) {
 		gpio_init(p);
 		gpio_put(p, false);
 		gpio_set_dir(p, GPIO_OUT);
 	}
+#endif
 
 #if ISR_COST_ON
 	isr_cost_init();		// SysTick is per-core, so it must be here

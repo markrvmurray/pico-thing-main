@@ -64,6 +64,7 @@ struct status_snapshot_t {
 	uint32_t rail_good;	// consecutive healthy samples behind it
 	bool     rail_clipped;	// supply channel at full scale: no measurement
 	bool     rail_floor_only;	// serving: absolute floor only, baseline frozen
+	uint32_t write_ring_overflow;	// dropped guest-write dispatches: real loss
 	uint8_t  busy_lic_avma;	// the pins, as the Q handler last read them
 	uint8_t  pio2_irq;	// all eight of pio2's SM-visible IRQ flags
 	uint8_t  clock_pc;	// the E/Q clock SM's PC, to prove it is cycling
