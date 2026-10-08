@@ -470,21 +470,50 @@ static volatile bool trace_hw_triggered = false;
 static volatile bool trace_pending_start = false;
 static void trace_hw_start();
 
-// Samples captured so far.  The DMA transfer count is the authority: it counts
-// down from trace_size, so this is exact and free.
+// THE TRACE TAKES ITS PIO RESOURCES ONLY WHILE A CAPTURE IS ARMED.
+//
+// WHY.  The two halves cost 2 state machines and 7 instruction words, and they
+// used to hold them from boot to power-off for a facility used occasionally.
+// That is what boxed in the whole PIO allocation: pio2 had all four of its
+// state machines taken - task_output, int_pins, bus_fault and this trace's high
+// half - so the E/Q clock could not move there, so pio1 stayed at 26 of 32
+// words, so the write program had no room to grow.  See [[way2-mirror-blocked]]
+// in the project notes for the census.
+//
+// The high half MUST live on pio2, because it samples GPIO 32-47 and only a
+// base-16 block can reach them; the low half needs base 0.  So the resources
+// cannot simply be moved elsewhere - they have to be given back when idle.
+//
+// WHAT "USABLE" VS "HELD" MEAN, because one flag used to do both jobs.
+// trace_lo.offset went negative on power-off and was read as "there is no trace
+// hardware".  Now it also goes negative whenever a capture is not armed, so the
+// two conditions need separate flags - otherwise trace_hw_count() reports 0
+// samples for a perfectly good completed capture.
+static bool trace_hw_usable = false;	// the DMA channels exist; claiming may be tried
+static bool trace_hw_held = false;	// the PIO programs and SMs are ours right now
+// The sample count survives the release: the DMA transfer count is the
+// authority while we hold the channels, and it is latched on the way out so a
+// finished capture can still be dumped and counted afterwards.
+static uint32_t trace_hw_samples = 0u;
+
 static uint32_t
 trace_hw_count()
 {
-	if (trace_lo.offset < 0)
+	if (!trace_hw_usable)
 		return 0u;
+	if (!trace_hw_held)
+		return trace_hw_samples;
 	const uint32_t left = dma_channel_hw_addr(trace_lo.data_channel)->transfer_count;
 	return (left > TRACE_SIZE) ? 0u : (TRACE_SIZE - left);
 }
 
+// Stop sampling WITHOUT giving the hardware back.  Used inside trace_hw_arm(),
+// which has to quiesce the state machines before reprogramming them and must
+// not release what it is about to configure.
 static void
-trace_hw_stop()
+trace_hw_quiesce()
 {
-	if (trace_lo.offset < 0)
+	if (!trace_hw_held)
 		return;
 	dma_channel_abort(trace_lo.data_channel);
 	dma_channel_abort(trace_hi.data_channel);
@@ -492,12 +521,107 @@ trace_hw_stop()
 	pio_sm_set_enabled(trace_hi.pio, trace_hi.sm, false);
 }
 
+// Claim both halves.  Can FAIL - another subsystem may hold the last state
+// machine on pio2 - and failing is a refusal to arm, not a panic: the trace is
+// a diagnostic, and nothing else should stop working because it cannot run.
+static bool
+trace_hw_acquire()
+{
+	if (trace_hw_held)
+		return true;
+	if (!trace_hw_usable)
+		return false;
+	const int lo_off = pio_add_program(trace_lo.pio, &bus_capture_lo_program);
+	const int hi_off = pio_add_program(trace_hi.pio, &bus_capture_hi_program);
+	const int lo_sm = (lo_off >= 0) ? pio_claim_unused_sm(trace_lo.pio, false) : -1;
+	const int hi_sm = (hi_off >= 0) ? pio_claim_unused_sm(trace_hi.pio, false) : -1;
+	if (lo_off < 0 || hi_off < 0 || lo_sm < 0 || hi_sm < 0) {
+		printf("trace: no room on pio%u/pio%u right now"
+		       " (words %d/%d, state machines %d/%d) - not armed\n",
+		       PIO_NUM(trace_lo.pio), PIO_NUM(trace_hi.pio),
+		       lo_off, hi_off, lo_sm, hi_sm);
+		if (lo_sm >= 0)
+			pio_sm_unclaim(trace_lo.pio, static_cast<uint>(lo_sm));
+		if (hi_sm >= 0)
+			pio_sm_unclaim(trace_hi.pio, static_cast<uint>(hi_sm));
+		if (lo_off >= 0)
+			pio_remove_program(trace_lo.pio, &bus_capture_lo_program,
+					   static_cast<uint>(lo_off));
+		if (hi_off >= 0)
+			pio_remove_program(trace_hi.pio, &bus_capture_hi_program,
+					   static_cast<uint>(hi_off));
+		return false;
+	}
+	trace_lo.offset = lo_off;
+	trace_hi.offset = hi_off;
+	trace_lo.sm = lo_sm;
+	trace_hi.sm = hi_sm;
+	// Default trigger pin is !NMI; any pin 0-31 will do, since only the low
+	// half ever sees it.  The high half follows via the IRQ handshake.
+	bus_capture_lo_program_init(trace_lo.pio, trace_lo.sm,
+				    static_cast<uint>(trace_lo.offset), GPIO_NMI);
+	bus_capture_hi_program_init(trace_hi.pio, trace_hi.sm,
+				    static_cast<uint>(trace_hi.offset));
+	// THE DMA CONFIGURATION HAS TO BE REDONE HERE, not once at setup: both
+	// the DREQ and the source address are per-STATE-MACHINE, and a claim on
+	// demand can land on a different one than last time.  Configuring these
+	// at boot against an SM number that later changes is a silent
+	// misconfiguration - the channel would pace off another SM's FIFO.
+	dma_channel_config tlo = dma_channel_get_default_config(trace_lo.data_channel);
+	channel_config_set_transfer_data_size(&tlo, DMA_SIZE_32);
+	channel_config_set_read_increment(&tlo, false);
+	channel_config_set_write_increment(&tlo, true);
+	channel_config_set_dreq(&tlo, pio_get_dreq(trace_lo.pio, trace_lo.sm, false));
+	dma_channel_configure(trace_lo.data_channel, &tlo, MC6809.trace_base(),
+			      &trace_lo.pio->rxf[trace_lo.sm], TRACE_SIZE, false);
+	// 16 bits: the high bank is only GPIO 32-47, so a half-word read of the
+	// FIFO takes the whole sample and halves the buffer.
+	dma_channel_config thi = dma_channel_get_default_config(trace_hi.data_channel);
+	channel_config_set_transfer_data_size(&thi, DMA_SIZE_16);
+	channel_config_set_read_increment(&thi, false);
+	channel_config_set_write_increment(&thi, true);
+	channel_config_set_dreq(&thi, pio_get_dreq(trace_hi.pio, trace_hi.sm, false));
+	dma_channel_configure(trace_hi.data_channel, &thi, MC6809.trace_hi_base(),
+			      &trace_hi.pio->rxf[trace_hi.sm], TRACE_SIZE, false);
+	trace_hw_held = true;
+	return true;
+}
+
+// Give both halves back.  The captured rows are in RAM, not in the PIO, so a
+// completed capture survives this and can still be dumped - but the DMA
+// transfer count does not, hence the latch.
+static void
+trace_hw_release()
+{
+	if (!trace_hw_held)
+		return;
+	trace_hw_samples = trace_hw_count();
+	trace_hw_quiesce();
+	bus_capture_hi_program_deinit(trace_hi.pio, trace_hi.sm);
+	bus_capture_lo_program_deinit(trace_lo.pio, trace_lo.sm);
+	pio_remove_program(trace_hi.pio, &bus_capture_hi_program,
+			   static_cast<uint>(trace_hi.offset));
+	pio_remove_program(trace_lo.pio, &bus_capture_lo_program,
+			   static_cast<uint>(trace_lo.offset));
+	trace_lo.offset = trace_hi.offset = -1;
+	trace_lo.sm = trace_hi.sm = -1;
+	trace_hw_held = false;
+	trace_pending_start = false;
+}
+
+static void
+trace_hw_stop()
+{
+	trace_hw_release();
+}
+
 static void
 trace_hw_arm()
 {
-	if (trace_lo.offset < 0)
+	if (!trace_hw_acquire())
 		return;
-	trace_hw_stop();
+	trace_hw_samples = 0u;
+	trace_hw_quiesce();
 	// Drain both FIFOs.  The state machines keep sampling after a completed
 	// DMA stops draining them, so without this the next capture would open
 	// with the tail of the previous one.
@@ -538,6 +662,14 @@ static void
 trace_hw_start()
 {
 	trace_pending_start = false;
+	// The deferred path reaches here from the reset-to-running transition in
+	// the EQ ISR, by which time the capture may have been stopped and the
+	// state machines handed back - in which case the SM numbers are -1.
+	// trace_hw_release() clears trace_pending_start as well, so this is
+	// belt and braces, but enabling state machine -1 is not a mistake worth
+	// leaving reachable on a per-cycle path.
+	if (!trace_hw_held)
+		return;
 	pio_sm_set_enabled(trace_hi.pio, trace_hi.sm, true);
 	pio_sm_set_enabled(trace_lo.pio, trace_lo.sm, true);
 }
@@ -890,20 +1022,33 @@ __time_critical_func(gpio_q_irq_handler())
 		// acia_torture passed throughout BOTH of those, which is why it
 		// alone cannot clear a change to this handler.  The DAT fault test
 		// and "irq 9" are what found them.
-		const bool armed = MC6809.trace_is_armed()
+		const bool armed = MC6809.trace_is_capturing()
 				|| step_state != STEP_IDLE
 				|| step_request
 				|| step_arm_cycles != 0u
 				|| dat_fault_block_countdown != 0u
 				|| system_tick.get_nmi_countdown() != 0u;
 		if (!bus_changed && !armed) {
+#if DIAG_ON
 			if (pending_interrupts & PEND_IRQ)
 				pend_irq_cycles++;
+#endif
 			goto q_done;
 		}
 
-		if (MC6809.trace_is_armed())
-			MC6809.trace_bla_store(trace_hw_count(), bla);
+		// The count is read here anyway, so fullness is free to spot - and
+		// spotting it is what stops this branch, and the gate above, from
+		// running for ever after the one-shot completes.  trace_armed stays
+		// set so the capture can still be dumped; only the capturing flag
+		// is cleared.  A hardware-triggered capture sits at a count of zero
+		// until its trigger arrives, which is correctly "still capturing".
+		if (MC6809.trace_is_capturing()) {
+			const uint32_t taken = trace_hw_count();
+			if (taken >= TRACE_SIZE)
+				MC6809.trace_capture_done();
+			else
+				MC6809.trace_bla_store(taken, bla);
+		}
 		if (reset_now) {
 			if (MC6809.run_state != RS_RESET)
 				MC6809.run_state = RS_RESET;
@@ -6587,20 +6732,18 @@ bus_pio_dma_init()
 	// SM pair: bus trace capture.  pio0 -> pio2 via "irq prev", which wraps
 	// across the three blocks.  pio1 would be the tidier neighbour but has
 	// no instruction memory left.
-	trace_lo.offset = pio_add_program(trace_lo.pio, &bus_capture_lo_program);
-	trace_hi.offset = pio_add_program(trace_hi.pio, &bus_capture_hi_program);
-	if (trace_lo.offset < 0 || trace_hi.offset < 0) {
-		printf("Core0 insufficient space for bus_capture programs\n");
-		panic("Unable to proceed");
-	}
-	trace_lo.sm = pio_claim_unused_sm(trace_lo.pio, true);
-	trace_hi.sm = pio_claim_unused_sm(trace_hi.pio, true);
-	// Default trigger pin is !NMI; any pin 0-31 will do, since only the low
-	// half ever sees it.  The high half follows via the IRQ handshake.
-	bus_capture_lo_program_init(trace_lo.pio, trace_lo.sm,
-				    static_cast<uint>(trace_lo.offset), GPIO_NMI);
-	bus_capture_hi_program_init(trace_hi.pio, trace_hi.sm,
-				    static_cast<uint>(trace_hi.offset));
+	//
+	// NOTHING IS CLAIMED HERE ANY MORE - see trace_hw_acquire().  The programs
+	// and state machines are taken when a capture is armed and given back when
+	// it stops, so an idle board leaves 2 state machines and 7 instruction
+	// words free.  Only the two DMA channels are permanent, because they are
+	// not the scarce resource and because the sample count lives in one of
+	// them.
+	//
+	// bus_fault below STILL claims its pio2 state machine at boot, and that
+	// ordering is deliberate: it always wins, and the trace takes what is left
+	// when someone asks for a capture.  A diagnostic that cannot arm is an
+	// inconvenience; a DAT fault sampler that cannot start is not.
 	// DAT fault sampler, on pio2 beside the trace's high half.  The SM is
 	// claimed rather than chosen: pio2 already runs task_output on sm0 and
 	// bus_capture_hi on sm1, and initialising one of those by hand would
@@ -6614,29 +6757,20 @@ bus_pio_dma_init()
 	bus_fault_program_init(bus_fault.pio, bus_fault.sm,
 			       static_cast<uint>(bus_fault.offset), GPIO_FAULT);
 
+	// The channels are permanent; their CONFIGURATION is not, because the DREQ
+	// and the source address both depend on which state machine the trace
+	// happened to claim.  trace_hw_acquire() configures them each time.
 	dma_channel_claim(trace_lo.data_channel);
 	dma_channel_claim(trace_hi.data_channel);
-	dma_channel_config tlo = dma_channel_get_default_config(trace_lo.data_channel);
-	channel_config_set_transfer_data_size(&tlo, DMA_SIZE_32);
-	channel_config_set_read_increment(&tlo, false);
-	channel_config_set_write_increment(&tlo, true);
-	channel_config_set_dreq(&tlo, pio_get_dreq(trace_lo.pio, trace_lo.sm, false));
-	dma_channel_configure(trace_lo.data_channel, &tlo, MC6809.trace_base(),
-			      &trace_lo.pio->rxf[trace_lo.sm], TRACE_SIZE, false);
-	// 16 bits: the high bank is only GPIO 32-47, so a half-word read of the
-	// FIFO takes the whole sample and halves the buffer.
-	dma_channel_config thi = dma_channel_get_default_config(trace_hi.data_channel);
-	channel_config_set_transfer_data_size(&thi, DMA_SIZE_16);
-	channel_config_set_read_increment(&thi, false);
-	channel_config_set_write_increment(&thi, true);
-	channel_config_set_dreq(&thi, pio_get_dreq(trace_hi.pio, trace_hi.sm, false));
-	dma_channel_configure(trace_hi.data_channel, &thi, MC6809.trace_hi_base(),
-			      &trace_hi.pio->rxf[trace_hi.sm], TRACE_SIZE, false);
 
+	trace_hw_usable = true;
+	trace_hw_held = false;
+	trace_hw_samples = 0u;
 	MC6809.set_trace_callbacks(trace_hw_arm, trace_hw_stop, trace_hw_count);
-	printf("Core0 bus trace pio%u sm%d + pio%u sm%d, DMA %d/%d\n",
-	       PIO_NUM(trace_lo.pio), trace_lo.sm, PIO_NUM(trace_hi.pio), trace_hi.sm,
-	       trace_lo.data_channel, trace_hi.data_channel);
+	printf("Core0 bus trace DMA %d/%d; pio%u+pio%u programs and state"
+	       " machines claimed only while a capture is armed\n",
+	       trace_lo.data_channel, trace_hi.data_channel,
+	       PIO_NUM(trace_lo.pio), PIO_NUM(trace_hi.pio));
 }
 
 static void
@@ -6686,18 +6820,17 @@ pio_shutdown()
 	// its 32 words, so leaving the capture program resident leaves no room to
 	// add it again, and pio_add_program returns -1.  The state machines and
 	// the two fixed DMA channels leak the same way behind it.
+	// MC6809.trace_stop() runs trace_hw_release(), which hands back the
+	// programs and state machines if a capture was armed - so the explicit
+	// deinit and pio_remove_program calls that used to be here have moved
+	// there, and doing them again would unclaim what is no longer ours.
 	MC6809.trace_stop();
 	dma_channel_abort(trace_lo.data_channel);
 	dma_channel_abort(trace_hi.data_channel);
 	dma_channel_unclaim(trace_lo.data_channel);
 	dma_channel_unclaim(trace_hi.data_channel);
-	bus_capture_hi_program_deinit(trace_hi.pio, trace_hi.sm);
-	bus_capture_lo_program_deinit(trace_lo.pio, trace_lo.sm);
-	pio_remove_program(trace_hi.pio, &bus_capture_hi_program, static_cast<uint>(trace_hi.offset));
-	pio_remove_program(trace_lo.pio, &bus_capture_lo_program, static_cast<uint>(trace_lo.offset));
-	// The offsets are the "trace hardware exists" guard for trace_hw_arm(),
-	// trace_hw_stop() and trace_hw_count(), so they go negative here.
-	trace_lo.offset = trace_hi.offset = -1;
+	trace_hw_usable = false;
+	trace_hw_samples = 0u;
 	trace_pending_start = false;
 	MC6809.set_trace_callbacks(nullptr, nullptr, nullptr);
 	bus_fault_program_deinit(bus_fault.pio, bus_fault.sm);

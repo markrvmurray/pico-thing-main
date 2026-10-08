@@ -134,6 +134,16 @@ private:
 	// One past the highest row stored, for the dump's footer.
 	volatile uint32_t trace_bla_index = 0u;
 	volatile bool trace_armed = false;	// capture requested (may still be waiting on a trigger)
+	// ARMED AND STILL FILLING, as a flag the per-cycle path can afford.
+	// trace_armed stays true after the one-shot fills - it also means "a
+	// capture exists and can be dumped", which the dump relies on - so a
+	// handler gated on it keeps reading the DMA transfer count every E cycle
+	// for ever.  Measured 2026-10-08: 48 cycles per E cycle, dropping the
+	// ISR-imposed E ceiling from 3.52 to 2.30 MHz until somebody typed
+	// "tr off".  trace_is_active() cannot be used instead because working out
+	// fullness IS that DMA read; this flag is the cached answer, cleared by
+	// the handler at the moment it sees the buffer full.
+	volatile bool trace_capturing = false;
 	uint8_t trace_irq_trigger = 0u;		// bitmask of (1<<interrupt) vectors that arm capture
 	using trace_cb_t = void (*)();
 	using trace_count_cb_t = uint32_t (*)();
@@ -186,9 +196,24 @@ public:
 	// --- Bus trace control (one-shot capture of one GPIO word per E cycle) ---
 	void set_trace_callbacks(trace_cb_t arm, trace_cb_t stop, trace_count_cb_t count)
 		{ trace_arm_callback = arm; trace_stop_callback = stop; trace_count_callback = count; }
-	void trace_arm() { trace_bla_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); }
+	// trace_capturing is set LAST, after the callback, and the order matters.
+	// The callback is what resets the DMA transfer count; until it has run,
+	// trace_hw_count() reads a finished-or-not-yet-started transfer as FULL
+	// (transfer_count 0 means TRACE_SIZE taken).  Setting the flag first let
+	// the Q handler see "full" on its very first pass and call
+	// trace_capture_done() before the capture had begun - measured as a dump
+	// with "0 rows recorded" and empty BUSY/LIC/AVMA columns.  It covers the
+	// deferred path too: the count is reset in the callback either way, and
+	// only the state machines wait for trace_hw_start().
+	void trace_arm() { trace_bla_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); trace_capturing = true; }
 	[[nodiscard]] bool trace_is_armed() const { return trace_armed; }
-	void trace_stop() { trace_armed = false; if (trace_stop_callback) trace_stop_callback(); }
+	void trace_stop() { trace_armed = false; trace_capturing = false; if (trace_stop_callback) trace_stop_callback(); }
+	// Cheap enough for the per-cycle path: one volatile load.
+	[[nodiscard]] bool trace_is_capturing() const { return trace_capturing; }
+	// Called by the handler when it sees the buffer full, which closes its own
+	// gate and stops the per-cycle DMA read.  trace_armed is left alone, so
+	// the capture can still be dumped.
+	void trace_capture_done() { trace_capturing = false; }
 	void trace_clear() { trace_stop(); trace_irq_trigger = 0u; }
 	void trace_set_irq_trigger(interrupt i) { trace_irq_trigger |= static_cast<uint8_t>(1u << i); }
 	[[nodiscard]] uint32_t trace_count() const
