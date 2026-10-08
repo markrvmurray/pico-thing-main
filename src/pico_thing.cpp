@@ -1644,19 +1644,45 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		watchpoint_nmi_pending = true;
 	else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
 		reg[wloc] = wval;
-	// Queue for the for(;;) loop to do full dispatch.
-	const uint8_t h = write_ring_head;
-	const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
-	if (next_h == write_ring_tail) {
-		// Ring full — drop oldest entry so the newest is never lost.
-		write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
+	// QUEUE ONLY WHAT THE DISPATCH WILL ACT ON.  Core 1's switch handles
+	// SYSTEM_TASK, SYSTEM_REQUEST, SYSTEM_SUBREQUEST, SYSTEM_WATCHPOINT,
+	// CONSOLE_CONTROL, CONSOLE_TX_DATA, AUX_CONTROL and AUX_TX_DATA - every
+	// one of them at offset 0x00 to 0x0A, so everything from
+	// REGISTER_BUFFER_OFFSET (0x10) up hits its "default: break" and the
+	// entry is pure waste.  And those are the HOTTEST writes there are: the
+	// shared buffer during a copy, the snippet area, the vectors.
+	//
+	// WHICH MATTERS BECAUSE THE RING IS THE 2.3 MHz LIMITER, not ISR cost.
+	// It holds 32 entries and the loop has to drain them before the write
+	// ISR refills it; measured 2026-10-08, a guest storing to $FFD0 every 8
+	// E cycles overflowed it between 2.2 and 2.3 MHz and dropped 331383
+	// dispatches while still reporting RS_RUNNING.  Filtering here cuts the
+	// arrival rate to device-register writes only.
+	//
+	// The mirror above is unaffected - it still runs for the whole
+	// $FFD0-$FFFF range, which is what makes the shared buffer readable.
+	// Only the DISPATCH queue is filtered.
+	static_assert(SYSTEM_WATCHPOINT < REGISTER_BUFFER_OFFSET
+		      && CONSOLE_CONTROL < REGISTER_BUFFER_OFFSET
+		      && AUX_TX_DATA < REGISTER_BUFFER_OFFSET
+		      && SYSTEM_SUBREQUEST < REGISTER_BUFFER_OFFSET,
+		      "a dispatched register has moved to or above "
+		      "REGISTER_BUFFER_OFFSET, so the ring filter below would "
+		      "silently stop delivering it");
+	if (wloc < REGISTER_BUFFER_OFFSET) {
+		const uint8_t h = write_ring_head;
+		const uint8_t next_h = (h + 1u) & WRITE_RING_MASK;
+		if (next_h == write_ring_tail) {
+			// Ring full — drop oldest entry so the newest is never lost.
+			write_ring_tail = (write_ring_tail + 1u) & WRITE_RING_MASK;
 #ifdef DEBUG
-		write_ring_overflow++;
+			write_ring_overflow++;
 #endif
+		}
+		write_ring[h].location = wloc;
+		write_ring[h].value = wval;
+		write_ring_head = next_h;
 	}
-	write_ring[h].location = wloc;
-	write_ring[h].value = wval;
-	write_ring_head = next_h;
 }
 
 void __isr
