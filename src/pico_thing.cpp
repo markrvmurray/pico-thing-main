@@ -1666,14 +1666,27 @@ __time_critical_func(dma_bus_read_irq_handler())
 // then drains however many entries are present, which also makes real
 // coalescing harmless if it ever does start.
 //
-// THE ADDRESS IS ENOUGH; THE VALUE IS NOT CAPTURED.  The drainer reads the byte
-// back out of write_registers[], so two writes to the SAME location give two
-// entries that both read the final value.  For the mirror that is exactly
-// right - it is memory, and the last value written is the one that should be
-// readable.  For the dispatched registers it would lose an intermediate value,
-// but each of those has its own handshake that stops the guest writing twice in
-// a row: CONSOLE_TX_DATA/AUX_TX_DATA drop TDRE until Core 1 takes the byte (see
-// write_received()), and no kernel path stores twice to SYSTEM_TASK.
+// THE ADDRESS IS ENOUGH FOR THE MIRROR; THE VALUE IS NOT CAPTURED.  The drainer
+// reads the byte back out of write_registers[], so two writes to the SAME
+// location give two entries that both read the final value.  For the mirror
+// that is exactly right - it is memory, and the last value written is the one
+// that should be readable.
+//
+// FOR A DISPATCHED REGISTER IT LOSES THE INTERMEDIATE VALUE, and the handshakes
+// do NOT rule that out.  An earlier version of this note claimed they did:
+// CONSOLE_TX_DATA/AUX_TX_DATA drop TDRE until Core 1 takes the byte (see
+// write_received()), and no kernel path stores twice to SYSTEM_TASK.  But TDRE
+// only OFFERS that handshake - a guest is free to ignore it, and
+// acia_torture's test 6 does exactly that on purpose:
+//
+//     T6Send  STA ACIATX / INCA / DECB / BNE T6Send     no TDRE poll
+//
+// so the protection is the drain keeping up, not the protocol.  Measured: 16
+// bytes all arrive at 2.4 MHz and only 4 of 16 at 2.5, where the guest outruns
+// Core 1's drain.  That is the loop's dispatch deadline, not this ring - the
+// two $FFD0 dumps in st AGREE throughout, so nothing is being lost on the
+// mirror path.  Capturing the value as well would fix it, and is the obvious
+// next step if a real guest ever writes a device register without polling.
 //
 // Must be aligned to its own byte size: the hardware ring wraps address bits,
 // so the buffer has to start on that boundary.
