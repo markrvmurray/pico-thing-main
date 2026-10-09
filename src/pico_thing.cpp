@@ -306,6 +306,52 @@ static constexpr uint8_t PEND_NMI  = 1u << 0;
 static constexpr uint8_t PEND_FIRQ = 1u << 1;
 static constexpr uint8_t PEND_IRQ  = 1u << 2;
 
+// WHICH DEVICES ARE ASSERTING /IRQ, so the read ISR can retire the console
+// ACIA's contribution when the guest reads the data register instead of waiting
+// for Core 1's next pass.
+//
+// THE PROBLEM IT ADDRESSES.  /IRQ comes from pending_interrupts, written
+// wholesale by the loop, while the status byte the guest reads is updated
+// promptly by sync_status() on the ISR path.  So after the guest's handler reads
+// the data register - clearing RDRF - the pin stays low until the loop next
+// runs.  If the handler's RTI completes inside that window the guest unmasks I
+// with /IRQ still asserted and re-enters with nothing pending.  Measured as
+// acia_torture test 8 failing from 2.4 MHz, "S_IRQ not set in handler", 234
+// unexpected entries of which 258 found S_IRQ clear.
+//
+// TWO WORDS, ONE WRITER EACH.  irq_sources belongs to Core 1's loop and
+// irq_retired to the read ISR, and the loop takes its update with interrupts
+// masked so the ISR cannot interleave - both run on Core 1, so that suffices,
+// and it is the idiom the console write path already uses.  An earlier version
+// had the ISR read-modify-write a byte the loop stored wholesale, which lost a
+// fresh assertion whenever a loop store landed mid-update.
+//
+// A RECOMPUTE IS NOT AN OPTION in the ISR: mc6850::has_interrupt() clears
+// irq_dirty, refreshes the TX queue state and STAGES THE NEXT RX BYTE.  Only
+// tick_timer::has_interrupt() is pure.  So the loop records what it found and
+// the ISR only subtracts.
+static constexpr uint8_t IRQ_SRC_CONSOLE_ACIA = 1u << 0;
+static constexpr uint8_t IRQ_SRC_AUX_ACIA     = 1u << 1;
+static constexpr uint8_t IRQ_SRC_TICK         = 1u << 2;
+static constexpr uint8_t IRQ_SRC_CONSOLE_CMD  = 1u << 3;
+static volatile uint8_t irq_sources = 0u;	// written by Core 1's loop only
+static volatile uint8_t irq_retired = 0u;	// written by the read ISR only
+// WHERE EACH /IRQ WENT UP AND CAME DOWN.  These three settled finding 21: the
+// read-ISR retirement alone gave 462 vectors taken for 308 assertions, and a
+// ratio above one is only possible if the guest re-enters on an assertion it
+// has already taken.  Adding the vector-fetch release took it to 330 taken for
+// 347 raised, with 330 of the retirements happening at the fetch - one per
+// acknowledgement, which is what a device does.
+//
+// Kept because that ratio is the one number that distinguishes "the line is
+// held too long" from "the device keeps asking", and they need opposite fixes.
+// Behind DIAG_ON: three stores on paths a pure user gains nothing from.
+#if DIAG_ON
+static volatile uint32_t irq_isr_deassert = 0u;
+static volatile uint32_t irq_loop_assert = 0u;
+static volatile uint32_t irq_ack_deassert = 0u;	// dropped at the vector fetch
+#endif
+
 // Interrupt amplification.  acia_torture's handler is entered ~300 times for
 // 24 real ACIA receive events, and the question is whether the 6809 really
 // takes 300 interrupts (so /IRQ is being held asserted too long) or whether
@@ -1083,8 +1129,48 @@ __time_critical_func(gpio_q_irq_handler())
 				// point at which the frame is on the stack and the copy is
 				// about to run.  This is the bus telling the console the
 				// break has been taken.
-				if (eirq == INTERRUPT_IRQ)
+				if (eirq == INTERRUPT_IRQ) {
 					irq_vectors++;
+					// RELEASE /IRQ AT THE ACKNOWLEDGEMENT, which is
+					// what a real device does: hold the request until
+					// the processor fetches the vector, then let go.
+					// The `irq` test command already works this way.
+					//
+					// WHY THE DATA READ IS NOT ENOUGH, measured: with
+					// retirement only in the read ISR the guest took 462
+					// vectors for 308 assertions.  A SPURIOUS entry finds
+					// S_IRQ clear, so the handler never reads the data
+					// register, so that retirement never runs - the line
+					// stays low and the guest re-enters on every RTI until
+					// Core 1's loop catches up.  Releasing here breaks that
+					// regardless of what the handler does.
+					//
+					// It also cannot truncate an unsampled pulse, which is
+					// the trap the read-ISR version fell into: the fetch IS
+					// the proof the processor took it.  If a device still
+					// wants service the loop reasserts on its next pass,
+					// harmlessly, since the 6809 masks I on IRQ entry.
+					//
+					// Masked because the read DMA ISR is priority 0 against
+					// this handler's 1 and so can preempt it; both touch
+					// int_pins_held, and two lost updates on the same bit
+					// would leave the shadow disagreeing with the PIO -
+					// which would make the loop skip a NEEDED assertion.
+					const uint32_t ack = save_and_disable_interrupts();
+					irq_retired = 0xFFu;
+					if (int_pins_held & PEND_IRQ) {
+						const uint32_t oe = int_pins_held
+							& ~static_cast<uint32_t>(PEND_IRQ);
+						int_pins_held = oe;
+						pio_sm_put(int_pins.pio,
+							   static_cast<uint>(int_pins.sm),
+							   oe);
+#if DIAG_ON
+						irq_ack_deassert++;
+#endif
+					}
+					restore_interrupts(ack);
+				}
 				if (eirq == INTERRUPT_NMI) {
 					break_vector_fetched = true;
 					// The guest is entering BREAK again, so it is
@@ -1455,10 +1541,31 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// read sees the change.  guest_receive() will stage the next byte
 			// (if any) and re-set RDRF on the next for(;;) iteration.
 			fast_serial.rx_read_fast_path();
-			// Do NOT clear PEND_IRQ here — the for(;;) loop recomputes it
-			// from all device has_interrupt() calls each Q-rising edge.
-			// Clearing here would briefly deassert /IRQ even if another
-			// device still has a pending interrupt.
+			// DROP /IRQ HERE.  rx_read_fast_path() has just cleared RDRF, so
+			// the console ACIA is no longer asking; holding the pin until the
+			// loop's next pass is what let the guest's RTI complete with /IRQ
+			// still low and re-enter with nothing pending.
+			//
+			// The comment here used to forbid this, on the grounds that
+			// clearing would deassert even if another device still wanted the
+			// line.  irq_retired answers that: the pin drops only when no
+			// other source wants it.  The loop cannot interleave - it masks
+			// for its update - so this read-modify-write is safe.
+			irq_retired = static_cast<uint8_t>(irq_retired
+							   | IRQ_SRC_CONSOLE_ACIA);
+			if ((irq_sources & ~irq_retired) == 0u
+			    && (int_pins_held & PEND_IRQ)) {
+				pending_interrupts =
+					static_cast<uint8_t>(pending_interrupts & ~PEND_IRQ);
+				const uint32_t oe =
+					int_pins_held & ~static_cast<uint32_t>(PEND_IRQ);
+				int_pins_held = oe;
+				pio_sm_put(int_pins.pio,
+					   static_cast<uint>(int_pins.sm), oe);
+#if DIAG_ON
+				irq_isr_deassert++;
+#endif
+			}
 		} else if (loc == CONSOLE_STATUS) {
 #if DIAG_ON
 			// Counted HERE because the generic notification path
@@ -3913,6 +4020,14 @@ status_print(const status_snapshot_t *s)
 	printf("    IRQ taken %" PRIu32 " times; /IRQ asserted: off"
 	       " (build with -D PICO_THING_DIAG=1)\n", irq_vectors);
 #endif
+#if DIAG_ON
+	printf("    /IRQ: loop raised %" PRIu32 ", dropped %" PRIu32 " at the"
+	       " data read, %" PRIu32 " at the vector fetch\n",
+	       irq_loop_assert, irq_isr_deassert, irq_ack_deassert);
+#else
+	printf("    /IRQ: where it was raised and dropped is off"
+	       " (build with -D PICO_THING_DIAG=1)\n");
+#endif
 	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
 	       s->aux_acia.interrupt_status,
 	       s->aux_acia.tx_level, s->aux_acia.rx_level,
@@ -6315,14 +6430,39 @@ __no_inline_not_in_flash_func(main_core1)()
 			//
 			// Single volatile write at the end: the Q-rising ISR drives all
 			// three pins from this byte.
-			const uint8_t pend = pend_bit(console_has_interrupt())
-					   | pend_bit(system_tick.has_interrupt())
-					   | pend_bit(fast_serial.has_interrupt())
-					   | pend_bit(aux_serial.has_interrupt());
+			// Four separate results so the per-source mask can be
+			// recorded.  Each still called EXACTLY ONCE per pass:
+			// console_has_interrupt() consumes an NMI request on read and
+			// the two ACIA ones stage the next byte.  Outside the masked
+			// section below, because they are the expensive part.
+			const interrupt con = console_has_interrupt();
+			const interrupt tck = system_tick.has_interrupt();
+			const interrupt fst = fast_serial.has_interrupt();
+			const interrupt axs = aux_serial.has_interrupt();
+			const uint8_t pend = pend_bit(con) | pend_bit(tck)
+					   | pend_bit(fst) | pend_bit(axs);
+			const uint8_t src = static_cast<uint8_t>(
+				  (con == INTERRUPT_IRQ ? IRQ_SRC_CONSOLE_CMD  : 0u)
+				| (tck == INTERRUPT_IRQ ? IRQ_SRC_TICK         : 0u)
+				| (fst == INTERRUPT_IRQ ? IRQ_SRC_CONSOLE_ACIA : 0u)
+				| (axs == INTERRUPT_IRQ ? IRQ_SRC_AUX_ACIA     : 0u));
 			if (pend & PEND_IRQ)
 				core1_irq_assert_count++;
+			// Masked for the update only.  irq_retired is cleared because
+			// the has_interrupt() calls above have just read the devices,
+			// so their answer supersedes any earlier retirement; one that
+			// lands straight after the clear applies to the next pass.
+			const uint32_t irq_saved = save_and_disable_interrupts();
+			const bool was_irq = (int_pins_held & PEND_IRQ) != 0u;
 			pending_interrupts = pend;
+			irq_sources = src;
+			irq_retired = 0u;
 			interrupt_pins_update();
+#if DIAG_ON
+			if (!was_irq && (int_pins_held & PEND_IRQ))
+				irq_loop_assert++;
+#endif
+			restore_interrupts(irq_saved);
 		}
 
 		// Console writes into the register block, carried out as the guest's

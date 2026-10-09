@@ -135,7 +135,18 @@ mc6850::status_byte() const
 	sr.rdrf = receive_buffer_full ? 1u : 0u;
 	sr.tdre = (transmit_buffer_empty && !cts_deasserted && !tx_write_pending) ? 1u : 0u;
 	sr.cts  = cts_deasserted ? 1u : 0u;
-	sr.irq  = (assert_receive_irq || assert_transmit_irq) ? 1u : 0u;
+	// The receive half is derived LIVE, not read back from
+	// assert_receive_irq.  That cached flag belongs to the pin driver and is
+	// only recomputed by has_interrupt_recompute(); several callers move
+	// receive_buffer_full and then store the status without it - guest_receive()
+	// stages a byte, rx_read_fast_path() clears one - and a cached copy then
+	// described the previous state.  The guest saw RDRF set with S_IRQ clear,
+	// which is a state the part cannot be in, and the torture suite's test 8
+	// counted 137 of them in 256 bytes at 2.4 MHz.  On real silicon this bit
+	// IS the live condition, so compute it that way and the class of bug goes.
+	// guest_transmit()'s close-loopback arm had to assign the flag by hand for
+	// this very reason; it no longer has to.
+	sr.irq  = ((receive_irq && receive_buffer_full) || assert_transmit_irq) ? 1u : 0u;
 	return sr.byte;
 }
 
