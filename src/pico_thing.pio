@@ -21,8 +21,16 @@
 .define	public	GPIO_Q		1
 
 .define	public	GPIO_RW		2	; R/!W
-.define	public	GPIO_A_BASE	3	; A5-0
-.define	public	GPIO_D_BASE	9	; D7-0
+; BOTH BUSES ARE LSB-AT-BASE: GPIO 3 is A0 and GPIO 8 is A5; GPIO 9 is D0 and
+; GPIO 16 is D7.  Spelled out because it is not inferable from a base address,
+; and because the old annotation "A5-0" read as though GPIO 3 were A5 - which
+; is how an address filter came to test A0 and A1 believing they were A5 and A4.
+; What settles it: union bus_pins' "A : 6" and "D : 8" start at those bits and
+; are used as a register offset and a data byte DIRECTLY - see the DAT-fault
+; test in the Q handler, and the trace's D column, where a guest "20 FE" at
+; $0000 reads back as A=00 D=20, A=01 D=FE.
+.define	public	GPIO_A_BASE	3	; A0 at GPIO 3 ... A5 at GPIO 8
+.define	public	GPIO_D_BASE	9	; D0 at GPIO 9 ... D7 at GPIO 16
 .define	public	GPIO_CS		17	; !CS_PICO
 .define	public	GPIO_TRACE_RD	27	; Debugging
 .define	public	GPIO_TRACE_WR	28	; Debugging
@@ -123,10 +131,10 @@ mc6809_clock_program_deinit(PIO pio, uint sm)
 
 %}
 
-; Bus READ cycle. The read_registers[] prefix + A5-0 are sent to the
+; Bus READ cycle. The read_registers[] prefix + A0-A5 are sent to the
 ; DMA read chain as soon as Q goes high. The byte at the given address is
 ; returned immediately to here, where we can take our time by sending
-; to D7-0 after Q trailing edge. The output is cleared at E trailing edge
+; to D0-D7 after Q trailing edge. The output is cleared at E trailing edge
 ; (plus a bit).
 ;
 ; To consider: Don't auto-return the read byte ASAP, instead give the
@@ -145,13 +153,11 @@ mc6809_clock_program_deinit(PIO pio, uint sm)
 ; zero exactly when both are clear and "jmp x--" skips the notify when either
 ; is set.
 ;
-; MIND THE PIN ORDER, WHICH IS THE OPPOSITE OF WHAT THIS FILE'S "A5-0" SUGGESTS.
-; That names the set of lines, not their order: GPIO_A_BASE (3) carries **A0**
-; and GPIO 8 carries A5, which is what union bus_pins' "A : 6" bitfield encodes
-; and what lets bits.A be compared against a register offset directly (see the
-; DAT-fault test in the Q handler).  So after the R/!W bit the OSR holds A0
-; first, and A5/A4 are the LAST two of the six - hence the "out null 4" to
-; discard A0-A3 before taking them.
+; MIND THE PIN ORDER.  GPIO_A_BASE (3) carries **A0**, so after the R/!W bit the
+; OSR holds A0 first and A5/A4 are the LAST two of the six - hence the
+; "out null 4" to discard A0-A3 before taking them.  The annotations used to read
+; "A5-0", which specified no order at all and invited exactly the wrong
+; inference from a base of 3; they now name both end points.
 ;
 ; Getting this wrong fails QUIETLY AND PLAUSIBLY, which is worth a warning: an
 ; "out x 2" straight after the R/!W reads A0 and A1 instead, so the notify
@@ -163,7 +169,7 @@ mc6809_clock_program_deinit(PIO pio, uint sm)
 ; THE PLACEMENT COSTS NOTHING, which is the point.  "out x 2" sits between the
 ; push and the pull, where the state machine is stalled waiting for the DMA
 ; round trip anyway (~11 clk_sys cycles, measured).  The test and the irq sit
-; after D7-0 is driven and before the wait for Q to fall, which is most of a Q
+; after D0-D7 is driven and before the wait for Q to fall, which is most of a Q
 ; half-cycle of slack - 26 PIO cycles even at 3 MHz.  Neither is on the path
 ; that has to finish inside the E cycle.
 ;
@@ -174,8 +180,8 @@ mc6809_clock_program_deinit(PIO pio, uint sm)
 ; required: the ISR recovers the address from the DMA's own read_addr register,
 ; so a notify raised before the transfer completed would hand it a stale one.
 ;
-; IN  pins:    (7) A5-0, R/!W
-; OUT pins:    (8) D7-0
+; IN  pins:    (7) A0-A5, R/!W
+; OUT pins:    (8) D0-D7
 ; JMP pin:     !CS
 .program	mc6809_bus_read
 .side_set	1			; Debugging
@@ -187,28 +193,28 @@ wait_q:
 	wait	0 gpio GPIO_Q	side 0  ; Wait for new Q cycle
 	wait	1 gpio GPIO_Q	side 0
 	jmp	pin wait_q	side 0	; If !CS (jmp_pin) is high, try again next cycle
-	in	pins 7		side 1	; R/!W, A5-0 all stable at Q rising edge
-	in	null 25		side 1	; Move A5-0, R/!W to the right
+	in	pins 7		side 1	; R/!W, A0-A5 all stable at Q rising edge
+	in	null 25		side 1	; Move A0-A5, R/!W to the right
 	mov	osr isr		side 1
 	out	x 1		side 1	; Get R/!W
 	jmp	!x wait_q	side 1	; If R/!W == 0 -> Write
-	mov	x isr		side 1	; Get back A5-0, R/!W
+	mov	x isr		side 1	; Get back A0-A5, R/!W
 	in	x 7		side 1
 	mov	x y		side 1  ; Get registers[] address
 	in	x 26		side 1  ; MSBs of registers[], R/!W falls off the end
-	push	block		side 1	; Send full address = registers[] + A5-0
+	push	block		side 1	; Send full address = registers[] + A0-A5
 	out	null 4		side 1	; discard A0-A3; GPIO3 is A0, NOT A5
 	out	x 2		side 1	; A4,A5 - grabbed BEFORE the pull overwrites the OSR
 public dma_wait:
 	pull	block		side 1	; Wait for data byte reply
-	out	pins 8		side 0	; Set D7-0 output values
+	out	pins 8		side 0	; Set D0-D7 output values
 	jmp	x-- no_notify	side 0	; A5 or A4 set: plain memory, tell the CPU nothing
 	irq	set 4		side 0	; $FFC0-$FFCF is a device register: notify
 no_notify:
 	wait	0 gpio GPIO_Q	side 0	; Q trailing edge
-	mov	pindirs !null	side 1	; Set D7-0 to outz                                                                                                                                                                                                                                                                                                                                                                                                                      cput
+	mov	pindirs !null	side 1	; Set D0-D7 to outz                                                                                                                                                                                                                                                                                                                                                                                                                      cput
 	wait	0 gpio GPIO_E	[7] side 1	; E trailing edge plus a bit
-	mov	pindirs null	side 0	; Set D7-0 back to input
+	mov	pindirs null	side 0	; Set D0-D7 back to input
 .wrap
 
 % c-sdk {
@@ -236,7 +242,7 @@ static inline void
 mc6809_bus_read_program_deinit(PIO pio, uint sm)
 {
 	pio_sm_set_enabled(pio, sm, false);
-	// D7-0 back to hi-Z input
+	// D0-D7 back to hi-Z input
 	pio_sm_set_consecutive_pindirs(pio, sm, GPIO_D_BASE, 8, false);
 	for (uint i = 0; i < 8; i++)
 		gpio_set_function(GPIO_D_BASE + i, GPIO_FUNC_SIO);
@@ -249,12 +255,12 @@ mc6809_bus_read_program_deinit(PIO pio, uint sm)
 
 %}
 
-; Bus WRITE cycle. The write_registers[] prefix + A5-0 are sent to the
-; DMA chain as soon as Q goes high. As soon as E goes high, we grab D7-0
+; Bus WRITE cycle. The write_registers[] prefix + A0-A5 are sent to the
+; DMA chain as soon as Q goes high. As soon as E goes high, we grab D0-D7
 ; and send this back to the DMA chain for storage at the given address.
 ;
-; IN pins: (7) A5-0, R/!W
-; IN pins: (8) D7-0
+; IN pins: (7) A0-A5, R/!W
+; IN pins: (8) D0-D7
 ; JMP pin: !CS
 .program	mc6809_bus_write
 .side_set	1			; Debugging
@@ -266,20 +272,20 @@ wait_q:
 	wait	0 gpio GPIO_Q	side 0  ; Wait for new Q cycle
 	wait	1 gpio GPIO_Q	side 0
 	jmp	pin wait_q	side 0	; If !CS (jmp_pin) is high, try again next cycle
-	in	pins 7		side 1	; A5-0, R/!W all stable at Q rising edge
-	in	null 25		side 1	; Move A5-0, R/!W to the right
+	in	pins 7		side 1	; A0-A5, R/!W all stable at Q rising edge
+	in	null 25		side 1	; Move A0-A5, R/!W to the right
 	mov	osr isr		side 1
 	out	x 1		side 1	; Get R/!W
 	jmp	x-- wait_q	side 1	; If R/!W == 1 -> Read
-	mov	x isr		side 1	; Get back A5-0, R/!W
+	mov	x isr		side 1	; Get back A0-A5, R/!W
 	in	x 7		side 1
 	mov	x y		side 1  ; Get registers[] address
 	in	x 26		side 1  ; MSBs of registers[], R/!W falls off the end
-	push	block		side 1	; Send full address = registers[] + A5-0
+	push	block		side 1	; Send full address = registers[] + A0-A5
 	wait	1 gpio GPIO_E	side 0	; E leading edge
-	in	pins 15		side 1	; Get D7-0, A5-0, R/!W
-	in	null 24		side 1	; Get D7-0 to the right; A5-0 + R/!W fall of the end
-	push	block		side 1	; Send D7-0
+	in	pins 15		side 1	; Get D0-D7, A0-A5, R/!W
+	in	null 24		side 1	; Get D0-D7 to the right; A0-A5 + R/!W fall of the end
+	push	block		side 1	; Send D0-D7
 .wrap
 
 % c-sdk {

@@ -1363,7 +1363,7 @@ __time_critical_func(pio_bus_fault_irq_handler())
 // ISR for the R/!W bus read loop and DMA chain
 // The PIO mediates the signalling
 // There are 2 DMA transfers:
-//   1) accept reg + A5-0
+//   1) accept reg + A0-A5
 //   2) return the byte at that address
 //
 // This reacts to a read after the fact. Consider breaking
@@ -1501,7 +1501,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 // ISR for the R/!W bus write loop and DMA chain
 // The PIO mediates the signalling
 // There are 2 DMA transfers:
-//   1) accept write_registers + A5-0
+//   1) accept write_registers + A0-A5
 //   2) accept the byte to be written to that address
 
 // Ring buffer for DMA write events.  The ISR pushes {location, value}
@@ -5461,7 +5461,7 @@ status_done:
 	case CMD_TRACE:
 	case CMD_TRACE_LEN: {
 		// Decode the one-word-per-E-cycle capture via the bus_pins union.
-		// A5-A0 is the low 6 bits of the bus address; for any $FFC0-page
+		// A0-A5 is the low 6 bits of the bus address; for any $FFC0-page
 		// access that is the full register offset.  Every pin is sampled at
 		// E-falling, so address, data, R/W and status are all settled.
 		const uint32_t have = MC6809.trace_count();
