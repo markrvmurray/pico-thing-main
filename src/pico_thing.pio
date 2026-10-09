@@ -285,7 +285,23 @@ wait_q:
 	wait	1 gpio GPIO_E	side 0	; E leading edge
 	in	pins 15		side 1	; Get D0-D7, A0-A5, R/!W
 	in	null 24		side 1	; Get D0-D7 to the right; A0-A5 + R/!W fall of the end
-	push	block		side 1	; Send D0-D7
+; THE DATA BYTE GOES OUT TWICE: once for the DMA that stores it, once for the
+; data ring the write ISR drains.  push empties the ISR, so X holds a copy
+; across the first one and refills it for the second.
+;
+; The ring has to have the byte AS WRITTEN.  The ISR used to read it back out
+; of write_registers[] when it ran, which is correct only while no later write
+; has landed on the same address - and acia_torture's test 6 blasts 16 bytes to
+; ACIATX with no TDRE poll on purpose, so at 2.5 MHz twelve of them were read
+; back as whatever arrived last.  Captured here it cannot go stale.
+;
+; Three extra instructions and a third FIFO entry per write cycle.  The RX FIFO
+; is 4 deep and the DMA drains it at clk_sys, so three is within it; the FIFOs
+; are NOT joined because the startup prefix still comes in through TX.
+	mov	x isr		side 1	; keep the byte - push is about to clear ISR
+	push	block		side 1	; Send D0-D7 for the store
+	mov	isr x		side 1	; put it back
+	push	block		side 1	; Send D0-D7 again, for the data ring
 .wrap
 
 % c-sdk {

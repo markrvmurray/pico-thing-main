@@ -65,6 +65,9 @@ struct status_snapshot_t {
 	bool     rail_clipped;	// supply channel at full scale: no measurement
 	bool     rail_floor_only;	// serving: absolute floor only, baseline frozen
 	uint32_t write_ring_overflow;	// dropped guest-write dispatches: real loss
+	uint32_t write_addr_worst;	// most ring entries one write interrupt drained
+	uint32_t write_addr_coalesced;	// writes that shared an interrupt with another
+	uint32_t write_addr_overflow;	// the address ring may have lapped
 	uint8_t  busy_lic_avma;	// the pins, as the Q handler last read them
 	uint8_t  pio2_irq;	// all eight of pio2's SM-visible IRQ flags
 	uint8_t  clock_pc;	// the E/Q clock SM's PC, to prove it is cycling

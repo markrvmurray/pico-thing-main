@@ -1611,6 +1611,113 @@ __time_critical_func(dma_bus_read_irq_handler())
 //   1) accept write_registers + A0-A5
 //   2) accept the byte to be written to that address
 
+// EVERY GUEST WRITE'S ADDRESS, WRITTEN BY DMA RATHER THAN READ BACK BY THE ISR.
+//
+// THE BUG THIS EXISTS FOR.  The write chain hands the data channel its target
+// by storing into that channel's write_addr register, and write_increment is
+// false, so the register simply holds wherever the last write went.  The ISR
+// used to read it back to learn where the guest had written:
+//
+//     written_addr = dma_channel_hw_addr(data_channel)->write_addr;
+//
+// THAT IS A READ-AFTER-OVERWRITE RACE, not a missed interrupt.  The interrupt
+// is raised once per completion and the handler does run once per write - but
+// the completion also CHAINS, re-arming the address channel, which loads the
+// NEXT write's address into that same register the moment the next write
+// starts.  If the handler has not run by then it reads the next write's
+// address while it is supposed to be servicing this one: this write is skipped
+// entirely, and the next is serviced twice.  For a mirror, doing one twice is
+// harmless and losing one is fatal.
+//
+// MEASURED, AND BOTH MECHANISMS ARE REAL.  This went in believing the cause was
+// two completions sharing one latched interrupt, and the drain counter first
+// read worst 1, zero shared, which looked like a flat refutation.  A later
+// 2.4 MHz run after a power cycle read WORST 2, ONE SHARED: coalescing does
+// happen, just rarely - once in a 12-test suite against the hundreds of writes
+// the register race was losing.
+//
+// So the race is the dominant mechanism and the one that broke test 8, because
+// it needs only the next ADDRESS to arrive, which happens far sooner than a
+// whole next completion.  Coalescing is the same loss by a rarer route.  The
+// ring closes both, and the single-slot ISR would have dropped a write in
+// either case - so do not take a worst of 1 in a short run as proof that
+// coalescing cannot happen here.
+//
+// Why it shows above 2.3 MHz: an E cycle is 320 clk_sys cycles at 1 MHz and 133
+// at 2.4, and a 6809 STD puts its two bytes one E cycle apart.  At 1 MHz the
+// handler always wins that race; at 2.4, with the Q handler and the read ISR
+// also contending, it does not.  Evidence at 2.4 MHz: the guest's handler did
+// STD IRQ_COUNT to $FFD0/$FFD1 and the arrays came out write side 01 00, read
+// side 00 00 - the high byte's mirror lost, the low byte's applied.  The guest
+// had set its counter to 256, read back 0, and waited for ever.  At 2.3 MHz the
+// two agreed.
+//
+// IT IS NOT ONLY THE MIRROR.  The same skipped write misses
+// bus_write_followup()'s dispatch of SYSTEM_TASK, CONSOLE_CONTROL and
+// CONSOLE_TX_DATA.  The note at the top of mc6850.cpp describes a related
+// hazard on this chain from the other side: "two completions while masked are
+// served as one, which misaligned DriveWire".
+//
+// HOW IT WORKS.  A third channel is chained in after the data byte lands and
+// copies the data channel's write_addr - a fixed source, one 32-bit word - into
+// this ring, whose write address wraps in hardware.  The address is captured AT
+// THE MOMENT IT WAS USED rather than read back afterwards, so nothing can
+// overwrite it first.  Nothing decides anything; it just records.  The handler
+// then drains however many entries are present, which also makes real
+// coalescing harmless if it ever does start.
+//
+// THE ADDRESS IS ENOUGH; THE VALUE IS NOT CAPTURED.  The drainer reads the byte
+// back out of write_registers[], so two writes to the SAME location give two
+// entries that both read the final value.  For the mirror that is exactly
+// right - it is memory, and the last value written is the one that should be
+// readable.  For the dispatched registers it would lose an intermediate value,
+// but each of those has its own handshake that stops the guest writing twice in
+// a row: CONSOLE_TX_DATA/AUX_TX_DATA drop TDRE until Core 1 takes the byte (see
+// write_received()), and no kernel path stores twice to SYSTEM_TASK.
+//
+// Must be aligned to its own byte size: the hardware ring wraps address bits,
+// so the buffer has to start on that boundary.
+static constexpr uint32_t WRITE_ADDR_RING_SIZE = 64u;		// entries, power of 2
+static constexpr uint32_t WRITE_ADDR_RING_MASK = WRITE_ADDR_RING_SIZE - 1u;
+static constexpr uint32_t WRITE_ADDR_RING_BYTES = WRITE_ADDR_RING_SIZE * 4u;
+static constexpr uint32_t WRITE_ADDR_RING_BITS = 8u;		// log2(256 bytes)
+static_assert((1u << WRITE_ADDR_RING_BITS) == WRITE_ADDR_RING_BYTES,
+	      "the DMA ring wrap is in address BITS, so the entry count and "
+	      "the bit count have to agree");
+alignas(WRITE_ADDR_RING_BYTES) static volatile uint32_t
+	write_addr_ring[WRITE_ADDR_RING_SIZE];
+// AND THE BYTE AS IT WAS WRITTEN, in a second ring with the same index.  The
+// PIO sends the data twice - once for the DMA that stores it, once for here -
+// so every write puts exactly one entry in each ring and one tail serves both.
+//
+// Captured rather than read back because reading back is only correct while no
+// later write has landed on the same address.  A guest may write a device
+// register twice in a row: TDRE offers a handshake but does not enforce one,
+// and acia_torture's test 6 declines it deliberately, so at 2.5 MHz twelve of
+// its sixteen bytes were read back as whatever arrived last.  One byte per
+// entry, so the ring wrap is 6 bits rather than 8.
+static constexpr uint32_t WRITE_DATA_RING_BITS = 6u;	// log2(64 bytes)
+static_assert((1u << WRITE_DATA_RING_BITS) == WRITE_ADDR_RING_SIZE,
+	      "the two rings share a tail, so they must hold the same number "
+	      "of entries");
+alignas(WRITE_ADDR_RING_SIZE) static volatile uint8_t
+	write_data_ring[WRITE_ADDR_RING_SIZE];
+static uint32_t write_addr_ring_tail = 0u;	// the ISR is its only reader
+static constexpr int WRITE_ADDR_RING_CHANNEL = 6;
+static constexpr int WRITE_DATA_RING_CHANNEL = 7;
+#ifdef DEBUG
+// HOW MANY ENTRIES ONE INTERRUPT HAD TO DRAIN, worst case.  1 through several
+// runs, then 2 with one shared at 2.4 MHz - so coalescing is real but rare, and
+// a short run reading 1 proves nothing either way.  It is the dominant register
+// race that this ring was built for (see above); this counter measures the rarer
+// route to the same loss, and bounds how much runway the ring needs.
+static volatile uint32_t write_addr_ring_worst = 0u;
+static volatile uint32_t write_addr_ring_coalesced = 0u;	// entries beyond the first
+// The producer lapping the consumer - 64 writes inside one interrupt latency,
+// which should be unreachable.  Counted rather than assumed.
+static volatile uint32_t write_addr_ring_overflow = 0u;
+#endif
+
 // Ring buffer for DMA write events.  The ISR pushes {location, value}
 // entries; the Core 1 for(;;) loop drains them.  This replaces the old
 // single-slot write_location / write_irq_received pair, which silently
@@ -1792,19 +1899,68 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 	}
 }
 
+// WHERE THE RING CHANNEL IS ABOUT TO WRITE, as an entry index.  Its write
+// address wraps inside the ring in hardware, so the difference from the base is
+// always in range and no masking is needed.
+static inline uint32_t
+__time_critical_func(write_addr_ring_head())
+{
+	const uintptr_t next = dma_channel_hw_addr(WRITE_ADDR_RING_CHANNEL)->write_addr;
+	return static_cast<uint32_t>((next - reinterpret_cast<uintptr_t>(write_addr_ring)) >> 2);
+}
+
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
 #if TESTPOINTS_ON
 	gpio_put(GPIO_TRACE_C, true);
 #endif
-	dma_channel_acknowledge_irq1(piodma_write.data_channel);
-	if (MC6809.run_state >= RS_RUNNING) {
-		const uintptr_t written_addr = dma_channel_hw_addr(piodma_write.data_channel)->write_addr;
-		const uint8_t wloc = written_addr & registers::register_mask;
-		const uint8_t wval = *reinterpret_cast<volatile std::uint8_t *>(written_addr);
-		bus_write_followup(wloc, wval);
+	dma_channel_acknowledge_irq1(WRITE_ADDR_RING_CHANNEL);
+	// DRAIN EVERY ENTRY, not just one.  Two completions can share a single
+	// latched interrupt, and before the ring existed the earlier one was lost
+	// for good - see the note on write_addr_ring.  The head is read once:
+	// anything that arrives during the drain keeps its entry and is taken by
+	// the next interrupt, which the chain is guaranteed to raise.
+	const uint32_t head = write_addr_ring_head();
+#ifdef DEBUG
+	uint32_t drained = 0u;
+#endif
+	while (write_addr_ring_tail != head) {
+		const uint32_t ring_slot = write_addr_ring_tail;
+		const uintptr_t addr = write_addr_ring[ring_slot];
+		write_addr_ring_tail = (ring_slot + 1u) & WRITE_ADDR_RING_MASK;
+#ifdef DEBUG
+		drained++;
+#endif
+		// The tail advances either way, so a write made while the guest
+		// was not running is DISCARDED rather than left to be applied
+		// later out of order.  That is the behaviour the single-slot
+		// version had, and the DAT fault path depends on it: a write
+		// taken while held in reset must not reach the read side.
+		if (MC6809.run_state >= RS_RUNNING) {
+			const uint8_t wloc = addr & registers::register_mask;
+			// The byte the PIO captured, NOT a read-back of
+			// write_registers[]: a later write to the same address
+			// would have replaced that one.  Applying them in order
+			// also leaves the read side holding the final value, so
+			// the mirror is right as well as the dispatch.
+			const uint8_t wval = write_data_ring[ring_slot];
+			bus_write_followup(wloc, wval);
+		}
 	}
+#ifdef DEBUG
+	if (drained > write_addr_ring_worst)
+		write_addr_ring_worst = drained;
+	if (drained > 1u)
+		write_addr_ring_coalesced += drained - 1u;
+	// A full ring and an empty one look identical from the indices, so this
+	// is the nearest honest test: draining the whole thing means the producer
+	// may have lapped and an entry may already be gone.  64 writes inside one
+	// interrupt latency should be unreachable - if this is ever non-zero the
+	// ring is too small, not the drain too slow.
+	if (drained >= WRITE_ADDR_RING_SIZE - 1u)
+		write_addr_ring_overflow++;
+#endif
 #if TESTPOINTS_ON
 	gpio_put(GPIO_TRACE_C, false);
 #endif
@@ -3550,6 +3706,9 @@ status_gather(status_snapshot_t *s)
 	// Guarded to match the field, which lives in status.h's DEBUG section -
 	// as do the increment and the report, so all three agree.
 	s->write_ring_overflow = write_ring_overflow;
+	s->write_addr_worst = write_addr_ring_worst;
+	s->write_addr_coalesced = write_addr_ring_coalesced;
+	s->write_addr_overflow = write_addr_ring_overflow;
 #endif
 	s->core1_read_irq = core1_read_irq_count;
 	s->core1_last_write = core1_last_write_loc;
@@ -3983,6 +4142,19 @@ status_print(const status_snapshot_t *s)
 	else
 		printf("  Write ring overflow: none (%u entries of runway)\n",
 		       WRITE_RING_SIZE);
+	// COALESCED WRITE COMPLETIONS.  "worst 1" means every DMA completion got its
+	// own interrupt; above 1 means some shared one, and each of those is a write
+	// the old single-slot ISR would have dropped.  Measured 2 with one shared at
+	// 2.4 MHz, so it is rare - the bulk of the loss was the read-after-overwrite
+	// race on the data channel's write_addr, which this does not count.
+	printf("  Write completions: worst %" PRIu32 " per interrupt, %" PRIu32
+	       " shared one (%u entries of ring)\n",
+	       s->write_addr_worst, s->write_addr_coalesced,
+	       WRITE_ADDR_RING_SIZE);
+	if (s->write_addr_overflow)
+		printf("  *** WRITE ADDRESS RING LAPPED x%" PRIu32 " - make it"
+		       " bigger; a write address may have been lost ***\n",
+		       s->write_addr_overflow);
 #endif
 	printf("  Last Write: %02X   Last Read: %02X\n",
 	       s->core1_last_write, s->core1_last_read);
@@ -6308,7 +6480,19 @@ __no_inline_not_in_flash_func(main_core1)()
 	irq_set_exclusive_handler(piodma_write.irq, dma_bus_write_irq_handler);
 	irq_set_priority(piodma_write.irq, 0);
 	irq_set_enabled(piodma_write.irq, true);
-	dma_channel_set_irq1_enabled(piodma_write.data_channel, true);
+	// RESYNCHRONISE THE TAIL TO THE HARDWARE before enabling the interrupt.
+	// Core 1 is reset and relaunched on every power-on, but the ring channel
+	// is configured once by Core 0 and write_addr_ring_tail is a file-scope
+	// static that survives - so after a relaunch the two can disagree and the
+	// first interrupt would drain up to 63 stale entries as though they were
+	// new writes.  Taking the head as the starting tail discards whatever the
+	// previous run left, which is what is wanted.  This is the same trap that
+	// put a bogus 8.7-million-cycle maximum in loop_cost.max.
+	write_addr_ring_tail = write_addr_ring_head();
+	// THE INTERRUPT COMES FROM THE RING CHANNEL, the last link in the chain,
+	// so by the time the handler runs the entry for this write is already in
+	// the ring.  On the data channel it could run first and find nothing.
+	dma_channel_set_irq1_enabled(WRITE_ADDR_RING_CHANNEL, true);
 	dma_channel_start(piodma_write.address_channel);
 	pio_sm_put(piodma_write.pio, piodma_write.sm, registers::write_address() >> 6); // Six bits for A0-5
 	printf("Core1 Main write DMA chain configured\n");
@@ -6841,7 +7025,11 @@ bus_pio_dma_init()
 	channel_config_set_read_increment(&write_in_dma, false);
 	channel_config_set_write_increment(&write_in_dma, false);
 	channel_config_set_transfer_data_size(&write_in_dma, DMA_SIZE_8);
-	channel_config_set_chain_to(&write_in_dma, piodma_write.address_channel);
+	// Chains to the ADDRESS RING, not straight back to the address channel:
+	// the ring entry has to be written after the byte has landed, so that a
+	// drainer reading write_registers[] for that address sees the new value.
+	// The ring then chains back to the address channel and the cycle closes.
+	channel_config_set_chain_to(&write_in_dma, WRITE_ADDR_RING_CHANNEL);
 	dma_channel_configure(
 		piodma_write.data_channel,
 		&write_in_dma,
@@ -6866,6 +7054,63 @@ bus_pio_dma_init()
 		dma_encode_transfer_count(1),
 		false);
 	printf("Core0 DMA write_address channel configured\n");
+	// DMA record every write's address into a wrapping ring, so a coalesced
+	// completion cannot lose one.  See the long note on write_addr_ring.
+	//
+	// No DREQ: it is triggered by the chain from the data channel and has
+	// nothing to wait for, so it runs unpaced and is done in a few cycles.
+	// Fixed source - the data channel's write_addr register - and an
+	// incrementing destination with a hardware wrap, which is what makes the
+	// channel self-reloading and never in need of reconfiguration.
+	if (dma_channel_is_claimed(WRITE_ADDR_RING_CHANNEL)) {
+		printf("Core0 DMA channel %d for the write address ring is already claimed\n",
+		       WRITE_ADDR_RING_CHANNEL);
+		panic("Unable to proceed");
+	}
+	dma_channel_claim(WRITE_ADDR_RING_CHANNEL);
+	dma_channel_config write_ring_dma = dma_channel_get_default_config(WRITE_ADDR_RING_CHANNEL);
+	channel_config_set_high_priority(&write_ring_dma, true);
+	channel_config_set_read_increment(&write_ring_dma, false);
+	channel_config_set_write_increment(&write_ring_dma, true);
+	channel_config_set_ring(&write_ring_dma, true, WRITE_ADDR_RING_BITS);
+	channel_config_set_transfer_data_size(&write_ring_dma, DMA_SIZE_32);
+	channel_config_set_chain_to(&write_ring_dma, WRITE_DATA_RING_CHANNEL);
+	dma_channel_configure(
+		WRITE_ADDR_RING_CHANNEL,
+		&write_ring_dma,
+		write_addr_ring,						// dst - wraps
+		&dma_channel_hw_addr(piodma_write.data_channel)->write_addr,	// src - fixed
+		dma_encode_transfer_count(1),
+		false);
+	printf("Core0 DMA write address ring channel configured\n");
+	// And the data ring: the PIO's SECOND push of the same data byte, taken
+	// straight from the FIFO so it cannot have been overwritten by a later
+	// write.  DREQ-paced like the other two FIFO readers, because it has to
+	// wait for that push; the address ring above needs no DREQ, being a
+	// register-to-memory copy.  Last link in the chain, so it closes the cycle
+	// back to the address channel.
+	if (dma_channel_is_claimed(WRITE_DATA_RING_CHANNEL)) {
+		printf("Core0 DMA channel %d for the write data ring is already claimed\n",
+		       WRITE_DATA_RING_CHANNEL);
+		panic("Unable to proceed");
+	}
+	dma_channel_claim(WRITE_DATA_RING_CHANNEL);
+	dma_channel_config write_data_dma = dma_channel_get_default_config(WRITE_DATA_RING_CHANNEL);
+	channel_config_set_high_priority(&write_data_dma, true);
+	channel_config_set_dreq(&write_data_dma, pio_get_dreq(piodma_write.pio, piodma_write.sm, false));
+	channel_config_set_read_increment(&write_data_dma, false);
+	channel_config_set_write_increment(&write_data_dma, true);
+	channel_config_set_ring(&write_data_dma, true, WRITE_DATA_RING_BITS);
+	channel_config_set_transfer_data_size(&write_data_dma, DMA_SIZE_8);
+	channel_config_set_chain_to(&write_data_dma, piodma_write.address_channel);
+	dma_channel_configure(
+		WRITE_DATA_RING_CHANNEL,
+		&write_data_dma,
+		write_data_ring,					// dst - wraps
+		&piodma_write.pio->rxf[piodma_write.sm],	// src - the second push
+		dma_encode_transfer_count(1),
+		false);
+	printf("Core0 DMA write data ring channel configured\n");
 
 	// SM: Task pin output driver (pio2 with GPIO base 16 for access to GPIO 40-45)
 	pio_set_gpio_base(task_output.pio, 16);
@@ -6958,8 +7203,10 @@ pio_shutdown()
 	irq_set_enabled(piodma_read.irq, false);
 	irq_remove_handler(piodma_read.irq, dma_bus_read_irq_handler);
 
-	// DMA write IRQ
-	dma_channel_set_irq1_enabled(piodma_write.data_channel, false);
+	// DMA write IRQ.  Disabled on the RING channel, which is where it is now
+	// raised - leaving it enabled on the data channel would arm an interrupt
+	// the handler is no longer registered for.
+	dma_channel_set_irq1_enabled(WRITE_ADDR_RING_CHANNEL, false);
 	irq_set_enabled(piodma_write.irq, false);
 	irq_remove_handler(piodma_write.irq, dma_bus_write_irq_handler);
 
@@ -7012,8 +7259,15 @@ pio_shutdown()
 	pio_remove_program(task_output.pio, &task_output_program, task_output.offset);
 
 	// --- Bus write SM + DMA ---
+	// The ring channel is part of this chain and goes down with it.  Aborted
+	// first: it is what the other two chain into, so stopping it stops the
+	// cycle rather than leaving a link that re-triggers what was just halted.
+	dma_channel_abort(WRITE_DATA_RING_CHANNEL);
+	dma_channel_abort(WRITE_ADDR_RING_CHANNEL);
 	dma_channel_abort(piodma_write.address_channel);
 	dma_channel_abort(piodma_write.data_channel);
+	dma_channel_unclaim(WRITE_DATA_RING_CHANNEL);
+	dma_channel_unclaim(WRITE_ADDR_RING_CHANNEL);
 	dma_channel_unclaim(piodma_write.address_channel);
 	dma_channel_unclaim(piodma_write.data_channel);
 	mc6809_bus_write_program_deinit(piodma_write.pio, piodma_write.sm);
