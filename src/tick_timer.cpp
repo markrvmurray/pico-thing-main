@@ -49,8 +49,10 @@ tick_timer::control(uint8_t val)
 		reg[status_offset] = static_cast<uint8_t>(0x00u);
 	}
 	uint8_t countdown = (val >> 1) & 0x1Fu;
-	if (countdown)
+	if (countdown) {
 		nmi_countdown = countdown;
+		q_rising_arm();	// the Q handler counts it down
+	}
 }
 
 void

@@ -41,7 +41,11 @@ private:
 		size_t i;
 		operator uint8_t() const { return read_registers[i]; }
 		explicit operator uint16_t() const { return __builtin_bswap16(*reinterpret_cast<volatile uint16_t*>(&read_registers[i])); }
-		explicit operator float() const { uint32_t u = __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(&read_registers[i])); float f; std::memcpy(&f,&u,sizeof f); return f; }		ReadProxy& operator=(volatile uint8_t v){ read_registers[i] = v; return *this; }
+		explicit operator float() const { uint32_t u = __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(&read_registers[i])); float f; std::memcpy(&f,&u,sizeof f); return f; }		// NOT `volatile uint8_t v`: a volatile BY-VALUE parameter makes the compiler
+		// materialise the argument on the stack and read it back before the store -
+		// a strb/ldrb pair through sp on every `reg[x] = y`, including the mirror
+		// store in the write ISR.  The qualifier on a copy protects nothing.
+		ReadProxy& operator=(uint8_t v){ read_registers[i] = v; return *this; }
 		ReadProxy& operator=(uint16_t v) { *reinterpret_cast<volatile uint16_t*>(&read_registers[i]) = __builtin_bswap16(v); return *this; }
 		ReadProxy& operator=(float v) { uint32_t u; std::memcpy(&u, &v, sizeof u); *reinterpret_cast<volatile uint32_t*>(&read_registers[i]) = __builtin_bswap32(u); return *this; }
 		bool operator==(uint8_t v) const { return read_registers[i] == v; }

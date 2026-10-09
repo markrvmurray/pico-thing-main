@@ -10,6 +10,7 @@
 
 #include "pico/time.h"
 #include "interrupt.h"
+#include "q_armed.h"
 
 // Forward declaration — full header included in tick_timer.cpp.
 class registers;
@@ -49,7 +50,7 @@ public:
 	// would rewrite from bit 0.  For the firmware's own single-stepping: the
 	// guest arms it by writing $FFC8, but a step has to arm it from the
 	// Q-rising handler, in the same pass that releases the guest.
-	void arm_countdown(uint8_t cycles) { nmi_countdown = cycles; }
+	void arm_countdown(uint8_t cycles) { nmi_countdown = cycles; q_rising_arm(); }
 
 	// Called once per E-cycle (Q-rising ISR).  Returns true when the
 	// NMI countdown expires, signalling the caller to set PEND_NMI.

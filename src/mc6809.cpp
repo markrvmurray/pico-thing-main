@@ -35,7 +35,7 @@ const char *run_state_string[] = {
 // function-local static, so no use site pays for an initialisation guard.
 mc6809 mc6809::instance;
 
-mc6809::mc6809() : task(0u), busy(false), lic(false), vma(false), trace{}
+mc6809::mc6809() : task(0u), trace{}
 {
 	old_bus_state = BUS_RUNNING;
 	bus_state = BUS_RUNNING;
@@ -86,7 +86,6 @@ mc6809::setup(enum run_state rs)
 	old_bus_state = BUS_RUNNING;
 	bus_state = BUS_RUNNING;
 	busy_lic_avma.byte = 0x00u;
-	vma = false;
 #ifdef DEBUG
 	_count_lic = 0u;
 #endif

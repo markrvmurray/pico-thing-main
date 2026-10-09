@@ -329,6 +329,26 @@ static_assert(GPIO_FIRQ == GPIO_NMI + 1 && GPIO_IRQ == GPIO_NMI + 2,
 	      "int_pins drives !NMI/!FIRQ/!IRQ as three consecutive pins");
 
 static volatile bool q_rising_edge = false;
+// TWO MORE "IS THERE ANYTHING TO DO" BYTES FOR THE LOOP, kept by the producers
+// so the pass with nothing to do tests one load each instead of walking the
+// counters (2026-10-10 loop audit, findings 4 and 5).
+//
+// loop_nmi_work: non-zero when the masked update has NMI work - a request
+// counted by the slow path, a watchpoint hit, a DAT fault, or hold passes
+// still to run.  Set by those writers AFTER their source; re-derived from the
+// sources at the end of the masked block, which runs with interrupts off, so
+// no Core 1 writer can interleave with the re-derive and nothing on Core 0
+// writes these sources (the console's NMI request travels in pend).
+//
+// loop_work: non-zero when an ISR has queued something for the drains - a
+// write-ring entry or an RX data read.  console_write_pending is the same for
+// the console's write queue, which Core 0 fills.  Each is cleared by the loop
+// BEFORE it drains, and set by the producer AFTER it produces, so a producer
+// landing on either side of the clear is drained this pass or flagged for the
+// next; the counters underneath stay the exact handshake.
+static volatile uint8_t loop_nmi_work = 0u;
+static volatile uint8_t loop_work = 0u;
+static volatile uint8_t console_write_pending = 0u;
 static volatile bool core1_initialised = false;
 
 mc6850 fast_serial(CONSOLE_CONTROL, CONSOLE_TX_DATA);
@@ -400,6 +420,12 @@ static volatile uint32_t irq_ack_deassert = 0u;	// dropped at the vector fetch
 // /IRQ was asserted, so their ratio is the cycles per taken interrupt.
 static volatile uint32_t irq_vectors = 0u;
 static volatile uint32_t pend_irq_cycles = 0u;
+#if DIAG_ON
+static volatile uint32_t q_armed_missed = 0u;	// a live source with the byte clear for 2+ passes
+static uint32_t q_armed_miss_run = 0u;		// consecutive passes of the above, loop-private
+static volatile uint32_t nmi_work_missed = 0u;	// the same for loop_nmi_work
+static uint32_t nmi_work_miss_run = 0u;
+#endif
 
 // Single-stepping (TODO 1b).  Both halves of a step MUST happen in the same
 // Q-rising pass: clearing the BREAK snippet's spin byte so the guest falls
@@ -474,15 +500,30 @@ static volatile bool step_logging = false;	// armed by the RTI detector
 static volatile uint8_t step_armed_edge = 0u;	// edge the LIC gate fired on
 
 
+// The pin bit each interrupt kind pends, by enum value, so that Core 1's loop
+// turns a device's answer into its bit with one load.  The switch this
+// replaces compiled to shifts of a packed constant, a clz and conditional
+// ORs - about 32 instructions per pass for the four devices, measured in the
+// 2026-10-10 loop audit - to produce three bits.
+static constexpr uint8_t PEND_OF[NUM_INTERRUPTS] = {
+	0u,		// INTERRUPT_ILLEGAL
+	0u,		// INTERRUPT_SWI3
+	0u,		// INTERRUPT_SWI2
+	PEND_FIRQ,	// INTERRUPT_FIRQ
+	PEND_IRQ,	// INTERRUPT_IRQ
+	0u,		// INTERRUPT_SWI
+	PEND_NMI,	// INTERRUPT_NMI
+	0u,		// INTERRUPT_RESET
+	0u,		// INTERRUPT_NONE
+};
+static_assert(PEND_OF[INTERRUPT_FIRQ] == PEND_FIRQ && PEND_OF[INTERRUPT_IRQ] == PEND_IRQ
+	      && PEND_OF[INTERRUPT_NMI] == PEND_NMI && PEND_OF[INTERRUPT_NONE] == 0u,
+	      "PEND_OF is indexed by enum interrupt; its order moved");
+
 static inline uint8_t
 pend_bit(const interrupt eirq)
 {
-	switch (eirq) {
-	case INTERRUPT_NMI:	return PEND_NMI;
-	case INTERRUPT_FIRQ:	return PEND_FIRQ;
-	case INTERRUPT_IRQ:	return PEND_IRQ;
-	default:		return 0u;
-	}
+	return PEND_OF[eirq];
 }
 
 // 50 Hz tick timer (IRQ) + E-cycle countdown (NMI).
@@ -492,13 +533,18 @@ pend_bit(const interrupt eirq)
 // on first use, so there is nothing to get wrong.
 static tick_timer system_tick(registers::getInstance(), SYSTEM_TIMER_CONTROL_13, SYSTEM_TIMER_STATUS);
 
+#if DIAG_ON
+// Read by st and nothing else, so they cost the hot loop nothing unless the
+// diagnostics are built: a read-modify-write per pass and per IRQ pass, and
+// two stores per ring entry (2026-10-10 loop audit).  st prints "off".
 static volatile uint32_t core1_qrise_count = 0u;
 static volatile uint32_t core1_irq_assert_count = 0u;
+#endif
 static volatile uint32_t core1_loop_count = 0u;
+#if DIAG_ON
 static volatile uint32_t core1_write_ring_count = 0u;
-static volatile uint32_t core1_read_irq_count = 0u;
 static volatile uint8_t core1_last_write_loc = 0u;
-static volatile uint8_t core1_last_read_loc = 0u;
+#endif
 static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 
 // Bus trace capture hardware.  Two PIO state machines sample the bus once per
@@ -985,6 +1031,312 @@ isr_cost_reset()
 }
 #endif
 
+// THE ARMED SOURCES, in one place: what the Q-rising handler's slow path is
+// for beyond a bus-state change.  Read by the slow path to re-derive
+// q_rising_armed, and by the DIAG audit in Core 1's loop.  HOW TO CHECK THIS
+// LIST AFTER CHANGING THE SLOW PATH: list every file-scope volatile the slow
+// path reads, and for each ask where it is written - inside BUS_IRQ or only
+// consulted on a state change is already covered, because BUS_IRQ *is* a bus
+// state change; written by Core 0 or another ISR and the handler has to
+// react means it belongs here AND its writer must call q_rising_arm().
+static inline bool
+q_rising_sources()
+{
+	return MC6809.trace_is_capturing()
+	    || step_state != STEP_IDLE
+	    || step_request
+	    || step_arm_cycles != 0u
+	    || dat_fault_block_countdown != 0u
+	    || system_tick.get_nmi_countdown() != 0u;
+}
+
+// THE SLOW HALF OF THE Q-RISING HANDLER: everything that reacts to a bus-state
+// change or serves an armed feature.  Deliberately not inlined into the handler
+// - see the call site for what that costs on the fast path.  It runs in the
+// handler's context, at its priority, with its interrupts; only the register
+// save is different.
+// External linkage, not static: mc6809 names it as a friend, and a friend
+// declaration gives a function external linkage, which a static definition
+// would then contradict.
+void __attribute__((noinline))
+__time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t address_lsb,
+					 const enum bus_state new_bs, const bool reset_now)
+{
+
+	// The count is read here anyway, so fullness is free to spot - and
+	// spotting it is what stops this branch, and the gate above, from
+	// running for ever after the one-shot completes.  trace_armed stays
+	// set so the capture can still be dumped; only the capturing flag
+	// is cleared.  A hardware-triggered capture sits at a count of zero
+	// until its trigger arrives, which is correctly "still capturing".
+	if (MC6809.trace_is_capturing()) {
+		const uint32_t taken = trace_hw_count();
+		if (taken >= TRACE_SIZE)
+			MC6809.trace_capture_done();
+		else
+			MC6809.trace_bla_store(taken, bla);
+	}
+	if (reset_now) {
+		if (MC6809.run_state != RS_RESET)
+			MC6809.run_state = RS_RESET;
+		// Keep the reported state honest while the guest is held: this
+		// branch used to leave bus_state frozen at whatever it was when
+		// the reset pin went low, and status reported that as current.
+		// It is done here rather than ahead of the chain so the running
+		// path below is left exactly as it was - the budget in this
+		// handler is measured in a few instructions, and the cycles
+		// spent here are ones where no bus traffic needs servicing.
+		if (new_bs != MC6809.bus_state) {
+			MC6809.old_bus_state = MC6809.bus_state;
+			MC6809.bus_state = new_bs;
+		}
+	} else if (MC6809.run_state == RS_RESET) {
+		MC6809.run_state = RS_RUNNING;
+		// The guest has started fetching.  Release a trace that was
+		// armed while the bus was still held in reset, so its one-shot
+		// is spent on real cycles rather than idle ones.
+		if (trace_pending_start)
+			trace_hw_start();
+	} else if (new_bs != MC6809.bus_state) {
+		MC6809.old_bus_state = MC6809.bus_state;
+		MC6809.bus_state = new_bs;
+		switch (new_bs) {
+		case BUS_IRQ: {
+			auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
+			if (eirq <= INTERRUPT_RESET)
+				MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
+			// Both the break command and the watchpoint point the NMI
+			// vector at the BREAK snippet, and the vector fetch is the
+			// point at which the frame is on the stack and the copy is
+			// about to run.  This is the bus telling the console the
+			// break has been taken.
+			if (eirq == INTERRUPT_IRQ) {
+				irq_vectors++;
+				// RELEASE /IRQ AT THE ACKNOWLEDGEMENT, which is
+				// what a real device does: hold the request until
+				// the processor fetches the vector, then let go.
+				// The `irq` test command already works this way.
+				//
+				// WHY THE DATA READ IS NOT ENOUGH, measured: with
+				// retirement only in the read ISR the guest took 462
+				// vectors for 308 assertions.  A SPURIOUS entry finds
+				// S_IRQ clear, so the handler never reads the data
+				// register, so that retirement never runs - the line
+				// stays low and the guest re-enters on every RTI until
+				// Core 1's loop catches up.  Releasing here breaks that
+				// regardless of what the handler does.
+				//
+				// It also cannot truncate an unsampled pulse, which is
+				// the trap the read-ISR version fell into: the fetch IS
+				// the proof the processor took it.  If a device still
+				// wants service the loop reasserts on its next pass,
+				// harmlessly, since the 6809 masks I on IRQ entry.
+				//
+				// Masked because the read DMA ISR is priority 0 against
+				// this handler's 1 and so can preempt it; both touch
+				// int_pins_held, and two lost updates on the same bit
+				// would leave the shadow disagreeing with the PIO -
+				// which would make the loop skip a NEEDED assertion.
+				const uint32_t ack = save_and_disable_interrupts();
+				irq_retired = 0xFFu;
+				if (int_pins_held & PEND_IRQ) {
+					const uint32_t oe = int_pins_held
+						& ~static_cast<uint32_t>(PEND_IRQ);
+					int_pins_held = oe;
+					pio_sm_put(int_pins.pio,
+						   static_cast<uint>(int_pins.sm),
+						   oe);
+#if DIAG_ON
+					irq_ack_deassert++;
+#endif
+				}
+				restore_interrupts(ack);
+			}
+			if (eirq == INTERRUPT_NMI) {
+				break_vector_fetched = true;
+				// The guest is entering BREAK again, so it is
+				// long past the spin it fell through: put the
+				// offset back before it gets there.
+				if (step_active)
+					reg[REGISTER_SNIPPET + 14] =
+						static_cast<uint8_t>(0xFEu);
+			}
+			// DELIBERATELY NOT UNIVERSAL (the owner, 2026-10-04).
+			// The brief once asked for every interrupt to switch to
+			// task 0 on entry; this switches only a DAT fault.  So
+			// every other handler runs under the INTERRUPTED task's
+			// own mapping and must switch for itself if it needs
+			// system memory - the DAT only lets task 0 write DAT RAM.
+			// Making the switch universal would change the
+			// environment every NitrOS-9 handler runs in, so the risk
+			// is in the guest rather than here, and this is the only
+			// arrangement proven to boot an OS.  Asked and answered:
+			// leave it.  See also apply_rti(), where the matching
+			// decision not to restore the task lives.
+			//
+			// A DAT fault vectors through NMI, and its handler has to
+			// reach the DAT RAM to reclaim the dead process's pages —
+			// which the GAL only enables for task 0.  (The faulting
+			// instruction is gone: the 6809 takes NMI at an instruction
+			// boundary, so the access has already completed on garbage
+			// and cannot be retried.)  Switch here rather than when the
+			// fault was latched, so the rest of that instruction and the
+			// CPU's register push both happen under the faulting task's
+			// own mapping, and the faulting task is on the task stack
+			// before the handler runs.
+			if (eirq == INTERRUPT_NMI && dat_fault_nmi_pending) {
+				dat_fault_nmi_pending = false;
+				const uint8_t supervisor = MC6809.task_change(0u);
+				reg[SYSTEM_TASK] = supervisor;
+				task_pins_update(supervisor);
+			}
+			// Not DEBUG-only: the interrupt tests deassert on this
+			// count, so it has to be maintained in every build.
+			if (eirq <= INTERRUPT_RESET)
+				MC6809.count_irq_ack(eirq);
+			break;
+		}
+		case BUS_SYNC:  MC6809.run_state = RS_SYNCED; break;
+		case BUS_HALT:  MC6809.run_state = RS_HALTED; break;
+		case BUS_RUNNING:
+			MC6809.run_state = RS_RUNNING;
+			break;
+		default:
+			break;
+		}
+	}
+	// Deferred NMIBlock assertion after a DAT fault, giving the NMI the
+	// GAL raised time to be seen before its D term is taken away.
+	if (dat_fault_block_countdown > 0u && --dat_fault_block_countdown == 0u) {
+		gpio_put(GPIO_NMI_BLOCK, true);
+		reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
+	}
+	// LIC-gated step.  Release and gate are both here for the same
+	// reason the cycle-count path is: from Core 0 the two would be a
+	// millisecond apart, which is not a step.
+	{
+		// The pins, deliberately, and the same read the rest of this
+		// handler uses: see the note on the states.
+		const bool lic_now = (bla & 0x02u) != 0u;	// LIC is bit 1
+		if (step_request) {
+			// Zeroing the BRA's offset turns the snippet's spin into
+			// "branch to the next byte", which is the RTI.
+			reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
+			step_state = STEP_RELEASED;
+			step_gap = 0u;
+			step_request = false;
+			if (step_active) {	// restart the edge log
+				step_pass = 0u;
+				step_edges = 0u;
+				step_armed_edge = 0u;
+				step_logging = true;
+			}
+		}
+		if (step_logging) {
+			if (step_pass < 0xFFu)
+				step_pass++;
+			if (lic_now && !step_prev_lic
+			    && step_edges < STEP_EDGE_MAX)
+				step_edge[step_edges++] = step_pass;
+		}
+		if (step_state == STEP_RELEASED) {
+			if (step_gap < 0xFFu)
+				step_gap++;
+			if (lic_now && !step_prev_lic) {
+				if (step_gap >= RTI_GAP_MIN) {
+					// That edge ended a long gap, so it
+					// is the RTI finishing and the
+					// guest's own instruction is next.
+					// ASSERT IT HERE, NOT VIA CORE 1.
+					// The edge has to land inside this
+					// E cycle: the entire point of the
+					// gate is that the guest executes
+					// exactly ONE more instruction, and
+					// Core 1 is a pass or two away -
+					// which is one or more instructions.
+					// Going through it broke stepping in
+					// d954a2b: "irq 9" fell from ONE
+					// INSTRUCTION PER STEP to 3/5.
+					//
+					// Core 1 deasserts on its next pass,
+					// because its own computed mask has
+					// no NMI in it.  That is fine: NMI is
+					// edge-triggered, so what matters is
+					// when the edge arrives, not how long
+					// the line then stays low.
+					// The hold matters as much as the
+					// edge: without it Core 1's very
+					// next pass recomputes a mask with
+					// no NMI in it and lets the line go,
+					// possibly inside one E cycle, which
+					// is too short for the 6809 to latch
+					// anything.  Asserting without this
+					// gave "no NMI came back".
+					nmi_hold_passes = NMI_HOLD_PASSES;
+					loop_nmi_work = 1u;	// the loop releases after the hold
+					int_pins_held |= PEND_NMI;
+					pio_sm_put(int_pins.pio,
+						   static_cast<uint>(int_pins.sm),
+						   int_pins_held);
+					step_armed_edge = step_edges;
+					step_state = STEP_IDLE;
+				} else {
+					step_gap = 0u;	// still spinning
+				}
+			}
+		}
+		step_prev_lic = lic_now;
+	}
+	// A step asked for: release the guest and arm, in this one pass.
+	// Ordered before the tick below so the cycle armed here is not
+	// immediately spent.
+	if (step_arm_cycles != 0u) {
+		// Zeroing the BRA's offset turns the snippet's spin into
+		// "branch to the next byte", which is the RTI.
+		reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
+		system_tick.arm_countdown(step_arm_cycles);
+		step_arm_cycles = 0u;
+	}
+	// E-cycle countdown NMI timer: $FFC8 bits 5:1 are a 5-bit count,
+	// decremented here once per Q-rising, and the pass it reaches zero
+	// on raises NMI.  So "LDA #(1<<1); STA $FFC8" means NMI after one
+	// E cycle - the single-stepping primitive.
+	//
+	// This was disabled by an #if 0 from e6c56df (March 2026) with no
+	// reason recorded.  Re-enabled 2026-10-04 and proved on the board;
+	// if it misbehaves, the first suspect is that PEND_NMI is shared
+	// with the DAT fault, the watchpoint and break, all of which funnel
+	// through the one nmi_hold_passes pulse - two requests in
+	// the same pass collapse into a single pulse, and only break has a
+	// way (break_vector_fetched) to confirm its own was the one taken.
+	if (system_tick.tick()) {
+		nmi_request_count++;
+		loop_nmi_work = 1u;
+	}
+
+	// THE PINS ARE NOT DRIVEN FROM HERE ANY MORE.  The int_pins state
+	// machine on pio2 re-applies them at every Q rising by itself, and
+	// Core 1 sends it a new word only when the pending set changes -
+	// see interrupt_pins_update().  What used to happen here was a
+	// three-bit mask being recomputed and rewritten a million times a
+	// second, almost always to the value it already held.
+	//
+	// This counter stays because it is a per-E-cycle measure and there
+	// is nowhere else to take it: the E cycles during which /IRQ was
+	// asserted, which st divides by the vector count to report how long
+	// each interrupt was held.
+
+	// RE-DERIVE THE ARMED BYTE, last, after every countdown above has
+	// moved.  Store 0 first, fence, then re-read the sources: a writer that
+	// lands after the re-read stores its 1 after this 0, and one that lands
+	// before it is seen (q_armed.h has the argument).  This is the only
+	// place the byte is cleared.
+	q_rising_armed = 0u;
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (q_rising_sources())
+		q_rising_armed = 1u;
+}
+
 void __isr
 __time_critical_func(gpio_q_irq_handler())
 {
@@ -1010,9 +1362,18 @@ __time_critical_func(gpio_q_irq_handler())
 	// hardware whenever an edge arrives, so an edge that lands while this
 	// pass is still running is latched again and re-enters.  Acknowledging
 	// afterwards would clear that latch and lose the edge.
-	const uint32_t q_events = gpio_get_irq_event_mask(GPIO_Q);
+	// DIRECTLY, NOT THROUGH gpio_get_irq_event_mask(): that helper reads
+	// SIO CPUID and multiplies to find THIS core's INTS register, on every
+	// entry, to answer a question whose answer is fixed - this handler runs
+	// on core 1 and nowhere else.  Same registers, same acknowledge, minus
+	// the lookup.  GPIO_Q is 1, so its four event bits are 4-7 of word 0.
+	static_assert(GPIO_Q < 8u, "GPIO_Q's event bits are assumed to be in "
+				   "ints[0]/intr[0]; move the indexing with the pin");
+	constexpr uint32_t Q_SHIFT = 4u * (GPIO_Q % 8u);
+	const uint32_t q_events =
+		(io_bank0_hw->proc1_irq_ctrl.ints[GPIO_Q / 8u] >> Q_SHIFT) & 0xFu;
 
-	gpio_acknowledge_irq(GPIO_Q, q_events & GPIO_IRQ_EDGE_RISE);
+	io_bank0_hw->intr[GPIO_Q / 8u] = (q_events & GPIO_IRQ_EDGE_RISE) << Q_SHIFT;
 	if (q_events & GPIO_IRQ_EDGE_RISE) {
 		// Counted here rather than on entry: one increment per E cycle
 		// instead of two, and it then measures the same event as
@@ -1105,284 +1466,27 @@ __time_critical_func(gpio_q_irq_handler())
 		// acia_torture passed throughout BOTH of those, which is why it
 		// alone cannot clear a change to this handler.  The DAT fault test
 		// and "irq 9" are what found them.
-		const bool armed = MC6809.trace_is_capturing()
-				|| step_state != STEP_IDLE
-				|| step_request
-				|| step_arm_cycles != 0u
-				|| dat_fault_block_countdown != 0u
-				|| system_tick.get_nmi_countdown() != 0u;
-		if (!bus_changed && !armed) {
-#if DIAG_ON
-			if (pending_interrupts & PEND_IRQ)
-				pend_irq_cycles++;
-#endif
-			goto q_done;
-		}
-
-		// The count is read here anyway, so fullness is free to spot - and
-		// spotting it is what stops this branch, and the gate above, from
-		// running for ever after the one-shot completes.  trace_armed stays
-		// set so the capture can still be dumped; only the capturing flag
-		// is cleared.  A hardware-triggered capture sits at a count of zero
-		// until its trigger arrives, which is correctly "still capturing".
-		if (MC6809.trace_is_capturing()) {
-			const uint32_t taken = trace_hw_count();
-			if (taken >= TRACE_SIZE)
-				MC6809.trace_capture_done();
-			else
-				MC6809.trace_bla_store(taken, bla);
-		}
-		if (reset_now) {
-			if (MC6809.run_state != RS_RESET)
-				MC6809.run_state = RS_RESET;
-			// Keep the reported state honest while the guest is held: this
-			// branch used to leave bus_state frozen at whatever it was when
-			// the reset pin went low, and status reported that as current.
-			// It is done here rather than ahead of the chain so the running
-			// path below is left exactly as it was - the budget in this
-			// handler is measured in a few instructions, and the cycles
-			// spent here are ones where no bus traffic needs servicing.
-			if (new_bs != MC6809.bus_state) {
-				MC6809.old_bus_state = MC6809.bus_state;
-				MC6809.bus_state = new_bs;
-			}
-		} else if (MC6809.run_state == RS_RESET) {
-			MC6809.run_state = RS_RUNNING;
-			// The guest has started fetching.  Release a trace that was
-			// armed while the bus was still held in reset, so its one-shot
-			// is spent on real cycles rather than idle ones.
-			if (trace_pending_start)
-				trace_hw_start();
-		} else if (new_bs != MC6809.bus_state) {
-			MC6809.old_bus_state = MC6809.bus_state;
-			MC6809.bus_state = new_bs;
-			switch (new_bs) {
-			case BUS_IRQ: {
-				auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
-				if (eirq <= INTERRUPT_RESET)
-					MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
-				// Both the break command and the watchpoint point the NMI
-				// vector at the BREAK snippet, and the vector fetch is the
-				// point at which the frame is on the stack and the copy is
-				// about to run.  This is the bus telling the console the
-				// break has been taken.
-				if (eirq == INTERRUPT_IRQ) {
-					irq_vectors++;
-					// RELEASE /IRQ AT THE ACKNOWLEDGEMENT, which is
-					// what a real device does: hold the request until
-					// the processor fetches the vector, then let go.
-					// The `irq` test command already works this way.
-					//
-					// WHY THE DATA READ IS NOT ENOUGH, measured: with
-					// retirement only in the read ISR the guest took 462
-					// vectors for 308 assertions.  A SPURIOUS entry finds
-					// S_IRQ clear, so the handler never reads the data
-					// register, so that retirement never runs - the line
-					// stays low and the guest re-enters on every RTI until
-					// Core 1's loop catches up.  Releasing here breaks that
-					// regardless of what the handler does.
-					//
-					// It also cannot truncate an unsampled pulse, which is
-					// the trap the read-ISR version fell into: the fetch IS
-					// the proof the processor took it.  If a device still
-					// wants service the loop reasserts on its next pass,
-					// harmlessly, since the 6809 masks I on IRQ entry.
-					//
-					// Masked because the read DMA ISR is priority 0 against
-					// this handler's 1 and so can preempt it; both touch
-					// int_pins_held, and two lost updates on the same bit
-					// would leave the shadow disagreeing with the PIO -
-					// which would make the loop skip a NEEDED assertion.
-					const uint32_t ack = save_and_disable_interrupts();
-					irq_retired = 0xFFu;
-					if (int_pins_held & PEND_IRQ) {
-						const uint32_t oe = int_pins_held
-							& ~static_cast<uint32_t>(PEND_IRQ);
-						int_pins_held = oe;
-						pio_sm_put(int_pins.pio,
-							   static_cast<uint>(int_pins.sm),
-							   oe);
-#if DIAG_ON
-						irq_ack_deassert++;
-#endif
-					}
-					restore_interrupts(ack);
-				}
-				if (eirq == INTERRUPT_NMI) {
-					break_vector_fetched = true;
-					// The guest is entering BREAK again, so it is
-					// long past the spin it fell through: put the
-					// offset back before it gets there.
-					if (step_active)
-						reg[REGISTER_SNIPPET + 14] =
-							static_cast<uint8_t>(0xFEu);
-				}
-				// DELIBERATELY NOT UNIVERSAL (the owner, 2026-10-04).
-				// The brief once asked for every interrupt to switch to
-				// task 0 on entry; this switches only a DAT fault.  So
-				// every other handler runs under the INTERRUPTED task's
-				// own mapping and must switch for itself if it needs
-				// system memory - the DAT only lets task 0 write DAT RAM.
-				// Making the switch universal would change the
-				// environment every NitrOS-9 handler runs in, so the risk
-				// is in the guest rather than here, and this is the only
-				// arrangement proven to boot an OS.  Asked and answered:
-				// leave it.  See also apply_rti(), where the matching
-				// decision not to restore the task lives.
-				//
-				// A DAT fault vectors through NMI, and its handler has to
-				// reach the DAT RAM to reclaim the dead process's pages —
-				// which the GAL only enables for task 0.  (The faulting
-				// instruction is gone: the 6809 takes NMI at an instruction
-				// boundary, so the access has already completed on garbage
-				// and cannot be retried.)  Switch here rather than when the
-				// fault was latched, so the rest of that instruction and the
-				// CPU's register push both happen under the faulting task's
-				// own mapping, and the faulting task is on the task stack
-				// before the handler runs.
-				if (eirq == INTERRUPT_NMI && dat_fault_nmi_pending) {
-					dat_fault_nmi_pending = false;
-					const uint8_t supervisor = MC6809.task_change(0u);
-					reg[SYSTEM_TASK] = supervisor;
-					task_pins_update(supervisor);
-				}
-				// Not DEBUG-only: the interrupt tests deassert on this
-				// count, so it has to be maintained in every build.
-				if (eirq <= INTERRUPT_RESET)
-					MC6809.count_irq_ack(eirq);
-				break;
-			}
-			case BUS_SYNC:  MC6809.run_state = RS_SYNCED; break;
-			case BUS_HALT:  MC6809.run_state = RS_HALTED; break;
-			case BUS_RUNNING:
-				MC6809.run_state = RS_RUNNING;
-				break;
-			default:
-				break;
-			}
-		}
-		// Deferred NMIBlock assertion after a DAT fault, giving the NMI the
-		// GAL raised time to be seen before its D term is taken away.
-		if (dat_fault_block_countdown > 0u && --dat_fault_block_countdown == 0u) {
-			gpio_put(GPIO_NMI_BLOCK, true);
-			reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
-		}
-		// LIC-gated step.  Release and gate are both here for the same
-		// reason the cycle-count path is: from Core 0 the two would be a
-		// millisecond apart, which is not a step.
-		{
-			// The pins, deliberately, and the same read the rest of this
-			// handler uses: see the note on the states.
-			const bool lic_now = (bla & 0x02u) != 0u;	// LIC is bit 1
-			if (step_request) {
-				// Zeroing the BRA's offset turns the snippet's spin into
-				// "branch to the next byte", which is the RTI.
-				reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
-				step_state = STEP_RELEASED;
-				step_gap = 0u;
-				step_request = false;
-				if (step_active) {	// restart the edge log
-					step_pass = 0u;
-					step_edges = 0u;
-					step_armed_edge = 0u;
-					step_logging = true;
-				}
-			}
-			if (step_logging) {
-				if (step_pass < 0xFFu)
-					step_pass++;
-				if (lic_now && !step_prev_lic
-				    && step_edges < STEP_EDGE_MAX)
-					step_edge[step_edges++] = step_pass;
-			}
-			if (step_state == STEP_RELEASED) {
-				if (step_gap < 0xFFu)
-					step_gap++;
-				if (lic_now && !step_prev_lic) {
-					if (step_gap >= RTI_GAP_MIN) {
-						// That edge ended a long gap, so it
-						// is the RTI finishing and the
-						// guest's own instruction is next.
-						// ASSERT IT HERE, NOT VIA CORE 1.
-						// The edge has to land inside this
-						// E cycle: the entire point of the
-						// gate is that the guest executes
-						// exactly ONE more instruction, and
-						// Core 1 is a pass or two away -
-						// which is one or more instructions.
-						// Going through it broke stepping in
-						// d954a2b: "irq 9" fell from ONE
-						// INSTRUCTION PER STEP to 3/5.
-						//
-						// Core 1 deasserts on its next pass,
-						// because its own computed mask has
-						// no NMI in it.  That is fine: NMI is
-						// edge-triggered, so what matters is
-						// when the edge arrives, not how long
-						// the line then stays low.
-						// The hold matters as much as the
-						// edge: without it Core 1's very
-						// next pass recomputes a mask with
-						// no NMI in it and lets the line go,
-						// possibly inside one E cycle, which
-						// is too short for the 6809 to latch
-						// anything.  Asserting without this
-						// gave "no NMI came back".
-						nmi_hold_passes = NMI_HOLD_PASSES;
-						int_pins_held |= PEND_NMI;
-						pio_sm_put(int_pins.pio,
-							   static_cast<uint>(int_pins.sm),
-							   int_pins_held);
-						step_armed_edge = step_edges;
-						step_state = STEP_IDLE;
-					} else {
-						step_gap = 0u;	// still spinning
-					}
-				}
-			}
-			step_prev_lic = lic_now;
-		}
-		// A step asked for: release the guest and arm, in this one pass.
-		// Ordered before the tick below so the cycle armed here is not
-		// immediately spent.
-		if (step_arm_cycles != 0u) {
-			// Zeroing the BRA's offset turns the snippet's spin into
-			// "branch to the next byte", which is the RTI.
-			reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
-			system_tick.arm_countdown(step_arm_cycles);
-			step_arm_cycles = 0u;
-		}
-		// E-cycle countdown NMI timer: $FFC8 bits 5:1 are a 5-bit count,
-		// decremented here once per Q-rising, and the pass it reaches zero
-		// on raises NMI.  So "LDA #(1<<1); STA $FFC8" means NMI after one
-		// E cycle - the single-stepping primitive.
-		//
-		// This was disabled by an #if 0 from e6c56df (March 2026) with no
-		// reason recorded.  Re-enabled 2026-10-04 and proved on the board;
-		// if it misbehaves, the first suspect is that PEND_NMI is shared
-		// with the DAT fault, the watchpoint and break, all of which funnel
-		// through the one nmi_hold_passes pulse - two requests in
-		// the same pass collapse into a single pulse, and only break has a
-		// way (break_vector_fetched) to confirm its own was the one taken.
-		if (system_tick.tick())
-			nmi_request_count++;
-
-		// THE PINS ARE NOT DRIVEN FROM HERE ANY MORE.  The int_pins state
-		// machine on pio2 re-applies them at every Q rising by itself, and
-		// Core 1 sends it a new word only when the pending set changes -
-		// see interrupt_pins_update().  What used to happen here was a
-		// three-bit mask being recomputed and rewritten a million times a
-		// second, almost always to the value it already held.
-		//
-		// This counter stays because it is a per-E-cycle measure and there
-		// is nowhere else to take it: the E cycles during which /IRQ was
-		// asserted, which st divides by the vector count to report how long
-		// each interrupt was held.
+		// ONE LOAD, NOT SIX: q_rising_armed is kept by the writers of the
+		// sources listed in q_rising_sources() - see q_armed.h for the
+		// rule and the ordering argument - and the slow path re-derives it
+		// when it runs.  The six-way test it replaces cost ~10 clk_sys
+		// cycles per E cycle, one of its loads needing a movw to reach an
+		// object offset of 0x7039.
+		const bool armed = q_rising_armed != 0u;
+		// THE BODY IS A SEPARATE FUNCTION, and noinline, so that this fast
+		// path - which is what runs on almost every E cycle - saves only
+		// the registers IT needs.  With the 300 lines below inlined here
+		// the prologue was stmdb {r4-r11, lr}: nine registers pushed and
+		// popped per E cycle for a path that uses about four of them,
+		// ~14 clk_sys cycles out of a 128-cycle budget at 2.5 MHz.  The
+		// slow path pays a bl and its own prologue only when it runs,
+		// which is on a bus-state change or while something is armed.
+		if (bus_changed || armed)
+			q_rising_slow_path(bla, address_lsb, new_bs, reset_now);
 #if DIAG_ON
 		if (pending_interrupts & PEND_IRQ)
 			pend_irq_cycles++;
 #endif
-q_done:;
 	}
 #if TESTPOINTS_ON
 	gpio_put(GPIO_TRACE_D, false);
@@ -1451,8 +1555,10 @@ __time_critical_func(pio_bus_fault_irq_handler())
 
 	// Arm the mask rather than raising it here: see the note by
 	// DAT_FAULT_BLOCK_DELAY.
-	if constexpr (DAT_FAULT_AUTO_BLOCK)
+	if constexpr (DAT_FAULT_AUTO_BLOCK) {
 		dat_fault_block_countdown = DAT_FAULT_BLOCK_DELAY;
+		q_rising_arm();
+	}
 	// Tell the BUS_IRQ case that the NMI now on its way is a fault, so it
 	// can drop the guest into task 0 for the handler.
 	dat_fault_nmi_pending = true;
@@ -1471,6 +1577,7 @@ __time_critical_func(pio_bus_fault_irq_handler())
 	// same priority as that one and on the same core, so neither can preempt
 	// the other part-way through this read-modify-write.
 	dat_fault_nmi_request = true;
+	loop_nmi_work = 1u;
 	// Nothing else writes bits 2-6.  The NMIBlock bit is not set here: it
 	// mirrors the pin, and the pin is not up yet.
 	reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(
@@ -1492,8 +1599,6 @@ __time_critical_func(pio_bus_fault_irq_handler())
 // This reacts to a read after the fact. Consider breaking
 // the DMA chain and deciding what to return on the fly.
 
-static volatile bool read_irq_received = false;
-static volatile uint8_t read_location;
 // Dedicated lossless counter for CONSOLE_RX_DATA reads.
 // The shared read_irq_received slot can be overwritten before Core 1 processes
 // it (e.g. a CONSOLE_STATUS read ISR fires right after a CONSOLE_RX_DATA read
@@ -1574,6 +1679,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// ISR fired before Core 1 drained it, causing guest_receive() to be
 			// skipped and RDRF to stay set with a stale byte.
 			rx_read_count++;
+			loop_work = 1u;
 			// Fast-path: clear RDRF/IRQ immediately so the next 6809 status
 			// read sees the change.  guest_receive() will stage the next byte
 			// (if any) and re-set RDRF on the next for(;;) iteration.
@@ -1616,6 +1722,7 @@ __time_critical_func(dma_bus_read_irq_handler())
 #endif
 		} else if (loc == AUX_RX_DATA) {
 			aux_rx_read_count++;
+			loop_work = 1u;
 			aux_serial.rx_read_fast_path();
 		} else if (loc == SYSTEM_TIMER_STATUS) {
 			// Reading the timer status register acknowledges the IRQ.
@@ -1629,10 +1736,11 @@ __time_critical_func(dma_bus_read_irq_handler())
 			// anything while a fault is latched, and the next fault
 			// overwrites it, so the guest can read the two in either order.
 			reg[SYSTEM_DAT_FAULT] &= static_cast<uint8_t>(~DAT_FAULT_LATCHED);
-		} else {
-			read_location = loc;
-			read_irq_received = true;
 		}
+		// No "else": a device register with nothing to do here used to be
+		// handed to Core 1's loop through a single slot, whose consumer
+		// was a switch in which every case was `break`.  Two volatile
+		// stores per such read, for nothing.
 	}
 #if TESTPOINTS_ON
 	gpio_put(GPIO_TRACE_C, false);
@@ -1755,7 +1863,7 @@ alignas(WRITE_ADDR_RING_SIZE) static volatile uint8_t
 static uint32_t write_addr_ring_tail = 0u;	// the ISR is its only reader
 static constexpr int WRITE_ADDR_RING_CHANNEL = 6;
 static constexpr int WRITE_DATA_RING_CHANNEL = 7;
-#ifdef DEBUG
+#if DIAG_ON
 // HOW MANY ENTRIES ONE INTERRUPT HAD TO DRAIN, worst case.  1 through several
 // runs, then 2 with one shared at 2.4 MHz - so coalescing is real but rare, and
 // a short run reading 1 proves nothing either way.  It is the dominant register
@@ -1833,6 +1941,39 @@ static volatile uint32_t console_writes_done = 0u;	// counted by Core 1
 static void
 __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 {
+	// THE HOTTEST CASE FIRST, and it used to be LAST.
+	//
+	// $FFD0-$FFFF is plain memory to the guest - the shared buffer during a
+	// block copy, the snippet area, the vectors - and it is far and away the
+	// commonest write here, which is exactly why the dispatch ring already
+	// filters it out (see the note further down).  Yet it was reached only
+	// after NINE device-register comparisons it can never match, on a handler
+	// measured at 124 clk_sys cycles mean against a budget of 133 at 2.4 MHz
+	// and 128 at 2.5 - see write_cost and the project note write-isr-cost.
+	//
+	// One range test decides it now.  The device registers pay an extra
+	// compare instead, and they are both rarer and already paced by their own
+	// handshakes.
+	//
+	// Every dispatched register is at offset 0x00-0x0C, so none of them can be
+	// shadowed by this early return; the static_assert on the ring filter
+	// below says the same thing and would fail if one moved.
+	if (wloc >= REGISTER_BUFFER_OFFSET) {
+		static_assert(REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN * 3u
+			      == registers::register_length,
+			      "the three mirrored blocks are assumed to reach the end "
+			      "of the register window, which is what lets a single "
+			      ">= test stand in for the old range test");
+		// The watchpoint deliberately does NOT copy: the byte stays in the
+		// write side while the read side keeps its old value, and that is
+		// what protects the BREAK handler and the vectors it guards.
+		if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET) {
+			watchpoint_nmi_pending = true;
+			loop_nmi_work = 1u;
+		} else
+			reg[wloc] = wval;
+		return;
+	}
 	// Special-case any writes that need to be handled before the next guest
 	// instruction picks up an incorrect read. I.e., these need to be _fast_.
 	if (wloc == SYSTEM_TASK) {
@@ -1904,10 +2045,6 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 	// CPU is concerned. When watchpoint is armed, writes to snippet space ($FFE0-$FFEF) and
 	// vector area ($FFF0-$FFFF) are blocked and trigger NMI — protects both the BREAK handler
 	// and the vectors it guards.
-	else if (watchpoint_armed && wloc >= REGISTER_SNIPPET_OFFSET)
-		watchpoint_nmi_pending = true;
-	else if (wloc >= REGISTER_BUFFER_OFFSET && wloc < REGISTER_BUFFER_OFFSET + REGISTER_BUFFER_LEN*3)
-		reg[wloc] = wval;
 	// QUEUE ONLY WHAT THE DISPATCH WILL ACT ON.  Core 1's switch handles
 	// SYSTEM_TASK, SYSTEM_REQUEST, SYSTEM_SUBREQUEST, SYSTEM_WATCHPOINT,
 	// CONSOLE_CONTROL, CONSOLE_TX_DATA, AUX_CONTROL and AUX_TX_DATA - every
@@ -1946,6 +2083,7 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		write_ring[h].location = wloc;
 		write_ring[h].value = wval;
 		write_ring_head = next_h;
+		loop_work = 1u;
 	}
 }
 
@@ -1975,14 +2113,14 @@ __time_critical_func(dma_bus_write_irq_handler())
 	// anything that arrives during the drain keeps its entry and is taken by
 	// the next interrupt, which the chain is guaranteed to raise.
 	const uint32_t head = write_addr_ring_head();
-#ifdef DEBUG
+#if DIAG_ON
 	uint32_t drained = 0u;
 #endif
 	while (write_addr_ring_tail != head) {
 		const uint32_t ring_slot = write_addr_ring_tail;
 		const uintptr_t addr = write_addr_ring[ring_slot];
 		write_addr_ring_tail = (ring_slot + 1u) & WRITE_ADDR_RING_MASK;
-#ifdef DEBUG
+#if DIAG_ON
 		drained++;
 #endif
 		// The tail advances either way, so a write made while the guest
@@ -2001,7 +2139,9 @@ __time_critical_func(dma_bus_write_irq_handler())
 			bus_write_followup(wloc, wval);
 		}
 	}
-#ifdef DEBUG
+#if DIAG_ON
+	// Three volatile read-modify-writes on every write interrupt, for a
+	// number only st ever reads: the "pure user" tier, so behind DIAG_ON.
 	if (drained > write_addr_ring_worst)
 		write_addr_ring_worst = drained;
 	if (drained > 1u)
@@ -3768,20 +3908,28 @@ status_gather(status_snapshot_t *s)
 	s->tick_irq_pending = system_tick.is_irq_pending();
 
 	s->core1_loop = core1_loop_count;
+#if DIAG_ON
 	s->core1_qrise = core1_qrise_count;
 	s->core1_irq_assert = core1_irq_assert_count;
 	s->core1_write_ring = core1_write_ring_count;
+#else
+	s->core1_qrise = s->core1_irq_assert = s->core1_write_ring = 0u;
+#endif
 #ifdef DEBUG
 	// Guarded to match the field, which lives in status.h's DEBUG section -
 	// as do the increment and the report, so all three agree.
 	s->write_ring_overflow = write_ring_overflow;
+#if DIAG_ON
 	s->write_addr_worst = write_addr_ring_worst;
 	s->write_addr_coalesced = write_addr_ring_coalesced;
 	s->write_addr_overflow = write_addr_ring_overflow;
 #endif
-	s->core1_read_irq = core1_read_irq_count;
+#endif
+#if DIAG_ON
 	s->core1_last_write = core1_last_write_loc;
-	s->core1_last_read = core1_last_read_loc;
+#else
+	s->core1_last_write = 0u;
+#endif
 	s->core1_isr = core1_isr_count;
 	{
 		volatile uint32_t *bottom = &__StackOneBottom;
@@ -4225,11 +4373,22 @@ status_print(const status_snapshot_t *s)
 	//
 	// Loop against ISR is the pair worth watching: it is the starvation ratio.
 	// 12.7:1 before the filter, 1.95:1 after it.
-	printf("       Loop     Q Rise   IRQ Asrt   Wrt Ring   Read IRQ        ISR\n");
+	// No "Read IRQ" column any more: the single-slot path it counted was
+	// deleted, its consumer having been a switch of nothing but `break`.
+	printf("       Loop     Q Rise   IRQ Asrt   Wrt Ring        ISR\n");
+#if DIAG_ON
 	printf("  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32
-	       "  %9" PRIu32 "  %9" PRIu32 "  %9" PRIu32 "\n",
+	       "  %9" PRIu32 "  %9" PRIu32 "\n",
 	       s->core1_loop, s->core1_qrise, s->core1_irq_assert,
-	       s->core1_write_ring, s->core1_read_irq, s->core1_isr);
+	       s->core1_write_ring, s->core1_isr);
+#else
+	// A GATED-OFF COUNTER PRINTS "off", NEVER 0 (see the ACIA status
+	// column): these three live in the loop and are read by nothing but
+	// this table, so the production build does not keep them.
+	printf("  %9" PRIu32 "        off        off        off  %9" PRIu32
+	       "  (build with -D PICO_THING_DIAG=1)\n",
+	       s->core1_loop, s->core1_isr);
+#endif
 #ifdef DEBUG
 	// THE RING OVERFLOW, called out rather than tabulated.  Each one is a
 	// guest write whose dispatch was dropped because the loop did not drain
@@ -4247,6 +4406,7 @@ status_print(const status_snapshot_t *s)
 	// the old single-slot ISR would have dropped.  Measured 2 with one shared at
 	// 2.4 MHz, so it is rare - the bulk of the loss was the read-after-overwrite
 	// race on the data channel's write_addr, which this does not count.
+#if DIAG_ON
 	printf("  Write completions: worst %" PRIu32 " per interrupt, %" PRIu32
 	       " shared one (%u entries of ring)\n",
 	       s->write_addr_worst, s->write_addr_coalesced,
@@ -4255,9 +4415,15 @@ status_print(const status_snapshot_t *s)
 		printf("  *** WRITE ADDRESS RING LAPPED x%" PRIu32 " - make it"
 		       " bigger; a write address may have been lost ***\n",
 		       s->write_addr_overflow);
+#else
+	printf("  Write completions: off (build with -D PICO_THING_DIAG=1)\n");
 #endif
-	printf("  Last Write: %02X   Last Read: %02X\n",
-	       s->core1_last_write, s->core1_last_read);
+#endif
+#if DIAG_ON
+	printf("  Last Write: %02X\n", s->core1_last_write);
+#else
+	printf("  Last Write: off (build with -D PICO_THING_DIAG=1)\n");
+#endif
 	printf("  Stack Total: %" PRIu32 "  Free (min): %" PRIu32
 	       "  Used (max): %" PRIu32 "\n",
 	       s->core1_stack_total, s->core1_stack_free,
@@ -4299,6 +4465,17 @@ status_print(const status_snapshot_t *s)
 #else
 	printf("    /IRQ: where it was raised and dropped is off"
 	       " (build with -D PICO_THING_DIAG=1)\n");
+#endif
+#if DIAG_ON
+	printf("    Armed byte: %" PRIu32 " time%s a live source found it clear for two passes%s\n",
+	       q_armed_missed, q_armed_missed == 1u ? "" : "s",
+	       q_armed_missed ? "  *** A WRITER IS MISSING q_rising_arm() ***" : "");
+	printf("    NMI-work byte: %" PRIu32 " time%s a live source found it clear for two passes%s\n",
+	       nmi_work_missed, nmi_work_missed == 1u ? "" : "s",
+	       nmi_work_missed ? "  *** A WRITER IS MISSING loop_nmi_work = 1 ***" : "");
+#else
+	printf("    Armed byte audit: off (build with -D PICO_THING_DIAG=1)\n");
+	printf("    NMI-work byte audit: off (build with -D PICO_THING_DIAG=1)\n");
 #endif
 	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
 	       s->aux_acia.interrupt_status,
@@ -4389,10 +4566,12 @@ status_json(const status_snapshot_t *s)
 	printf(",\"core1_loop\":%" PRIu32 ",\"core1_qrise\":%" PRIu32
 	       ",\"core1_irq_assert\":%" PRIu32,
 	       s->core1_loop, s->core1_qrise, s->core1_irq_assert);
-	printf(R"(,"core1_write_ring":%)" PRIu32 R"(,"core1_read_irq":%)" PRIu32,
-	       s->core1_write_ring, s->core1_read_irq);
-	printf(R"(,"core1_last_write":%u,"core1_last_read":%u,"core1_isr":%)" PRIu32,
-	       s->core1_last_write, s->core1_last_read, s->core1_isr);
+	printf(R"(,"core1_write_ring":%)" PRIu32, s->core1_write_ring);
+	printf(R"(,"core1_last_write":%u,"core1_isr":%)" PRIu32,
+	       s->core1_last_write, s->core1_isr);
+	// The three loop counters and last_write above are 0 on a build that
+	// does not keep them; this says which kind of 0 that is.
+	printf(R"(,"core1_counters":%s)", DIAG_ON ? "true" : "false");
 	printf(R"(,"core1_stack_total":%)" PRIu32 R"(,"core1_stack_free":%)" PRIu32,
 	       s->core1_stack_total, s->core1_stack_free);
 	printf(",");
@@ -4654,6 +4833,7 @@ status_done:
 				};
 				if (!queue_try_add(&console_write_queue, &w))
 					break;
+				console_write_pending = 1u;	// after the add: the loop clears before it drains
 			}
 			if (queued < count)
 				printf("Console write queue full - %u of %u bytes queued\n", queued, count);
@@ -5421,6 +5601,7 @@ status_done:
 					step_request = true;		// gate on the next opcode fetch
 				else
 					step_arm_cycles = STEP_ARM_CYCLES;
+				q_rising_arm();
 				waited = 0u;
 				while (!break_vector_fetched && ++waited <= 1000u)
 					sleep_ms(1u);
@@ -6367,8 +6548,9 @@ poll_console()
 						printf("*** ISRs still running — thread mode starved or hung\n");
 					printf("  loop=%" PRIu32 "  isr=%" PRIu32 "\n",
 					       cur_loop, cur_isr);
-					printf("  last_write=%02X  last_read=%02X\n",
-					       core1_last_write_loc, core1_last_read_loc);
+#if DIAG_ON
+					printf("  last_write=%02X\n", core1_last_write_loc);
+#endif
 					printf("  pending_interrupts=%02X  write_ring: head=%u tail=%u\n",
 					       pending_interrupts, write_ring_head, write_ring_tail);
 					printf("  ACIA: int_status=%02X  Aux: int_status=%02X\n",
@@ -6563,7 +6745,16 @@ __no_inline_not_in_flash_func(main_core1)()
 	// while the guest was powered off.
 	static bool q_handler_added = false;
 	if (!q_handler_added) {
-		gpio_add_raw_irq_handler(GPIO_Q, gpio_q_irq_handler);
+		// EXCLUSIVE, NOT SHARED.  gpio_add_raw_irq_handler() installs a
+		// shared handler, which the SDK dispatches through its
+		// irq_handler_chain trampoline: slot -> first_slot (push, load,
+		// bx) -> handler -> slot's pop {pc}.  About a dozen cycles on
+		// EVERY Q-rising, to arbitrate between handlers of which there is
+		// exactly one - nothing else on core 1 uses IO_IRQ_BANK0, and no
+		// gpio callback is installed.  An exclusive handler goes straight
+		// into the RAM vector table.  gpio_set_irq_enabled() below is
+		// independent of how the handler was installed.
+		irq_set_exclusive_handler(IO_IRQ_BANK0, gpio_q_irq_handler);
 		q_handler_added = true;
 	}
 	gpio_set_irq_enabled(GPIO_Q, GPIO_IRQ_EDGE_RISE, true);
@@ -6716,7 +6907,9 @@ __no_inline_not_in_flash_func(main_core1)()
 		// Interrupts need to be done before the falling edge of Q
 		if (q_rising_edge) {
 			q_rising_edge = false;
+#if DIAG_ON
 			core1_qrise_count++;
+#endif
 
 			// Ask each device what it wants and keep the three bits the
 			// pins can carry.  This used to count into a
@@ -6743,23 +6936,116 @@ __no_inline_not_in_flash_func(main_core1)()
 				| (tck == INTERRUPT_IRQ ? IRQ_SRC_TICK         : 0u)
 				| (fst == INTERRUPT_IRQ ? IRQ_SRC_CONSOLE_ACIA : 0u)
 				| (axs == INTERRUPT_IRQ ? IRQ_SRC_AUX_ACIA     : 0u));
+#if DIAG_ON
 			if (pend & PEND_IRQ)
 				core1_irq_assert_count++;
-			// Masked for the update only.  irq_retired is cleared because
-			// the has_interrupt() calls above have just read the devices,
-			// so their answer supersedes any earlier retirement; one that
-			// lands straight after the clear applies to the next pass.
-			const uint32_t irq_saved = save_and_disable_interrupts();
-			const bool was_irq = (int_pins_held & PEND_IRQ) != 0u;
-			pending_interrupts = pend;
-			irq_sources = src;
-			irq_retired = 0u;
-			interrupt_pins_update();
-#if DIAG_ON
-			if (!was_irq && (int_pins_held & PEND_IRQ))
-				irq_loop_assert++;
 #endif
-			restore_interrupts(irq_saved);
+			// ONLY WHEN SOMETHING WOULD CHANGE.  The masked block below
+			// ran on every pass - about 45 clk_sys cycles with interrupts
+			// off, every pass, which at 2.5 MHz is a third of an E cycle
+			// during which no DMA completion can be serviced, for an
+			// update that almost never changed anything.  Measured as part
+			// of the loop's 405-cycle pass in the Core 1 audit.
+			//
+			// THE WRONG GATE, and why: "pend unchanged since last pass".
+			// The vector-fetch release in the Q handler drops /IRQ while
+			// the ACIA still wants service, and it is THIS block on the
+			// next pass that puts it back up - pend is unchanged, the pin
+			// is not.  So the comparison is against the PIN, int_pins_held,
+			// not against last time.  The NMI inputs are listed because
+			// interrupt_pins_update() consumes them, and nmi_hold_passes
+			// because it is a countdown that block decrements - skipping
+			// it would hold /NMI low for ever.  int_pins_held and the NMI
+			// flags are read unmasked: a race means the block runs one
+			// pass late or one pass extra, both harmless.
+			//
+			// The four polls above stay OUTSIDE this gate on purpose:
+			// console_has_interrupt() consumes a request on read, and the
+			// two ACIA polls stage the next byte.
+			//
+			// NMI IS IN THE PIN COMPARISON, AND IT HAS TO BE.  The first
+			// cut compared only FIRQ and IRQ, reasoning that the NMI
+			// inputs were all named in nmi_work.  They were - but the
+			// RELEASE is not an input.  interrupt_pins_update() holds the
+			// pin for nmi_hold_passes passes and lets go on the pass
+			// AFTER the count reaches zero, when it computes an oe
+			// without NMI and finds it differs from the pin.  On that
+			// pass nothing in nmi_work is true any more, so the block was
+			// skipped and /NMI stayed low for ever.  irq 2 and irq 5
+			// passed, because they test the EDGE; irq 8 failed, because
+			// a second DAT fault needs a second edge on a line that was
+			// never released.  With NMI in the mask, held-but-not-wanted
+			// is a difference, the block runs once more, and releases.
+			//
+			// ONE STRAIGHT-LINE OR, NOT A SHORT-CIRCUIT CHAIN.  On the pass
+			// that has nothing to do - almost all of them - every term is
+			// false, so || evaluated every load anyway; what it added was
+			// a branch per term, and the compiler, short of registers in
+			// those arms, re-materialised four base addresses with
+			// movw/movt in each of them: ~20 instructions a pass for no
+			// load saved (2026-10-10 loop audit).  The loads are the same;
+			// the arms are gone.
+			const uint8_t held = static_cast<uint8_t>(int_pins_held);
+			const uint8_t pins_differ = static_cast<uint8_t>(
+				(pend ^ held) & (PEND_NMI | PEND_FIRQ | PEND_IRQ));
+			// The NMI work is one byte now (loop_nmi_work, see its
+			// declaration); a console NMI request arrives in pend and is
+			// caught by pins_differ, whose mask includes PEND_NMI.
+			if ((pins_differ | loop_nmi_work | static_cast<uint8_t>(src ^ irq_sources)) != 0u) {
+				// Masked for the update only.  irq_retired is cleared
+				// because the has_interrupt() calls above have just read
+				// the devices, so their answer supersedes any earlier
+				// retirement; one that lands straight after the clear
+				// applies to the next pass.
+				const uint32_t irq_saved = save_and_disable_interrupts();
+				const bool was_irq = (int_pins_held & PEND_IRQ) != 0u;
+				pending_interrupts = pend;
+				irq_sources = src;
+				irq_retired = 0u;
+				interrupt_pins_update();
+				// Re-derive the NMI-work byte from its sources, with
+				// interrupts still off so no writer can interleave: this
+				// is where it is cleared, and where it stays set while
+				// hold passes remain.
+				loop_nmi_work = static_cast<uint8_t>(
+					  static_cast<uint8_t>(nmi_request_count != nmi_request_done)
+					| static_cast<uint8_t>(watchpoint_nmi_pending)
+					| static_cast<uint8_t>(dat_fault_nmi_request)
+					| nmi_hold_passes);
+#if DIAG_ON
+				if (!was_irq && (int_pins_held & PEND_IRQ))
+					irq_loop_assert++;
+#endif
+				restore_interrupts(irq_saved);
+			}
+#if DIAG_ON
+			// The same audit for the NMI-work byte as for the armed one:
+			// a live source with the byte clear for two consecutive
+			// passes is a writer that forgot to set it.
+			if (loop_nmi_work == 0u
+			    && (nmi_request_count != nmi_request_done || watchpoint_nmi_pending
+				|| dat_fault_nmi_request || nmi_hold_passes != 0u)) {
+				if (++nmi_work_miss_run == 2u)
+					nmi_work_missed++;
+			} else
+				nmi_work_miss_run = 0u;
+#endif
+#if DIAG_ON
+			// AUDIT OF THE ARMED BYTE against its sources: a live source
+			// with the byte clear is a writer that forgot q_rising_arm(),
+			// which otherwise fails silently - until the next bus-state
+			// change re-derives the byte, so it is a delay, not a loss,
+			// but still a bug.  A writer IN FLIGHT looks the same for one
+			// pass (source stored, byte not yet - "irq 9" showed exactly
+			// one), so only a miss that persists across two consecutive
+			// passes is counted.  Counted, not repaired, so the count
+			// means something.
+			if (q_rising_armed == 0u && q_rising_sources()) {
+				if (++q_armed_miss_run == 2u)
+					q_armed_missed++;
+			} else
+				q_armed_miss_run = 0u;
+#endif
 		}
 
 		// Console writes into the register block, carried out as the guest's
@@ -6768,10 +7054,14 @@ __no_inline_not_in_flash_func(main_core1)()
 		// ring entries that queues are dispatched just below, in this pass.
 		// queue_try_remove() takes the queue's spinlock before it looks at
 		// the level, so an empty queue - which is almost every pass - costs
-		// a lock acquire, a release and their barriers.  The unsafe level
-		// read is two loads and no lock; a stale "empty" only defers a
-		// console write by one pass, and console writes are human-paced.
-		if (queue_get_level_unsafe(&console_write_queue) != 0u) {
+		// a lock acquire, a release and their barriers.  So the pass tests
+		// console_write_pending instead, one load: Core 0 sets it after a
+		// successful add, and this clears it before draining, so an add on
+		// either side of the clear is drained now or flagged for the next
+		// pass.  It replaced an unsafe level read of two loads and the
+		// arithmetic behind it (2026-10-10 loop audit).
+		if (console_write_pending != 0u) {
+			console_write_pending = 0u;	// BEFORE the drain
 			write_entry w;
 			while (queue_try_remove(&console_write_queue, &w)) {
 				const uint32_t saved = save_and_disable_interrupts();
@@ -6782,12 +7072,17 @@ __no_inline_not_in_flash_func(main_core1)()
 			}
 		}
 
+		if (loop_work == 0u)
+			continue;
+		loop_work = 0u;				// BEFORE the drains
 		while (write_ring_tail != write_ring_head) {
-			core1_write_ring_count++;
 			const uint8_t t = write_ring_tail;
 			const uint8_t written_location = write_ring[t].location;
 			const uint8_t written_byte = write_ring[t].value;
+#if DIAG_ON
+			core1_write_ring_count++;
 			core1_last_write_loc = written_location;
+#endif
 			write_ring_tail = (t + 1u) & WRITE_RING_MASK;
 			switch (written_location) {
 			default:
@@ -6916,42 +7211,6 @@ __no_inline_not_in_flash_func(main_core1)()
 			aux_rx_processed_count++;
 		}
 
-		if (read_irq_received) {
-			core1_read_irq_count++;
-			read_irq_received = false;
-			core1_last_read_loc = read_location;
-			switch (read_location) {
-			default:
-				// The MC6809 got whatever byte was here. By default, do nothing else.
-				break;
-			case SYSTEM_TASK:
-				// Will be set by writing to this address
-				break;
-
-			case SYSTEM_REQUEST_RESPONSE:
-				// Will be set by the sysreq processor
-				break;
-
-			case CONSOLE_STATUS:
-				// UNREACHABLE, and left here saying so: the read
-				// ISR handles this address in a branch that never
-				// sets read_irq_received, so nothing arrives for
-				// it.  Counted in the ISR itself as
-				// CONSOLE_STATUS_READS.
-				break;
-
-			case AUX_STATUS:
-#ifdef DEBUG
-				AUX_ACIA_STATUS_COUNT++;
-#endif
-				break;
-
-			// CONSOLE_RX_DATA / AUX_RX_DATA handled via rx_read_count above.
-
-			// Tick timer status read is handled directly in the DMA read ISR.
-
-			}
-		} // if (read_irq_received)
 	} // for(;;)
 }
 

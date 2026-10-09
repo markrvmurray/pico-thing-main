@@ -84,8 +84,8 @@ struct status_snapshot_t {
 
 	// Core 1 diagnostics
 	uint32_t core1_loop, core1_qrise, core1_irq_assert;
-	uint32_t core1_write_ring, core1_read_irq;
-	uint8_t  core1_last_write, core1_last_read;
+	uint32_t core1_write_ring;
+	uint8_t  core1_last_write;
 	uint32_t core1_isr;
 	uint32_t core1_stack_total, core1_stack_free;
 

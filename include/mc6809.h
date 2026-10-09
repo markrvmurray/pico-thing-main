@@ -42,6 +42,7 @@
 #define IRQ_IS_ASSERTED ((gpio_get_dir(GPIO_IRQ) == GPIO_OUT) && !gpio_get(GPIO_IRQ))
 
 #include "interrupt.h"
+#include "q_armed.h"
 
 #define stringify(a) x_stringify(a)
 #define x_stringify(a) #a
@@ -106,7 +107,6 @@ private:
 	// the per-cycle redesign; without it nothing can unwind a depth count, so
 	// counting one would only ever climb.
 	volatile uint8_t task;
-	volatile bool busy, lic, vma;
 	using task_pin_cb_t = void(*)(uint8_t);
 	task_pin_cb_t task_pin_callback = nullptr;
 #ifdef DEBUG
@@ -182,17 +182,12 @@ public:
 	static mc6809& getInstance() { return instance; }
 	mc6809(const mc6809&) = delete;
 	mc6809& operator=(const mc6809&) = delete;
-	void set_busy_lic_avma(uint8_t value)
-	{
-		busy_lic_avma.byte = value;
-		busy = busy_lic_avma.bit.BUSY;
-		lic = busy_lic_avma.bit.LIC;
-		vma = busy_lic_avma.bit.AVMA;
-	}
+	// ONE STORE.  This used to also unpack the byte into three volatile bools
+	// - four stores and three loads on every E cycle - and nothing read two of
+	// them, while the third was read only by count_lic() under DIAG_ON.  The
+	// bits are in the byte; read them from there.
+	void set_busy_lic_avma(uint8_t value) { busy_lic_avma.byte = value; }
 	[[nodiscard]] uint8_t get_busy_lic_avma() const { return busy_lic_avma.byte; }
-	[[nodiscard]] bool get_busy() const { return busy; }
-	[[nodiscard]] bool get_lic() const { return lic; }
-	[[nodiscard]] bool get_vma() const { return vma; }
 	// --- Bus trace control (one-shot capture of one GPIO word per E cycle) ---
 	void set_trace_callbacks(trace_cb_t arm, trace_cb_t stop, trace_count_cb_t count)
 		{ trace_arm_callback = arm; trace_stop_callback = stop; trace_count_callback = count; }
@@ -205,7 +200,7 @@ public:
 	// with "0 rows recorded" and empty BUSY/LIC/AVMA columns.  It covers the
 	// deferred path too: the count is reset in the callback either way, and
 	// only the state machines wait for trace_hw_start().
-	void trace_arm() { trace_bla_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); trace_capturing = true; }
+	void trace_arm() { trace_bla_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); trace_capturing = true; q_rising_arm(); }
 	[[nodiscard]] bool trace_is_armed() const { return trace_armed; }
 	void trace_stop() { trace_armed = false; trace_capturing = false; if (trace_stop_callback) trace_stop_callback(); }
 	// Cheap enough for the per-cycle path: one volatile load.
@@ -251,7 +246,7 @@ public:
 #ifdef DEBUG
 	void clear_lic_count() { _count_lic = 0u; }
 	[[nodiscard]] uint32_t get_lic_count() const { return _count_lic; }
-	void count_lic() { if (lic && bus_state == BUS_RUNNING) _count_lic++; }
+	void count_lic() { if (busy_lic_avma.bit.LIC && bus_state == BUS_RUNNING) _count_lic++; }
 #endif
 	void clear_irq_ack_count() { for (auto &c : _count_irq_ack) c = 0u; }
 	[[nodiscard]] uint32_t get_irq_ack_count(interrupt i) const { return _count_irq_ack[i]; }
@@ -294,6 +289,9 @@ public:
 	[[nodiscard]] enum bus_state get_old_bus_state() const { return old_bus_state; }
 	[[nodiscard]] uint8_t get_task() const { return task; }
 	friend void gpio_q_irq_handler();
+	// The handler's slow half, split out so the fast path saves fewer
+	// registers; it touches the same state the handler does.
+	friend void q_rising_slow_path(uint8_t, uint8_t, enum bus_state, bool);
 	friend void dma_bus_read_irq_handler();
 	friend void dma_bus_write_irq_handler();
 	friend void process_command(char *buf);

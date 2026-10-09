@@ -37,32 +37,15 @@
 // come between; no interrupt is lost, only delayed well inside one bus cycle;
 // and there is nothing to retry, so it cannot spin.  Only Core 1 gets here (its
 // loop and its own ISRs), so one saved interrupt state is enough.
-#if PICO_ON_DEVICE
-static uint32_t interrupts_held;
-
-static uint8_t
-held_open(volatile uint8_t *status)
-{
-	interrupts_held = save_and_disable_interrupts();
-	return *status;
-}
-
-static bool
-held_commit(volatile uint8_t *status, const uint8_t value)
-{
-	*status = value;
-	restore_interrupts(interrupts_held);
-	return true;
-}
-
-static void
-held_abandon()
-{
-	restore_interrupts(interrupts_held);
-}
-const mc6850::status_store mc6850::native_store = { held_open, held_commit, held_abandon };
-#else
-// On the host nothing can come between, so a plain store never fails.
+#if !PICO_ON_DEVICE
+// THE SEAM EXISTS FOR THE HOST TESTS ONLY, which replace it to drive a fast
+// path into the window between building and storing.  On the device it is not
+// compiled at all: sync_status() holds interrupts off inline instead.  Paying
+// for the seam there meant two indirect calls (blx through a function-pointer
+// table) with their prologues on every status store - on the read ISR's data
+// path and in has_interrupt_recompute() - measured at 20-30 clk_sys cycles
+// per store in the 2026-10-09 Core 1 audit.  On the host nothing can come
+// between, so a plain store never fails.
 static uint8_t
 plain_open(volatile uint8_t *status)
 {
@@ -81,8 +64,8 @@ plain_abandon()
 {
 }
 const mc6850::status_store mc6850::native_store = { plain_open, plain_commit, plain_abandon };
-#endif
 mc6850::status_store mc6850::store = mc6850::native_store;
+#endif
 
 mc6850::mc6850(uint16_t ctl_off, uint16_t data_off) :
 	ctl_offset(ctl_off),
@@ -182,6 +165,21 @@ mc6850::sync_status()
 	if (status_byte() == *status)
 		return;
 
+#if PICO_ON_DEVICE
+	// Interrupts off for the rebuild, the compare and the store, inline: see
+	// the note at the top of this file for why this and not an exclusive
+	// store, and the seam comment for why the host's function pointers are
+	// not paid for here.  Holding interrupts off cannot be interrupted, so
+	// there is nothing to retry.
+	const uint32_t saved = save_and_disable_interrupts();
+	// Rebuilt inside the critical section, not reused from above: a fast
+	// path may have moved the flags since, and its value is the newer one.
+	// This is the race that took three attempts in September.
+	const uint8_t want = status_byte();
+	if (want != *status)
+		*status = want;
+	restore_interrupts(saved);
+#else
 	for (;;) {
 		const uint8_t current = store.open(status);
 		// Rebuilt inside the critical section, not reused from above: a
@@ -196,6 +194,7 @@ mc6850::sync_status()
 		if (store.commit(status, want))
 			return;
 	}
+#endif
 }
 
 // Sync TDRE/CTS status bits from current TX queue state.
@@ -218,7 +217,39 @@ mc6850::write_received()
 {
 	tx_write_pending = true;
 	irq_dirty = true;
-	sync_status();
+	// CLEAR ONE BIT, do not rebuild the byte.  sync_status() builds the whole
+	// status twice - once for its cheap pre-check and once inside the critical
+	// section, about sixteen volatile reads between them - and then stores all
+	// eight bits.  But tx_write_pending can only ever affect TDRE, and it has
+	// just been SET, so TDRE is unconditionally false: there is exactly one bit
+	// to change and its new value is known without reading anything.
+	//
+	// This is the hot write on this bus.  A guest sending a byte stores to
+	// CONSOLE_TX_DATA/AUX_TX_DATA and that lands here, which is why the
+	// device-register path measured 126 clk_sys cycles mean against the high
+	// range's 82 - and 126 does not fit a 2.5 MHz E cycle (128) while 82 does.
+	// See the project note write-isr-cost.
+	//
+	// SAFER than the store it replaces, not just cheaper: masking and then
+	// ANDing one bit leaves every other bit as whoever owns it last wrote it,
+	// where commit() writes all eight from a snapshot and can therefore undo a
+	// change another path made in between.  The mask is still needed, because a
+	// read-modify-write is not atomic and both Core 1's loop and its ISRs store
+	// this byte.
+	// bit 1 of mc6850_status; the status_byte() above is the other place that
+	// has to agree with the union's layout.
+	static constexpr uint8_t TDRE_MASK = 0b00000010u;
+	const auto status = reinterpret_cast<volatile uint8_t *>(
+		registers::read_address() + ctl_offset);
+#if PICO_ON_DEVICE
+	const uint32_t saved = save_and_disable_interrupts();
+	*status = static_cast<uint8_t>(*status & static_cast<uint8_t>(~TDRE_MASK));
+	restore_interrupts(saved);
+#else
+	// On the host nothing can come between, which is the same assumption
+	// plain_open()/plain_commit() make above.
+	*status = static_cast<uint8_t>(*status & static_cast<uint8_t>(~TDRE_MASK));
+#endif
 }
 
 void
@@ -289,7 +320,29 @@ mc6850::rx_read_fast_path()
 	receive_buffer_full = false;
 	assert_receive_irq = false;
 	irq_dirty = true;
-	sync_status();
+	// CLEAR THE BITS A DATA READ CAN CHANGE, do not rebuild the byte: the
+	// write_received() reasoning in reverse.  Reading the data register can
+	// only take RDRF away, and with it the receive half of IRQ; the transmit
+	// half is whatever assert_transmit_irq already says, one load.  Every
+	// other bit is left as its owner last stored it, and the recompute that
+	// irq_dirty requests rebuilds the whole byte from the flags afterwards.
+	// This runs on the read ISR's data path, where sync_status() cost two
+	// status_byte() builds and the critical section per guest read.
+	// bits 0 and 7 of mc6850_status; status_byte() is the other place that
+	// has to agree with the union's layout.
+	static constexpr uint8_t RDRF_MASK = 0b00000001u;
+	static constexpr uint8_t IRQ_MASK  = 0b10000000u;
+	const uint8_t clear = static_cast<uint8_t>(
+		RDRF_MASK | (assert_transmit_irq ? 0u : IRQ_MASK));
+	const auto status = reinterpret_cast<volatile uint8_t *>(
+		registers::read_address() + ctl_offset);
+#if PICO_ON_DEVICE
+	const uint32_t saved = save_and_disable_interrupts();
+	*status = static_cast<uint8_t>(*status & static_cast<uint8_t>(~clear));
+	restore_interrupts(saved);
+#else
+	*status = static_cast<uint8_t>(*status & static_cast<uint8_t>(~clear));
+#endif
 }
 
 void

@@ -127,9 +127,11 @@ public:
 	// register's current value and starts an exclusive access; commit() stores
 	// a new value and returns false if anything intervened since open(), and
 	// abandon() ends an access with nothing to store.  native_store uses
-	// LDREXB, STREXB and CLREX on the device, where exception entry cancels
-	// the access, and plain reads and stores that never fail on the host.
-	// store is what sync_status() uses; a test may replace it.
+	// plain reads and stores that never fail on the host.  store is what
+	// the HOST's sync_status() uses, and a test may replace it; on the
+	// device neither is defined - sync_status() holds interrupts off
+	// inline, so a status store pays no indirect calls (Core 1 audit,
+	// 2026-10-09).
 	struct status_store {
 		uint8_t (*open)(volatile uint8_t *status);
 		bool (*commit)(volatile uint8_t *status, uint8_t value);
