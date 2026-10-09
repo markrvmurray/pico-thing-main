@@ -45,6 +45,46 @@
 #include "command_parser.h"
 #include "status.h"
 
+// THE THREE DIAGNOSTIC SWITCHES, DEFINED HERE BECAUSE A #if MUST FOLLOW ITS
+// #define.  The reasoning behind each one is at its first heavy use further
+// down - search ISR_COST_ON, DIAG_ON and TESTPOINTS_ON - and only the
+// definitions are hoisted.
+//
+// THEY WERE NOT ALWAYS HERE, AND THAT WAS A BUILD BREAK WAITING TO HAPPEN.  An
+// `#if DIAG_ON` guarding the /IRQ accounting counters sits at about line 350,
+// which was ABOVE the old definition site: an undefined macro is 0 in #if, so
+// with PICO_THING_DIAG=0 both the declarations and their uses vanished and
+// everything matched.  Turn DIAG on and only the USES came back - six
+// "use of undeclared identifier" errors, in the one configuration nobody had
+// compiled since the switch went in.  Defining them before anything reads them
+// is the fix; keep it that way.
+#ifndef PICO_THING_ISR_COST
+#define PICO_THING_ISR_COST 0	// match CMake's default; it is an instrument
+#endif
+#if defined(DEBUG) && PICO_THING_ISR_COST
+#define ISR_COST_ON 1
+#else
+#define ISR_COST_ON 0
+#endif
+
+#ifndef PICO_THING_DIAG
+#define PICO_THING_DIAG 0	// match CMake's default
+#endif
+#if defined(DEBUG) && PICO_THING_DIAG
+#define DIAG_ON 1
+#else
+#define DIAG_ON 0
+#endif
+
+#ifndef PICO_THING_TESTPOINTS
+#define PICO_THING_TESTPOINTS 0	// match CMake's default
+#endif
+#if defined(DEBUG) && PICO_THING_TESTPOINTS
+#define TESTPOINTS_ON 1
+#else
+#define TESTPOINTS_ON 0
+#endif
+
 /* Flex/bison generated scanner API (yy_buffer_state is flex's internal type) */
 extern "C" {
 struct yy_buffer_state;
@@ -801,14 +841,8 @@ extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK
 // started failing the moment it went in.  Build with
 // -D PICO_THING_ISR_COST=0 to get those cycles back while keeping the rest of
 // DEBUG.
-#ifndef PICO_THING_ISR_COST
-#define PICO_THING_ISR_COST 0	// match CMake's default; it is an instrument
-#endif
-#if defined(DEBUG) && PICO_THING_ISR_COST
-#define ISR_COST_ON 1
-#else
-#define ISR_COST_ON 0
-#endif
+// The switch itself is defined at the top of this file: a #if must follow
+// its #define, and an `#if ISR_COST_ON` above that point reads as 0.
 
 // PER-CYCLE DIAGNOSTIC COUNTING.  Separate from DEBUG, which is defined
 // unconditionally (CMakeLists.txt) and therefore gates what st can REPORT
@@ -824,14 +858,8 @@ extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK
 // lost, the third because the interrupt tests hold a request asserted until
 // its count moves, which its own declaration says in as many words.  Gating
 // any of those loses interrupts rather than statistics.
-#ifndef PICO_THING_DIAG
-#define PICO_THING_DIAG 0	// match CMake's default
-#endif
-#if defined(DEBUG) && PICO_THING_DIAG
-#define DIAG_ON 1
-#else
-#define DIAG_ON 0
-#endif
+// The switch itself is defined at the top of this file: a #if must follow
+// its #define, and an `#if DIAG_ON` above that point reads as 0.
 
 // GPIO SCOPE MARKERS.  Driven high on entry to an ISR and low on exit so a
 // scope can see when each ran and for how long.  Two SIO writes per entry on
@@ -853,14 +881,8 @@ extern "C" uint32_t __StackOneTop;	// linker symbol (NOLINT: the name is the SDK
 // truncated the width being measured - so the one measurement these pins exist
 // for, a scope against Q for handler latency, was corrupted in exactly the case
 // it is most wanted in.
-#ifndef PICO_THING_TESTPOINTS
-#define PICO_THING_TESTPOINTS 0	// match CMake's default
-#endif
-#if defined(DEBUG) && PICO_THING_TESTPOINTS
-#define TESTPOINTS_ON 1
-#else
-#define TESTPOINTS_ON 0
-#endif
+// The switch itself is defined at the top of this file: a #if must follow
+// its #define, and an `#if TESTPOINTS_ON` above that point reads as 0.
 
 #if ISR_COST_ON
 #define SYSTICK_MASK 0x00FFFFFFu
@@ -870,6 +892,20 @@ struct isr_cost {
 };
 static volatile isr_cost q_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
 static volatile isr_cost read_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
+// THE WRITE ISR, which was absent from isr_demand entirely until now - audit
+// finding 3.  Every figure that line printed was therefore too LOW by whatever
+// this path costs, while finding 2 (the instrument being in circuit) pushed it
+// the other way: the headline cap was wrong in both directions at once.
+//
+// Worth having for its own sake now, not just completeness.  The write ISR is
+// MEASURED as the first thing to give way: coalesced write completions go 0 at
+// 2.4 MHz to 8610 at 2.5, so it is missing its deadline on thousands of writes
+// at a clock where nothing else complains.  This says what it costs to do so.
+//
+// Its span is variable by design, because it drains however many ring entries
+// are present - so max/mean apart is the interesting reading here, more than
+// for the other two.
+static volatile isr_cost write_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
 
 static inline void
 isr_cost_init()		// Core 1 only: SysTick is per-core
@@ -942,6 +978,7 @@ isr_cost_reset()
 {
 	isr_cost_clear(q_cost);
 	isr_cost_clear(read_cost);
+	isr_cost_clear(write_cost);
 	isr_cost_clear(loop_cost);
 	isr_cost_clear(loop_period);
 	loop_prev_valid = false;
@@ -1925,6 +1962,9 @@ __time_critical_func(write_addr_ring_head())
 void __isr
 __time_critical_func(dma_bus_write_irq_handler())
 {
+#if ISR_COST_ON
+	const uint32_t write_cost_start = systick_hw->cvr;
+#endif
 #if TESTPOINTS_ON
 	gpio_put(GPIO_TRACE_C, true);
 #endif
@@ -1976,6 +2016,12 @@ __time_critical_func(dma_bus_write_irq_handler())
 #endif
 #if TESTPOINTS_ON
 	gpio_put(GPIO_TRACE_C, false);
+#endif
+	// Last, as in the read ISR, so the span covers the whole handler
+	// including the DEBUG bookkeeping above - that work is this ISR's cost
+	// and belongs in its bucket, not left to land in loop_cost.
+#if ISR_COST_ON
+	isr_cost_add(write_cost, write_cost_start);
 #endif
 }
 
@@ -3684,6 +3730,16 @@ status_gather(status_snapshot_t *s)
 	// reading and says only that the clock is running.  Flag 0 is the one
 	// that matters: bus_fault's wait clears it, so it should read clear.
 	s->pio2_irq = static_cast<uint8_t>(bus_fault.pio->irq & 0xFFu);
+	// DID THE WRITE STATE MACHINE EVER STALL ON A FULL RX FIFO?  The question
+	// is whether the data ring's second push is what costs 2.5 MHz: the SM
+	// sends three words per write cycle into a 4-deep FIFO, and a blocking
+	// push to a full one HALTS THE STATE MACHINE - which makes it miss bus
+	// cycles outright, far worse than the stale dispatch byte it cured.
+	//
+	// RXSTALL is the hardware's own answer, latched per SM, so it needs no
+	// sampling luck.  Cleared at Core 1 launch and by fq, so a reading always
+	// belongs to the current clock.
+	s->write_fdebug = piodma_write.pio->fdebug;
 	s->clock_pc = (pio_clock.sm < 0) ? 0xFFu : static_cast<uint8_t>(
 		pio_sm_get_pc(pio_clock.pio, static_cast<uint>(pio_clock.sm))
 		- static_cast<uint>(pio_clock.offset));
@@ -3957,6 +4013,21 @@ status_print(const status_snapshot_t *s)
 	       live.bit.AVMA ? 'V' : '.');
 	printf("pio2 irq flags %02X (flag1 %s - unconsumed, expected)  clock pc +%u\n",
 	       s->pio2_irq, (s->pio2_irq & 0x02u) ? "SET" : "clear", s->clock_pc);
+	// THE WRITE SM'S STALL FLAGS.  RXSTALL set means a blocking push met a
+	// full RX FIFO and HALTED THE STATE MACHINE, which loses bus cycles - the
+	// thing to rule in or out before adding any more pushes to this program.
+	// TXSTALL is expected to be set and means nothing here: the program pulls
+	// its prefix once at startup and then never again, so the TX FIFO is
+	// empty for ever after.
+	{
+		const uint sm = static_cast<uint>(piodma_write.sm);
+		const bool rxstall = (s->write_fdebug >> (PIO_FDEBUG_RXSTALL_LSB + sm)) & 1u;
+		const bool rxunder = (s->write_fdebug >> (PIO_FDEBUG_RXUNDER_LSB + sm)) & 1u;
+		printf("write pio sm%u: RX FIFO push stalled %s   RX read when empty %s"
+		       "   (fdebug %08" PRIX32 ")\n",
+		       sm, rxstall ? "*** YES ***" : "no",
+		       rxunder ? "YES" : "no", s->write_fdebug);
+	}
 	if (s->lic_stalled)
 		printf("WARNING: LIC stalled at %" PRIu32 ", run state is %s\n",
 		       s->lic_count, run_state_string[s->run_state]);
@@ -3973,6 +4044,9 @@ status_print(const status_snapshot_t *s)
 		const uint32_t r_last = read_cost.last, r_min = read_cost.min,
 			       r_max = read_cost.max, r_n = read_cost.n;
 		const uint64_t r_sum = read_cost.sum;
+		const uint32_t w_last = write_cost.last, w_min = write_cost.min,
+			       w_max = write_cost.max, w_n = write_cost.n;
+		const uint64_t w_sum = write_cost.sum;
 		const float e_mhz = MC6809.get_e_frequency();	// MHz
 		const uint32_t budget = (e_mhz > 0.0f)
 			? (uint32_t) ((float) clock_get_hz(clk_sys)
@@ -3983,6 +4057,7 @@ status_print(const status_snapshot_t *s)
 		const uint64_t l_sum = loop_cost.sum;
 		const uint32_t qm = q_n ? (uint32_t) (q_sum / q_n) : 0u;
 		const uint32_t rm = r_n ? (uint32_t) (r_sum / r_n) : 0u;
+		const uint32_t wm = w_n ? (uint32_t) (w_sum / w_n) : 0u;
 		const uint32_t lm = l_n ? (uint32_t) (l_sum / l_n) : 0u;
 		// PER E CYCLE, NOT PER OCCURRENCE, and the two kinds of work are
 		// kept APART, which is the whole point of this instrument.
@@ -4001,8 +4076,14 @@ status_print(const status_snapshot_t *s)
 		// real work - 318 of 320 before and after - and look broken.  Its
 		// passes went from 754k to 116M over the same two changes while
 		// reporting the same utilisation, which is the giveaway.
+		// THE WRITE ISR IS NOW IN THE SUM - audit finding 3.  Scaled the
+		// same way as the read ISR: one Q pass per E cycle, so n/q_n is
+		// each handler's entries per E cycle.  Until this term existed the
+		// figure was too low by exactly this much, and that is the half of
+		// the "wrong in both directions" headline that made it understate.
 		const uint32_t isr_demand = q_n
 			? qm + (uint32_t) ((uint64_t) rm * r_n / q_n)
+			   + (uint32_t) ((uint64_t) wm * w_n / q_n)
 			: 0u;
 		const uint32_t loop_share = q_n
 			? (uint32_t) ((uint64_t) lm * l_n / q_n)
@@ -4014,6 +4095,12 @@ status_print(const status_snapshot_t *s)
 		printf("  read DMA  last %4" PRIu32 "  min %4" PRIu32 "  max %5" PRIu32
 		       "  mean %4" PRIu32 "  n %" PRIu32 "\n",
 		       r_last, r_n ? r_min : 0u, r_max, rm, r_n);
+		// The write ISR's span VARIES BY DESIGN - it drains however many
+		// ring entries are waiting - so the gap between mean and max is
+		// the reading, not the mean alone.
+		printf("  write DMA last %4" PRIu32 "  min %4" PRIu32 "  max %5" PRIu32
+		       "  mean %4" PRIu32 "  n %" PRIu32 "\n",
+		       w_last, w_n ? w_min : 0u, w_max, wm, w_n);
 		printf("  Core1 loop last %4" PRIu32 "  min %4" PRIu32
 		       "  max %5" PRIu32 "  mean %4" PRIu32 "  n %" PRIu32
 		       "  (own work, ISRs subtracted)\n",
@@ -6046,6 +6133,13 @@ status_done:
 		// The budget just changed, so the old samples describe a
 		// different question.
 		isr_cost_reset();
+		// Start-of-measurement: the stall flags are sticky and latch per
+		// SM, so clearing them here means an RXSTALL seen afterwards was
+		// earned at THIS clock and not inherited from a faster one.
+		piodma_write.pio->fdebug = PIO_FDEBUG_RXSTALL_BITS
+					 | PIO_FDEBUG_TXSTALL_BITS
+					 | PIO_FDEBUG_RXUNDER_BITS
+					 | PIO_FDEBUG_TXOVER_BITS;
 #endif
 		break;
 
@@ -6502,6 +6596,12 @@ __no_inline_not_in_flash_func(main_core1)()
 	// previous run left, which is what is wanted.  This is the same trap that
 	// put a bogus 8.7-million-cycle maximum in loop_cost.max.
 	write_addr_ring_tail = write_addr_ring_head();
+	// Same reason as the tail above: these latch and survive a relaunch, so a
+	// stall from a previous run would be read as one from this one.
+	piodma_write.pio->fdebug = PIO_FDEBUG_RXSTALL_BITS
+				 | PIO_FDEBUG_TXSTALL_BITS
+				 | PIO_FDEBUG_RXUNDER_BITS
+				 | PIO_FDEBUG_TXOVER_BITS;
 	// THE INTERRUPT COMES FROM THE RING CHANNEL, the last link in the chain,
 	// so by the time the handler runs the entry for this write is already in
 	// the ring.  On the data channel it could run first and find nothing.

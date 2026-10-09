@@ -70,6 +70,7 @@ struct status_snapshot_t {
 	uint32_t write_addr_overflow;	// the address ring may have lapped
 	uint8_t  busy_lic_avma;	// the pins, as the Q handler last read them
 	uint8_t  pio2_irq;	// all eight of pio2's SM-visible IRQ flags
+	uint32_t write_fdebug;	// the write PIO's FDEBUG: did a push ever stall?
 	uint8_t  clock_pc;	// the E/Q clock SM's PC, to prove it is cycling
 #endif
 
