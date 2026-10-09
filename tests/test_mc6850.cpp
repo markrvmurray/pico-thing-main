@@ -696,22 +696,65 @@ TEST_CASE("host CTS does not affect TX IRQ assertion") {
 // Loopback mode transitions
 // -----------------------------------------------------------------------
 
-TEST_CASE("SpscQueue reset drains all queued bytes") {
+TEST_CASE("SpscQueue empties from either side with one store") {
+	// The consumer's flush.  tail moves up to head, so nothing unread is left.
 	SpscQueue q;
 	for (int i = 0; i < 100; i++)
 		q.put(static_cast<uint8_t>(i));
 	CHECK(q.get_level() == 100);
-	q.reset();
+	q.discard_unread();
 	CHECK(q.is_empty());
 	CHECK(q.get_level() == 0);
 	CHECK(q.has_space());
+
+	// The producer's flush.  head comes back down to tail.
+	SpscQueue p;
+	for (int i = 0; i < 100; i++)
+		p.put(static_cast<uint8_t>(i));
+	p.abandon_unsent();
+	CHECK(p.is_empty());
+	CHECK(p.get_level() == 0);
+
+	// AND IT EMPTIES FROM A WRAPPED POSITION, which is the case that matters
+	// and the one the old reset() got wrong.  That version stored 0 into BOTH
+	// indices, so after the first store the queue read head == 0 against an
+	// unchanged tail == V: not empty, but a level of CAPACITY - V, and the
+	// consumer walked that many slots round the ring.
+	//
+	// NO BACKLOG WAS NEEDED.  The queue below is EMPTY at the flush - head and
+	// tail both at V - which is why an instrument measuring get_level() at
+	// reset read 0 and said there was nothing wrong.  The hazard is in the
+	// index VALUE, not the level.  On the board the burst length matched
+	// CAPACITY - V exactly: 922 NULs for V == 102.
+	SpscQueue w;
+	constexpr int V = 102;
+	for (int i = 0; i < V; i++) {		// walk both indices up to V
+		w.put(static_cast<uint8_t>(i));
+		(void) w.get();
+	}
+	CHECK(w.is_empty());
+	CHECK(w.get_level() == 0);
+	// What the old code exposed from here: 1024 - 102 = 922 phantom bytes.
+	CHECK((CONSOLE_QUEUE_LEN - V) == 922);
+	// What this code exposes: nothing.  Still empty, from either side.
+	w.discard_unread();
+	CHECK(w.is_empty());
+	CHECK(w.get_level() == 0);
+	w.abandon_unsent();
+	CHECK(w.is_empty());
+	CHECK(w.get_level() == 0);
 }
 
-TEST_CASE("mc6850 reset flushes TX queue") {
+// DELIBERATE BEHAVIOUR CHANGE.  This case used to assert the opposite - that a
+// master reset drained the TX queue.  A real MC6850 has no transmit FIFO for a
+// reset to clear; this queue models the host link, not the part, and draining it
+// discards output the guest has already handed over and believes it has sent.
+// Not storing to head at all is also what closes the corruption window for
+// certain: any store there reopens it.
+TEST_CASE("mc6850 reset keeps output the guest has already handed over") {
 	registers::clear();
 	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
 
-	// Fill some bytes into TX queue
 	for (int i = 0; i < 50; i++)
 		uart_write(uart, static_cast<uint8_t>(i));
 	CHECK(uart.host_receive_avail());
@@ -719,7 +762,11 @@ TEST_CASE("mc6850 reset flushes TX queue") {
 	// Master reset (divide_select=0b11)
 	uart_control(uart, 0x03);
 
-	// TX queue should be drained
+	// Still there, and still in order.
+	CHECK(uart.host_receive_avail());
+	CHECK(uart.host_receive_level_avail() == 50);
+	for (int i = 0; i < 50; i++)
+		CHECK(uart.host_receive() == static_cast<uint8_t>(i));
 	CHECK_FALSE(uart.host_receive_avail());
 }
 

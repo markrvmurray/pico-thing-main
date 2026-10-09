@@ -116,8 +116,19 @@ mc6850::reset()
 	host_cts_deasserted = false;
 	tx_write_pending = false;
 	irq_dirty = true;
-	tx.reset();
-	rx.reset();
+	// THE TX QUEUE IS LEFT ALONE, and that is the whole fix for the console
+	// corruption.  A real MC6850 has no transmit FIFO for a master reset to
+	// clear; this queue models the host link, not the part.  Not storing is
+	// also the only way to be sure of closing the window, since any store to
+	// head here reopens it.
+	//
+	// The receive side is different: a master reset does clear the receiver, so
+	// dropping unread input is faithful.  Core 1 consumes rx, so Core 1 owns
+	// tail and discard_unread() is its store to make.  The Core 0 call sites
+	// (init, CMD_GO, set_power) are starting the guest, where at worst a couple
+	// of stale input bytes are gained or lost; no interleaving can produce the
+	// ring walk, which is the property that matters.
+	rx.discard_unread();
 	reg[ctl_offset] = reset_status.byte;
 }
 

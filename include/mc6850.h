@@ -61,10 +61,37 @@ public:
 		buf[h] = ch;
 		head.store((h + 1) & MASK, std::memory_order_release);
 	}
-	void reset()
+	// NEVER STORE BOTH INDICES.  head belongs to the producer and tail to the
+	// consumer, and the reset() that used to live here stored both: between its
+	// two stores the queue read head == 0 with tail still at its old value, so
+	// head != tail said NOT EMPTY and the consumer's drain loop walked tail the
+	// whole way round the ring - emitting whatever was still in it, then the
+	// never-written zeros - until tail wrapped to meet head.  That was the
+	// console corruption above 2.3 MHz: the guest's C_RESET is applied on
+	// Core 1 while Core 0 sits inside that loop, which under load it nearly
+	// always does, so the window gets hit instead of being skipped over.
+	//
+	// AND THE QUEUE DOES NOT HAVE TO BE HOLDING ANYTHING.  An EMPTY queue with
+	// both indices at V reads, after the first store alone, as head == 0
+	// against tail == V - a level of CAPACITY - V.  Measured on the board: 922
+	// NUL bytes in one capture, and 1024 - 922 = 102, the index at the time.
+	// An instrument that sampled get_level() at reset therefore read 0 and
+	// said nothing was wrong; the hazard is the index VALUE, not the level.
+	//
+	// Each of these stores ONE index - its own caller's - and sets the two
+	// equal, so no interleaving can make the queue read anything but EMPTY.
+	// Even racing the other side's get()/put(), the only reachable outcomes are
+	// "empty" and "one element moved", both of which are valid states; the
+	// ring-walk state is unreachable by construction.
+	void discard_unread()		// consumer side: drop what was never read
 	{
-		head.store(0, std::memory_order_release);
-		tail.store(0, std::memory_order_release);
+		tail.store(head.load(std::memory_order_acquire),
+			   std::memory_order_release);
+	}
+	void abandon_unsent()		// producer side: drop what was never consumed
+	{
+		head.store(tail.load(std::memory_order_acquire),
+			   std::memory_order_release);
 	}
 };
 
