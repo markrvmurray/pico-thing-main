@@ -7805,10 +7805,14 @@ int
 main()
 {
 	// VREG_VOLTAGE_MAX is 1.30V, and the regulator's own limit holds anything
-	// above it there unless vreg_disable_voltage_limit() lifts it - which is
-	// deliberately not called.  Asking for more than this only made the line
-	// read as something it was not: 320 MHz has been reliable at 1.30V.
-	vreg_set_voltage(VREG_VOLTAGE_1_30);
+	// above it there unless vreg_disable_voltage_limit() lifts it.  Both come
+	// from CMake (PICO_THING_VREG, PICO_THING_VREG_UNLIMITED) so an experiment
+	// above 1.30V is a separate build tree, not an edit: 320 MHz has been
+	// reliable at 1.30V, and nothing watches the die temperature above it.
+#if PICO_THING_VREG_UNLIMITED
+	vreg_disable_voltage_limit();
+#endif
+	vreg_set_voltage(PICO_THING_VREG);
 	sleep_ms(5);
 
 	gpio_set_function(GPIO_UART_TX, UART_FUNCSEL_NUM(uart0, GPIO_UART_TX));
@@ -7818,6 +7822,8 @@ main()
 
 	printf("\n\nPico2 MC6809E bus supervisor %s\n", DEVICE_VERSION);
 	printf("Pico2 MC6809E built on %s %s\n", __DATE__, __TIME__);
+	printf("Core at %s%s, clk_sys %u Hz\n", PICO_THING_VREG_NAME,
+	       PICO_THING_VREG_UNLIMITED ? " (limit disabled)" : "", SYS_CLK_DEFAULT);
 	// Which pin map this image was built for.  The two revisions swap the
 	// task pins and the DAT fault signals over, so an image flashed onto
 	// the wrong board drives outputs into outputs - say so before anything

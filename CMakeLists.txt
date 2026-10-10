@@ -274,9 +274,40 @@ message(STATUS "Pico-Thing UART console ${PICO_THING_CONSOLE_BAUD} baud")
 # attempted with panic=false so an unachievable target falls back instead of
 # hanging.  NOT adjusted here: the QMI divider for XIP flash, so a high enough
 # clk_sys puts the flash clock out of spec.
-set(PICO_THING_SYS_CLK_HZ 320000000 CACHE STRING
-	"clk_sys in Hz; 360000000 has been reliable on an RP2350B, 400000000 starts unreliably")
+set(PICO_THING_SYS_CLK_HZ 360000000 CACHE STRING
+	"clk_sys in Hz; the default 360000000 pairs with VREG_VOLTAGE_1_50 (die 40-42C); 320000000 at VREG_VOLTAGE_1_30 is the conservative pair; 400000000 at VREG_VOLTAGE_2_00 works but the die climbs past 55C in minutes")
 message(STATUS "Pico-Thing clk_sys ${PICO_THING_SYS_CLK_HZ} Hz")
+
+# The core regulator, paired with the clock above.  VREG_VOLTAGE_1_30 is the
+# SDK's VREG_VOLTAGE_MAX; anything above it is clamped by the regulator's own
+# limit unless PICO_THING_VREG_UNLIMITED lifts it with
+# vreg_disable_voltage_limit().  Any value of the hardware/vreg.h enum is
+# accepted, 0.70V to 3.30V in the RP2350's steps.
+#
+# THE DEFAULT IS 360 MHz AT VREG_VOLTAGE_1_50 (the user's decision, 2026-10-10),
+# measured the same day on this board, every reading with the guest rail OFF
+# because with it on the ADC reference collapses and the thermometer reads
+# with it:
+#   320 MHz / 1.30V  E = 1.0..2.4 solid                die ~40C
+#   360 MHz / 1.50V  E = 1.0..2.4 solid, 2.5 clean     die 40 -> 42C in 7 min
+#   400 MHz / 2.00V  E = 1.0, 2.0 clean                die 46 -> 57C in 5 min, rising
+# 360/1.50 is where the Pico has the E headroom with the die barely moving;
+# 400/2.00 works but needs a heatsink and a thermometer in the loop before it
+# is left running.  320/1.30 remains the conservative pair, one configure away.
+set(PICO_THING_VREG VREG_VOLTAGE_1_50 CACHE STRING
+	"core regulator setting, any enum from hardware/vreg.h (VREG_VOLTAGE_0_70 .. VREG_VOLTAGE_3_30); above VREG_VOLTAGE_1_30 needs PICO_THING_VREG_UNLIMITED=ON")
+set_property(CACHE PICO_THING_VREG PROPERTY STRINGS
+	VREG_VOLTAGE_0_70 VREG_VOLTAGE_0_75 VREG_VOLTAGE_0_80 VREG_VOLTAGE_0_85
+	VREG_VOLTAGE_0_90 VREG_VOLTAGE_0_95 VREG_VOLTAGE_1_00 VREG_VOLTAGE_1_05
+	VREG_VOLTAGE_1_10 VREG_VOLTAGE_1_15 VREG_VOLTAGE_1_20 VREG_VOLTAGE_1_25
+	VREG_VOLTAGE_1_30 VREG_VOLTAGE_1_35 VREG_VOLTAGE_1_40 VREG_VOLTAGE_1_50
+	VREG_VOLTAGE_1_60 VREG_VOLTAGE_1_65 VREG_VOLTAGE_1_70 VREG_VOLTAGE_1_80
+	VREG_VOLTAGE_1_90 VREG_VOLTAGE_2_00 VREG_VOLTAGE_2_35 VREG_VOLTAGE_2_50
+	VREG_VOLTAGE_2_65 VREG_VOLTAGE_2_80 VREG_VOLTAGE_3_00 VREG_VOLTAGE_3_15
+	VREG_VOLTAGE_3_30)
+option(PICO_THING_VREG_UNLIMITED
+	"call vreg_disable_voltage_limit() so a PICO_THING_VREG above VREG_VOLTAGE_1_30 takes effect" ON)
+message(STATUS "Pico-Thing vreg ${PICO_THING_VREG} unlimited ${PICO_THING_VREG_UNLIMITED}")
 
 # The per-cycle ISR cost instrument costs about 21 clk_sys cycles per E cycle,
 # which moves the E ceiling by roughly 0.13 MHz.  Set to 0 to get those back
@@ -358,6 +389,9 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_DAT_FAULT_BLOCK_DELAY=${PICO_THING_DAT_FAULT_BLOCK_DELAY}u
 	PICO_THING_CONSOLE_BAUD=${PICO_THING_CONSOLE_BAUD}
 	SYS_CLK_DEFAULT=${PICO_THING_SYS_CLK_HZ}
+	PICO_THING_VREG=${PICO_THING_VREG}
+	PICO_THING_VREG_NAME="${PICO_THING_VREG}"
+	PICO_THING_VREG_UNLIMITED=$<BOOL:${PICO_THING_VREG_UNLIMITED}>
 	PICO_THING_ISR_COST=${PICO_THING_ISR_COST}
 	PICO_THING_DIAG=${PICO_THING_DIAG}
 	PICO_THING_TESTPOINTS=${PICO_THING_TESTPOINTS}
