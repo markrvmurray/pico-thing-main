@@ -122,9 +122,11 @@ private:
 	// reached through the callbacks below, so this header stays free of SDK
 	// dependencies for the host-side unit tests.
 	static constexpr unsigned trace_size = TRACE_SIZE;
-	volatile uint32_t trace[trace_size];
+	// Aligned to their own size so the DMA address ring can wrap inside them
+	// in ring mode (channel_config_set_ring needs a power-of-two boundary).
+	alignas(trace_size * sizeof(uint32_t)) volatile uint32_t trace[trace_size];
 	// GPIO 32-47 only, so 16 bits is the whole of the high bank on a PGA2350.
-	volatile uint16_t trace_hi[trace_size];
+	alignas(trace_size * sizeof(uint16_t)) volatile uint16_t trace_hi[trace_size];
 	// The BUSY/LIC/AVMA the Q-rising handler actually USED for each cycle,
 	// taken from the DMA mirror.  The two buffers above are the pins as a PIO
 	// state machine saw them; this one is what reached the software, so a
@@ -145,10 +147,30 @@ private:
 	// the handler at the moment it sees the buffer full.
 	volatile bool trace_capturing = false;
 	uint8_t trace_irq_trigger = 0u;		// bitmask of (1<<interrupt) vectors that arm capture
+	// RING MODE.  The capture never stops on its own: the DMA write address
+	// wraps inside the buffers and the newest cycle overwrites the oldest,
+	// so the buffer always holds the LAST trace_size cycles.  It is frozen
+	// by a chosen vector fetch or by 'trace stop', and the dump then starts
+	// at the oldest row.  Nothing runs per cycle for it: trace_capturing
+	// stays false, so the Q handler's fullness poll and the BUSY/LIC/AVMA
+	// mirror column are both off in this mode.
+	bool trace_ring = false;
+	volatile bool trace_ring_frozen = false;
+	uint8_t trace_ring_trigger = 0u;	// (1<<interrupt) vectors that freeze the ring
+	uint32_t trace_ring_head = 0u;		// physical row of the oldest cycle, once frozen
+	uint32_t trace_ring_rows = 0u;		// rows that hold real cycles, once frozen
+	// Q-rising passes left before a triggered ring freezes; 0 = none pending.
+	// The trigger is seen at the Q-rising of the first vector byte, a quarter
+	// cycle BEFORE that row is captured at E-falling, so freezing at once
+	// loses the vector fetch itself.  Waiting keeps both vector bytes, the
+	// dead cycle after them and the handler's first fetch.
+	volatile uint8_t trace_ring_freeze_delay = 0u;
+	static constexpr uint8_t TRACE_RING_FREEZE_PASSES = 5u;
 	using trace_cb_t = void (*)();
 	using trace_count_cb_t = uint32_t (*)();
 	trace_cb_t trace_arm_callback = nullptr;
 	trace_cb_t trace_stop_callback = nullptr;
+	trace_cb_t trace_freeze_callback = nullptr;
 	trace_count_cb_t trace_count_callback = nullptr;
 	float e_freq;
 	using setup_callback_t = void(*)();
@@ -189,8 +211,10 @@ public:
 	void set_busy_lic_avma(uint8_t value) { busy_lic_avma.byte = value; }
 	[[nodiscard]] uint8_t get_busy_lic_avma() const { return busy_lic_avma.byte; }
 	// --- Bus trace control (one-shot capture of one GPIO word per E cycle) ---
-	void set_trace_callbacks(trace_cb_t arm, trace_cb_t stop, trace_count_cb_t count)
-		{ trace_arm_callback = arm; trace_stop_callback = stop; trace_count_callback = count; }
+	void set_trace_callbacks(trace_cb_t arm, trace_cb_t stop, trace_count_cb_t count,
+				 trace_cb_t freeze = nullptr)
+		{ trace_arm_callback = arm; trace_stop_callback = stop; trace_count_callback = count;
+		  trace_freeze_callback = freeze; }
 	// trace_capturing is set LAST, after the callback, and the order matters.
 	// The callback is what resets the DMA transfer count; until it has run,
 	// trace_hw_count() reads a finished-or-not-yet-started transfer as FULL
@@ -200,7 +224,9 @@ public:
 	// with "0 rows recorded" and empty BUSY/LIC/AVMA columns.  It covers the
 	// deferred path too: the count is reset in the callback either way, and
 	// only the state machines wait for trace_hw_start().
-	void trace_arm() { trace_bla_index = 0u; trace_armed = true; if (trace_arm_callback) trace_arm_callback(); trace_capturing = true; q_rising_arm(); }
+	// In ring mode trace_capturing stays false: there is no fullness to poll
+	// for and no mirror column, so the per-cycle path owes it nothing.
+	void trace_arm() { trace_bla_index = 0u; trace_armed = true; trace_ring_frozen = false; if (trace_arm_callback) trace_arm_callback(); trace_capturing = !trace_ring; q_rising_arm(); }
 	[[nodiscard]] bool trace_is_armed() const { return trace_armed; }
 	void trace_stop() { trace_armed = false; trace_capturing = false; if (trace_stop_callback) trace_stop_callback(); }
 	// Cheap enough for the per-cycle path: one volatile load.
@@ -209,10 +235,34 @@ public:
 	// gate and stops the per-cycle DMA read.  trace_armed is left alone, so
 	// the capture can still be dumped.
 	void trace_capture_done() { trace_capturing = false; }
-	void trace_clear() { trace_stop(); trace_irq_trigger = 0u; }
+	void trace_clear() { trace_stop(); trace_irq_trigger = 0u; trace_ring = false; trace_ring_trigger = 0u; trace_ring_frozen = false; trace_ring_freeze_delay = 0u; trace_ring_head = 0u; trace_ring_rows = 0u; }
+	// Ring mode: arm now, keep the last trace_size cycles, freeze on any
+	// vector in mask (none = only 'trace stop' freezes it).
+	void trace_ring_arm(uint8_t mask) { trace_ring = true; trace_ring_trigger = mask; trace_ring_freeze_delay = 0u; trace_ring_head = 0u; trace_ring_rows = 0u; trace_arm(); }
+	// A trigger vector starts the countdown; the slow path ticks it once
+	// per pass and freezes when it runs out.
+	[[nodiscard]] bool trace_ring_freeze_pending() const { return trace_ring_freeze_delay != 0u; }
+	void trace_ring_freeze_tick() { if (trace_ring_freeze_delay != 0u && --trace_ring_freeze_delay == 0u) trace_ring_freeze(); }
+	// Freeze the ring where it is.  Safe from the Q-rising handler: the
+	// callback only aborts the capture DMA and reads its registers.
+	void trace_ring_freeze() { if (trace_ring && trace_armed && !trace_ring_frozen) { trace_ring_frozen = true; if (trace_freeze_callback) trace_freeze_callback(); } }
+	void trace_ring_set(uint32_t head, uint32_t rows) { trace_ring_head = head; trace_ring_rows = rows; }
+	[[nodiscard]] bool trace_is_ring() const { return trace_ring; }
+	[[nodiscard]] bool trace_ring_is_frozen() const { return trace_ring_frozen; }
+	[[nodiscard]] uint8_t trace_ring_mask() const { return trace_ring_trigger; }
+	// Dump row i -> physical row.  A frozen ring starts at its oldest cycle.
+	[[nodiscard]] uint32_t trace_row(uint32_t i) const
+		{ return (trace_ring && trace_ring_frozen) ? (trace_ring_head + i) % trace_size : i; }
 	void trace_set_irq_trigger(interrupt i) { trace_irq_trigger |= static_cast<uint8_t>(1u << i); }
+	// Rows that can be dumped.  A frozen ring knows exactly; a live one
+	// reports what the hardware has written so far, clamped to the buffer.
 	[[nodiscard]] uint32_t trace_count() const
-		{ return trace_count_callback ? trace_count_callback() : 0u; }
+	{
+		if (trace_ring && trace_ring_frozen)
+			return trace_ring_rows;
+		const uint32_t n = trace_count_callback ? trace_count_callback() : 0u;
+		return n > trace_size ? trace_size : n;
+	}
 	[[nodiscard]] bool trace_is_full() const { return trace_count() >= trace_size; }
 	// Armed and still filling.  A hardware-triggered capture reads as active
 	// with a count of zero while it waits for its trigger.
@@ -240,6 +290,12 @@ public:
 	}
 	void trace_irq_event(interrupt i)
 	{
+		if (trace_ring) {
+			if ((trace_ring_trigger & (1u << i)) && !trace_ring_frozen
+			    && trace_ring_freeze_delay == 0u)
+				trace_ring_freeze_delay = TRACE_RING_FREEZE_PASSES;
+			return;
+		}
 		if ((trace_irq_trigger & (1u << i)) && !trace_armed)
 			trace_arm();
 	}

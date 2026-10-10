@@ -76,6 +76,15 @@
 #define DIAG_ON 0
 #endif
 
+#ifndef PICO_THING_TRAP_TRIGGER
+#define PICO_THING_TRAP_TRIGGER 0	// match CMake's default
+#endif
+// A scope trigger for the HD6309 trap: when the Q handler sees the $FFF0
+// vector fetch it pulses GPIO_TRACE_D for ~50 ns.  The misread fetch that
+// caused the trap is ~15 E cycles earlier (the 12-byte push comes first), so
+// the scope wants ~10 us of pre-trigger at 2.5 MHz.  Costs nothing on any
+// cycle that is not a trap vector fetch; off by default.
+#define TRAP_TRIGGER_ON (PICO_THING_TRAP_TRIGGER != 0)
 #ifndef PICO_THING_TESTPOINTS
 #define PICO_THING_TESTPOINTS 0	// match CMake's default
 #endif
@@ -601,6 +610,7 @@ static volatile bool trace_hw_triggered = false;
 // Set when a capture is armed but the guest is not running yet.
 static volatile bool trace_pending_start = false;
 static void trace_hw_start();
+static void trace_hw_freeze();
 
 // THE TRACE TAKES ITS PIO RESOURCES ONLY WHILE A CAPTURE IS ARMED.
 //
@@ -628,6 +638,41 @@ static bool trace_hw_held = false;	// the PIO programs and SMs are ours right no
 // finished capture can still be dumped and counted afterwards.
 static uint32_t trace_hw_samples = 0u;
 
+// Ring mode runs the capture DMA for this many cycles with the write address
+// wrapping inside the buffer: 2^28 - 1 is the widest transfer count the
+// channel has, about 4.5 minutes at 1 MHz E.  A ring left longer than that
+// simply stops with the last TRACE_SIZE cycles in place.
+static constexpr uint32_t TRACE_RING_COUNT = 0x0FFFFFFFu;
+
+// Program the two capture channels for a one-shot (write straight through
+// the buffers, TRACE_SIZE transfers) or a ring (write address wrapping on
+// the buffer's own size).  Called from arm, so a change of mode between
+// captures takes effect without releasing the hardware.
+static void
+trace_hw_dma_setup(const bool ring)
+{
+	dma_channel_config tlo = dma_channel_get_default_config(trace_lo.data_channel);
+	channel_config_set_transfer_data_size(&tlo, DMA_SIZE_32);
+	channel_config_set_read_increment(&tlo, false);
+	channel_config_set_write_increment(&tlo, true);
+	channel_config_set_dreq(&tlo, pio_get_dreq(trace_lo.pio, trace_lo.sm, false));
+	if (ring)
+		channel_config_set_ring(&tlo, true, __builtin_ctz(TRACE_SIZE * sizeof(uint32_t)));
+	dma_channel_configure(trace_lo.data_channel, &tlo, MC6809.trace_base(),
+			      &trace_lo.pio->rxf[trace_lo.sm],
+			      ring ? TRACE_RING_COUNT : TRACE_SIZE, false);
+	dma_channel_config thi = dma_channel_get_default_config(trace_hi.data_channel);
+	channel_config_set_transfer_data_size(&thi, DMA_SIZE_16);
+	channel_config_set_read_increment(&thi, false);
+	channel_config_set_write_increment(&thi, true);
+	channel_config_set_dreq(&thi, pio_get_dreq(trace_hi.pio, trace_hi.sm, false));
+	if (ring)
+		channel_config_set_ring(&thi, true, __builtin_ctz(TRACE_SIZE * sizeof(uint16_t)));
+	dma_channel_configure(trace_hi.data_channel, &thi, MC6809.trace_hi_base(),
+			      &trace_hi.pio->rxf[trace_hi.sm],
+			      ring ? TRACE_RING_COUNT : TRACE_SIZE, false);
+}
+
 static uint32_t
 trace_hw_count()
 {
@@ -636,6 +681,11 @@ trace_hw_count()
 	if (!trace_hw_held)
 		return trace_hw_samples;
 	const uint32_t left = dma_channel_hw_addr(trace_lo.data_channel)->transfer_count;
+	if (MC6809.trace_is_ring()) {
+		// A ring counts down from TRACE_RING_COUNT, so what is left says
+		// how many cycles have been written in all; the caller clamps.
+		return (left > TRACE_RING_COUNT) ? 0u : (TRACE_RING_COUNT - left);
+	}
 	return (left > TRACE_SIZE) ? 0u : (TRACE_SIZE - left);
 }
 
@@ -699,22 +749,7 @@ trace_hw_acquire()
 	// demand can land on a different one than last time.  Configuring these
 	// at boot against an SM number that later changes is a silent
 	// misconfiguration - the channel would pace off another SM's FIFO.
-	dma_channel_config tlo = dma_channel_get_default_config(trace_lo.data_channel);
-	channel_config_set_transfer_data_size(&tlo, DMA_SIZE_32);
-	channel_config_set_read_increment(&tlo, false);
-	channel_config_set_write_increment(&tlo, true);
-	channel_config_set_dreq(&tlo, pio_get_dreq(trace_lo.pio, trace_lo.sm, false));
-	dma_channel_configure(trace_lo.data_channel, &tlo, MC6809.trace_base(),
-			      &trace_lo.pio->rxf[trace_lo.sm], TRACE_SIZE, false);
-	// 16 bits: the high bank is only GPIO 32-47, so a half-word read of the
-	// FIFO takes the whole sample and halves the buffer.
-	dma_channel_config thi = dma_channel_get_default_config(trace_hi.data_channel);
-	channel_config_set_transfer_data_size(&thi, DMA_SIZE_16);
-	channel_config_set_read_increment(&thi, false);
-	channel_config_set_write_increment(&thi, true);
-	channel_config_set_dreq(&thi, pio_get_dreq(trace_hi.pio, trace_hi.sm, false));
-	dma_channel_configure(trace_hi.data_channel, &thi, MC6809.trace_hi_base(),
-			      &trace_hi.pio->rxf[trace_hi.sm], TRACE_SIZE, false);
+	trace_hw_dma_setup(false);
 	trace_hw_held = true;
 	return true;
 }
@@ -769,10 +804,7 @@ trace_hw_arm()
 	else
 		bus_capture_lo_program_trigger_now(trace_lo.pio, trace_lo.sm,
 						   static_cast<uint>(trace_lo.offset));
-	dma_channel_set_write_addr(trace_lo.data_channel, MC6809.trace_base(), false);
-	dma_channel_set_write_addr(trace_hi.data_channel, MC6809.trace_hi_base(), false);
-	dma_channel_set_trans_count(trace_lo.data_channel, TRACE_SIZE, false);
-	dma_channel_set_trans_count(trace_hi.data_channel, TRACE_SIZE, false);
+	trace_hw_dma_setup(MC6809.trace_is_ring());
 	dma_channel_start(trace_lo.data_channel);
 	dma_channel_start(trace_hi.data_channel);
 	// Hold the state machines off until the guest is actually running.  They
@@ -804,6 +836,27 @@ trace_hw_start()
 		return;
 	pio_sm_set_enabled(trace_hi.pio, trace_hi.sm, true);
 	pio_sm_set_enabled(trace_lo.pio, trace_lo.sm, true);
+}
+
+// Freeze a ring where it is: stop the capture and work out which physical
+// row is the oldest.  Runs from the Q-rising handler when the chosen vector
+// is fetched, so it does nothing that cannot be done there: two DMA aborts
+// and three register reads.  The hardware stays held for the dump.
+static void
+trace_hw_freeze()
+{
+	if (!trace_hw_held)
+		return;
+	const uint32_t written = trace_hw_count();
+	trace_hw_quiesce();
+	const uintptr_t base = reinterpret_cast<uintptr_t>(MC6809.trace_base());
+	const uintptr_t next = dma_channel_hw_addr(trace_lo.data_channel)->write_addr;
+	const uint32_t next_row = static_cast<uint32_t>((next - base) / sizeof(uint32_t)) % TRACE_SIZE;
+	// Until the ring has wrapped, row 0 is the oldest; after that the row
+	// the DMA would write next is.
+	const uint32_t rows = written < TRACE_SIZE ? written : TRACE_SIZE;
+	const uint32_t head = written < TRACE_SIZE ? 0u : next_row;
+	MC6809.trace_ring_set(head, rows);
 }
 
 // Set to zero ONLY for bring-up, and ONLY while !NMI is physically
@@ -1043,6 +1096,7 @@ static inline bool
 q_rising_sources()
 {
 	return MC6809.trace_is_capturing()
+	    || MC6809.trace_ring_freeze_pending()
 	    || step_state != STEP_IDLE
 	    || step_request
 	    || step_arm_cycles != 0u
@@ -1105,6 +1159,15 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 			auto eirq = static_cast<interrupt>((address_lsb - 0x30u) >> 1);
 			if (eirq <= INTERRUPT_RESET)
 				MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
+#if TRAP_TRIGGER_ON
+			// Scope trigger on the trap vector, see PICO_THING_TRAP_TRIGGER.
+			if (eirq == INTERRUPT_ILLEGAL) {
+				gpio_put(GPIO_TRACE_D, true);
+				for (unsigned i = 0u; i < 16u; i++)
+					__asm volatile("nop");
+				gpio_put(GPIO_TRACE_D, false);
+			}
+#endif
 			// Both the break command and the watchpoint point the NMI
 			// vector at the BREAK snippet, and the vector fetch is the
 			// point at which the frame is on the stack and the copy is
@@ -1211,6 +1274,9 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 		gpio_put(GPIO_NMI_BLOCK, true);
 		reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
 	}
+	// A ring triggered by a vector freezes a few cycles later, so the
+	// vector fetch is in it; see TRACE_RING_FREEZE_PASSES.
+	MC6809.trace_ring_freeze_tick();
 	// LIC-gated step.  Release and gate are both here for the same
 	// reason the cycle-count path is: from Core 0 the two would be a
 	// millisecond apart, which is not a step.
@@ -4651,7 +4717,11 @@ process_command(char *buf)
 		"  trace [start] [len] (tr)  dump the capture; rows are hex, and the\n"
 		"                           start defaults to 0.  Row numbers stay\n"
 		"                           absolute, so offset dumps line up\n"
-		"  trace <vector>     (tr)  arm on swi|swi2|swi3|nmi|firq|irq\n"
+		"  trace <vector>     (tr)  arm on swi|swi2|swi3|nmi|firq|irq|illegal\n"
+		"                           (illegal = the HD6309 trap through $FFF0, trap also works)\n"
+		"  trace ring [vector] (tr) keep the last %u cycles, frozen when the\n"
+		"                           vector is taken, or by trace stop\n"
+		"  trace stop         (tr)  freeze a running ring\n"
 		"  break [addr|r]     (br)  breakpoint; r resumes\n"
 		"  irq <0-8>          (ir)  interrupt tests; 7 is NMIBlock latency,\n"
 		"                           8 is the DAT fault path\n"
@@ -4674,7 +4744,7 @@ process_command(char *buf)
 		"  help               (h)   this text\n"
 		"\nAn S-record pasted at the prompt is loaded directly.\n\n",
 		static_cast<double>(GUEST_CLK_MIN), static_cast<double>(GUEST_CLK_MAX),
-		TRACE_SIZE);
+		TRACE_SIZE, TRACE_SIZE);
 		break;
 
 	case CMD_STATUS: {
@@ -6050,20 +6120,30 @@ status_done:
 		// gate, the read ISR's AVMA guard), so a ! column is the warning that
 		// the assumption has broken - worth re-reading after any change to
 		// this handler's cost, or at a higher E where t_CD is tighter.
-		const uint32_t blas = MC6809.trace_bla_count();
+		const bool ring = MC6809.trace_is_ring();
+		if (ring && !MC6809.trace_ring_is_frozen()) {
+			printf("trace: ring still running (%" PRIu32 " cycles so far) - "
+			       "'trace stop' or the trigger vector freezes it\n\n", have);
+			break;
+		}
+		// A ring has no mirror column: nothing ran per cycle to record it.
+		const uint32_t blas = ring ? 0u : MC6809.trace_bla_count();
 		uint32_t bla_differs = 0u, bla_differs_prev = 0u;
 		printf("    #  EQ R/W  A  D  CS  bus-state    B L V  b l v !  "
 		       "H N F I  TSK Pg  FM\n");
 		for (uint32_t i = start; i < start + len; i++) {
-			bus_pins bp{}; bp.word = MC6809.trace_word(i);
-			high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(i);
+			// Rows are numbered oldest first; a frozen ring maps them
+			// onto the buffer from wherever its oldest cycle landed.
+			const uint32_t r = MC6809.trace_row(i);
+			bus_pins bp{}; bp.word = MC6809.trace_word(r);
+			high_bus_pins hp{}; hp.word = MC6809.trace_hi_word(r);
 			BLA bla{}; bla.byte = static_cast<uint8_t>(bp.bits.BUSY_LIC_AVMA);
 			const bool have_bla = i < blas;
 			BLA mir{}; mir.byte = have_bla ? MC6809.trace_bla_byte(i) : 0u;
 			// The pins from the row before: what this row's handler read
 			// should match.  Row 0 has no predecessor to check against.
 			BLA prev{};
-			bus_pins pbp{}; pbp.word = (i > 0u) ? MC6809.trace_word(i - 1u) : 0u;
+			bus_pins pbp{}; pbp.word = (i > 0u) ? MC6809.trace_word(MC6809.trace_row(i - 1u)) : 0u;
 			prev.byte = static_cast<uint8_t>(pbp.bits.BUSY_LIC_AVMA);
 			// Counted BOTH ways, because which row the handler's read
 			// belongs to is a measurement, not an argument: against this
@@ -6103,8 +6183,12 @@ status_done:
 			       hp.bits.FAULT ? 'F' : '.',
 			       hp.bits.NMI_BLOCK ? 'M' : '.');
 		}
-		printf("%" PRIu32 " of %" PRIu32 " cycles%s\n", len, have,
-		       MC6809.trace_is_full() ? " (buffer full)" : "");
+		if (ring)
+			printf("%" PRIu32 " of %" PRIu32 " cycles, oldest first; ring frozen%s\n",
+			       len, have, have >= TRACE_SIZE ? " after wrapping" : " before wrapping");
+		else
+			printf("%" PRIu32 " of %" PRIu32 " cycles%s\n", len, have,
+			       MC6809.trace_is_full() ? " (buffer full)" : "");
 		// The mirror column is written by the Q handler from trace_arm(),
 		// while the DMA columns start when the trigger fires.  With 'trace
 		// on' those are the same moment; with a vector trigger the handler
@@ -6125,6 +6209,34 @@ status_done:
 	case CMD_TRACE_OFF:
 		MC6809.trace_clear();
 		printf("trace stopped and cleared\n\n");
+		break;
+
+	case CMD_TRACE_RING: {
+		static constexpr const char *const rnames[NUM_INTERRUPTS] = {
+			"ILLEGAL", "SWI3", "SWI2", "FIRQ", "IRQ", "SWI", "NMI", "RESET", "NONE"
+		};
+		const auto it = static_cast<interrupt>(cmd.trace.intr);
+		const uint8_t mask = (it < INTERRUPT_NONE) ? static_cast<uint8_t>(1u << it) : 0u;
+		MC6809.trace_ring_arm(mask);
+		if (mask)
+			printf("trace ring armed: keeping the last %u cycles, frozen when the %s vector is taken (or by 'trace stop')\n\n",
+			       TRACE_SIZE, rnames[it]);
+		else
+			printf("trace ring armed: keeping the last %u cycles until 'trace stop'\n\n", TRACE_SIZE);
+		break;
+	}
+
+	case CMD_TRACE_FREEZE:
+		if (!MC6809.trace_is_ring() || !MC6809.trace_is_armed()) {
+			printf("trace: no ring is running - arm one with 'trace ring [<irq>]'\n\n");
+			break;
+		}
+		if (MC6809.trace_ring_is_frozen()) {
+			printf("trace: ring already frozen\n\n");
+			break;
+		}
+		MC6809.trace_ring_freeze();
+		printf("trace ring frozen: %" PRIu32 " cycles, oldest first\n\n", MC6809.trace_count());
 		break;
 
 	case CMD_TRACE_IRQ: {
@@ -6706,7 +6818,7 @@ __no_inline_not_in_flash_func(main_core1)()
 
 	// Trace pins - ISR set.  Named individually rather than as a run: they
 	// sit on 37-38 on version 1 but 38-39 on version 2, where 37 is TASK0.
-#if TESTPOINTS_ON
+#if TESTPOINTS_ON || TRAP_TRIGGER_ON
 	static constexpr uint8_t trace_pins[] = { GPIO_TRACE_C, GPIO_TRACE_D };
 	for (const uint8_t p : trace_pins) {
 		gpio_init(p);
@@ -7542,7 +7654,7 @@ bus_pio_dma_init()
 	trace_hw_usable = true;
 	trace_hw_held = false;
 	trace_hw_samples = 0u;
-	MC6809.set_trace_callbacks(trace_hw_arm, trace_hw_stop, trace_hw_count);
+	MC6809.set_trace_callbacks(trace_hw_arm, trace_hw_stop, trace_hw_count, trace_hw_freeze);
 	printf("Core0 bus trace DMA %d/%d; pio%u+pio%u programs and state"
 	       " machines claimed only while a capture is armed\n",
 	       trace_lo.data_channel, trace_hi.data_channel,

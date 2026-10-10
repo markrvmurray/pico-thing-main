@@ -350,6 +350,9 @@ message(STATUS "Pico-Thing ISR cost instrument: ${PICO_THING_ISR_COST}")
 # scope can see when each one ran and for how long.  Two SIO writes per entry
 # on paths that run every E cycle, for a signal nobody needs unless they have
 # probes on the board.
+set(PICO_THING_TRAP_TRIGGER 0 CACHE STRING
+	"1: pulse GPIO_TRACE_D for ~50 ns when the guest takes the HD6309 trap vector ($FFF0) - a scope trigger for the misread fetch ~15 E cycles earlier; costs nothing otherwise")
+message(STATUS "Pico-Thing trap trigger: ${PICO_THING_TRAP_TRIGGER}")
 set(PICO_THING_TESTPOINTS 0 CACHE STRING
 	"1 = drive the GPIO scope marker pins from the ISRs, 0 = do not")
 message(STATUS "Pico-Thing ISR testpoints: ${PICO_THING_TESTPOINTS}")
@@ -395,6 +398,7 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_ISR_COST=${PICO_THING_ISR_COST}
 	PICO_THING_DIAG=${PICO_THING_DIAG}
 	PICO_THING_TESTPOINTS=${PICO_THING_TESTPOINTS}
+	PICO_THING_TRAP_TRIGGER=${PICO_THING_TRAP_TRIGGER}
 	PICO_THING_ADC_CLK_KHZ=${PICO_THING_ADC_CLK_KHZ}u
 )
 

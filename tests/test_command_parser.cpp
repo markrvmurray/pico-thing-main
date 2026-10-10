@@ -943,10 +943,46 @@ TEST_CASE("trace command", "[parser][trace]")
 
 		REQUIRE(parse("trace firq", &cmd));
 		CHECK(cmd.trace.intr == INTERRUPT_FIRQ);
+
+		// The HD6309 trap vector at $FFF0, by either name
+		REQUIRE(parse("trace illegal", &cmd));
+		CHECK(cmd.trace.intr == INTERRUPT_ILLEGAL);
+		REQUIRE(parse("trace trap", &cmd));
+		CHECK(cmd.trace.intr == INTERRUPT_ILLEGAL);
 	}
 	SECTION("trace with unknown interrupt name is rejected")
 	{
 		CHECK_FALSE(parse("trace bogus", &cmd));
+	}
+	SECTION("trace ring with no trigger")
+	{
+		REQUIRE(parse("trace ring", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_RING);
+		CHECK(cmd.trace.intr == INTERRUPT_NONE);
+	}
+	SECTION("trace ring <irq> names the freezing vector")
+	{
+		REQUIRE(parse("trace ring nmi", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_RING);
+		CHECK(cmd.trace.intr == INTERRUPT_NMI);
+		REQUIRE(parse("trace ring irq", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_RING);
+		CHECK(cmd.trace.intr == INTERRUPT_IRQ);
+		REQUIRE(parse("tr ring illegal", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_RING);
+		CHECK(cmd.trace.intr == INTERRUPT_ILLEGAL);
+	}
+	SECTION("trace ring with a bad vector is an error")
+	{
+		CHECK_FALSE(parse("trace ring reset", &cmd));
+		CHECK_FALSE(parse("trace loop nmi", &cmd));
+	}
+	SECTION("trace stop freezes a ring")
+	{
+		REQUIRE(parse("trace stop", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_FREEZE);
+		REQUIRE(parse("tr sp", &cmd));
+		CHECK(cmd.tag == CMD_TRACE_FREEZE);
 	}
 }
 

@@ -75,6 +75,16 @@ parse_dec(const char *s)
 /* Map an interrupt mnemonic to its enum interrupt value, or -1 if unknown.
  * Only the non-keyword mnemonics arrive here as TOK_WORD; "irq" comes via
  * TOK_IRQ in the grammar. */
+/* A TOK_WORD's text is a pointer into the lexer's buffer, and once the lexer
+ * has moved on the character after the word is no longer a terminator: an
+ * earlier word reads as "ring nmi".  Compare up to the next blank instead. */
+static int
+word_is(const char *s, const char *w)
+{
+	const size_t n = strlen(w);
+	return strncasecmp(s, w, n) == 0 && (s[n] == '\0' || s[n] == ' ' || s[n] == '\t');
+}
+
 static int
 parse_intname(const char *s)
 {
@@ -83,6 +93,14 @@ parse_intname(const char *s)
 	if (!strcasecmp(s, "swi3")) return INTERRUPT_SWI3;
 	if (!strcasecmp(s, "nmi"))  return INTERRUPT_NMI;
 	if (!strcasecmp(s, "firq")) return INTERRUPT_FIRQ;
+	/* The HD6309's illegal-opcode (and division) trap, through $FFF0.  A
+	 * misread opcode at the top of the E range lands here first, and on a
+	 * chunk whose slot is JMP $0000 it becomes a frame storm that sweeps
+	 * RAM before anything can be read - this is the arm that catches it.
+	 * ("reset" cannot be offered here: it is the reset command's keyword
+	 * and never arrives as a word.) */
+	if (!strcasecmp(s, "illegal")) return INTERRUPT_ILLEGAL;
+	if (!strcasecmp(s, "trap"))    return INTERRUPT_ILLEGAL;
 	return -1;
 }
 
@@ -684,7 +702,7 @@ irq_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * trace [ <len> ]
+ * trace [ <len> | <start> <len> | on | off | <irq> | ring [<irq>] | stop ]
  * ----------------------------------------------------------------------- */
 trace_cmd:
 	  TOK_TRACE {
@@ -726,11 +744,43 @@ trace_cmd:
 		result->tag        = CMD_TRACE_IRQ;
 		result->trace.intr = (uint8_t)INTERRUPT_IRQ;
 	}
+	| TOK_TRACE TOK_STOP {
+		/* freeze a running ring where it is */
+		result->tag = CMD_TRACE_FREEZE;
+	}
+	| TOK_TRACE TOK_WORD TOK_IRQ {
+		if (!word_is($2, "ring")) {
+			printf("Unknown trace mode '%s' (use ring)\n", $2);
+			YYERROR;
+		}
+		result->tag        = CMD_TRACE_RING;
+		result->trace.intr = (uint8_t)INTERRUPT_IRQ;
+	}
+	| TOK_TRACE TOK_WORD TOK_WORD {
+		if (!word_is($2, "ring")) {
+			printf("Unknown trace mode '%s' (use ring)\n", $2);
+			YYERROR;
+		}
+		int code = parse_intname($3);
+		if (code < 0) {
+			printf("Unknown trace interrupt '%s' "
+			       "(use swi, swi2, swi3, nmi, firq, irq, illegal)\n", $3);
+			YYERROR;
+		}
+		result->tag        = CMD_TRACE_RING;
+		result->trace.intr = (uint8_t)code;
+	}
 	| TOK_TRACE TOK_WORD {
+		if (!strcasecmp($2, "ring")) {
+			/* ring with no trigger: only 'trace stop' freezes it */
+			result->tag        = CMD_TRACE_RING;
+			result->trace.intr = (uint8_t)INTERRUPT_NONE;
+			break;
+		}
 		int code = parse_intname($2);
 		if (code < 0) {
 			printf("Unknown trace interrupt '%s' "
-			       "(use swi, swi2, swi3, nmi, firq, irq)\n", $2);
+			       "(use swi, swi2, swi3, nmi, firq, irq, illegal)\n", $2);
 			YYERROR;
 		}
 		result->tag        = CMD_TRACE_IRQ;
