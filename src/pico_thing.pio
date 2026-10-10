@@ -191,8 +191,21 @@ mc6809_clock_program_deinit(PIO pio, uint sm)
 .wrap_target
 wait_q:
 	wait	0 gpio GPIO_Q	side 0  ; Wait for new Q cycle
+; AVMA GATE.  The 6809's dead cycles - the VMA-off cycle in every branch and
+; most indexed instructions - put $FFFF on the bus with !CS asserted, and this
+; machine served each one: an address push, a DMA round trip and the vector
+; byte driven onto the bus, for a cycle the CPU ignores.  AVMA, sampled here
+; at Q's trailing edge, says whether the NEXT cycle is a real access; if it
+; was low the next cycle is skipped entirely and the bus is left alone.  Five
+; words, because PIO has no bit test: the sample goes through the OSR and bit
+; 20 (GPIO 22 against the IN base of GPIO 2) comes out alone into X.
+	mov	x pins		side 0	; all 32 input pins; bit 20 is AVMA
 	wait	1 gpio GPIO_Q	side 0
 	jmp	pin wait_q	side 0	; If !CS (jmp_pin) is high, try again next cycle
+	mov	osr x		side 0
+	out	null 20		side 0	; drop R/!W, A0-A5, D0-D7, !CS, BS, BA, BUSY, LIC
+	out	x 1		side 0	; X = AVMA from the previous cycle
+	jmp	!x wait_q	side 0	; low: this is a dead cycle - do not serve it
 	in	pins 7		side 1	; R/!W, A0-A5 all stable at Q rising edge
 	in	null 25		side 1	; Move A0-A5, R/!W to the right
 	mov	osr isr		side 1
@@ -211,8 +224,18 @@ public dma_wait:
 	jmp	x-- no_notify	side 0	; A5 or A4 set: plain memory, tell the CPU nothing
 	irq	set 4		side 0	; $FFC0-$FFCF is a device register: notify
 no_notify:
-	wait	0 gpio GPIO_Q	side 0	; Q trailing edge
-	mov	pindirs !null	side 1	; Set D0-D7 to outz                                                                                                                                                                                                                                                                                                                                                                                                                      cput
+; DRIVE FROM E'S LEADING EDGE, NOT Q'S TRAILING EDGE.  The byte has been in
+; the output register since the out above, ~11 clk_sys cycles after the push
+; (measured with `lo R fffe`, 2026-10-10), long before E rises.  Waiting for Q
+; to fall put it on the bus for only the LAST QUARTER of the cycle - 96 ns at
+; 2.6 MHz, less the pad, the buffer and the HD63C09E's setup time - and that
+; window shrinks with E whatever clk_sys does, which is why 2.6 would not start
+; even cold and 360 MHz did not help.  From E rising the data is on the bus for
+; half the cycle.  It is contention-free because the bus buffer's DIR is R/!W
+; and its OE is !CS: on a Pico-window read it faces the CPU from Q rising, and
+; nothing else is selected.
+	wait	1 gpio GPIO_E	side 0	; E leading edge
+	mov	pindirs !null	side 1	; Set D0-D7 to output                                                                                                                                                                                                                                                                                                                                                                                                                    cput
 	wait	0 gpio GPIO_E	[7] side 1	; E trailing edge plus a bit
 	mov	pindirs null	side 0	; Set D0-D7 back to input
 .wrap
@@ -282,7 +305,19 @@ wait_q:
 	mov	x y		side 1  ; Get registers[] address
 	in	x 26		side 1  ; MSBs of registers[], R/!W falls off the end
 	push	block		side 1	; Send full address = registers[] + A0-A5
-	wait	1 gpio GPIO_E	side 0	; E leading edge
+; SAMPLE THE DATA AT Q'S TRAILING EDGE, NOT E'S LEADING EDGE.  A 6809E puts
+; write data on the bus some time after Q rises (tDDQ) and holds it until after
+; E falls (tDHW).  Sampling a few PIO cycles after E rose gave it one quarter
+; of the cycle to appear - 96 ns at 2.6 MHz before pad and buffer delays - and
+; a CMOS part gets slower as it warms, which is the shape of the 2.45 MHz
+; warm-board failures and the 2.6 wall (2026-10-10): the guest ran its program
+; from RAM correctly and only its Pico-window writes were garbled, one junk
+; byte on the console and an ACIA left in a mode the test loop waits on.  Q
+; falls half a cycle after it rose, so the data has had twice as long and is
+; still held; the three pushes below start a quarter cycle later, which the
+; write ISR's follow-up absorbs, since the guest's next status read is two or
+; more cycles away.
+	wait	0 gpio GPIO_Q	side 0	; Q trailing edge
 	in	pins 15		side 1	; Get D0-D7, A0-A5, R/!W
 	in	null 24		side 1	; Get D0-D7 to the right; A0-A5 + R/!W fall of the end
 ; THE DATA BYTE GOES OUT TWICE: once for the DMA that stores it, once for the
@@ -406,7 +441,7 @@ trigger:
 	wait	1 gpio GPIO_E		; resynchronise
 	wait	0 gpio GPIO_E		; E falling
 	in	pins 32			; autopush -> RX FIFO -> DMA
-	irq	prev set 2		; wake the high half (wraps pio0 -> pio2)
+	irq	next set 2		; wake the high half (pio1 -> pio2; it was "prev" when this lived on pio0)
 .wrap
 
 ; Bus capture (high half) — GPIO 32-47, 16 bits per E cycle.

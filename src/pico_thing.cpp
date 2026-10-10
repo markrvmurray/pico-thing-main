@@ -169,7 +169,7 @@ volatile bool verbose = false;
 #define BUS_READ_PIO	pio0		// guest reads of the register block
 #define BUS_WRITE_PIO	pio1		// guest writes to the register block
 #define TASK_OUTPUT_PIO	pio2		// task pins, GPIO base 16
-#define TRACE_LO_PIO	pio0		// bus trace, GPIO 0-31
+#define TRACE_LO_PIO	pio1		// bus trace, GPIO 0-31 (moved from pio0 2026-10-11 to make room for the read SM's AVMA gate; pio1 = clock 4 + write 22 + this 5 = 31 words)
 #define TRACE_HI_PIO	pio2		// bus trace, GPIO 32-47
 #define BUS_FAULT_PIO	pio2		// DAT fault sampler, needs GPIO_FAULT
 #define INT_PINS_PIO	pio2		// !NMI/!FIRQ/!IRQ driver, GPIO 24-26
@@ -1653,23 +1653,16 @@ __time_critical_func(dma_bus_read_irq_handler())
 	gpio_put(GPIO_TRACE_C, true);
 #endif
 	pio_interrupt_clear(piodma_read.pio, READ_DEVICE_PIO_IRQ);
-	// AVMA from the pin, via the Q-rising handler's snapshot.  BE CLEAR ABOUT
-	// WHAT THIS TESTS: the pins are in-advance signals read past t_CD, so
-	// this asks "is the NEXT cycle a valid bus cycle", not "was this one".
-	// Neither source answers the question exactly - the mirror it replaced
-	// was a cycle behind the access, this is a cycle ahead of it - and the
-	// filter is belt-and-braces anyway, since the read DMA only completes
-	// when the guest really did read this window.
-	//
-	// What settles it is measurement, over a full acia_torture run each way:
-	// the mirrored AVMA was low on 92% of the completions this ISR saw and
-	// rejected 2 of 305 ACIA data reads, with offset $FFD4 turning up in both
-	// the passed and the rejected set - the verdict followed the cycle pattern
-	// of whatever instruction did the reading.  The pin is low on 1.1% of
-	// completions and has rejected ZERO ACIA reads in 610.  A rejection here
-	// costs no data either way: the for(;;) loop services the access, just
-	// not on the fast path.
-	if (MC6809.run_state >= RS_RUNNING && gpio_get(GPIO_AVMA)) {
+	// NO AVMA TEST ANY MORE.  AVMA is a forecast - asserted in cycle N it says
+	// cycle N+1 is a valid bus cycle - so sampled here, after the read it was
+	// meant to judge had completed, it described the FOLLOWING cycle, and the
+	// measurement said as much: low on 1.1% of completions and ZERO rejections
+	// in 610 ACIA data reads over a full acia_torture run.  A SIO read and a
+	// branch on every device read, for nothing (2026-10-11).  The filter was
+	// belt-and-braces anyway: this DMA only completes when the guest really
+	// did read this window.  The run-state guard stays: a snippet's reads
+	// must not take the device fast path.
+	if (MC6809.run_state >= RS_RUNNING) {
 		const uintptr_t read_addr = dma_channel_hw_addr(piodma_read.data_channel)->read_addr;
 		const uint8_t loc = read_addr & registers::register_mask;
 		if (loc == CONSOLE_RX_DATA) {
