@@ -550,6 +550,27 @@ static volatile uint32_t core1_qrise_count = 0u;
 static volatile uint32_t core1_irq_assert_count = 0u;
 #endif
 static volatile uint32_t core1_loop_count = 0u;
+
+// Task register event log (always on - the events are rare).  Every guest
+// write to SYSTEM_TASK, every guest READ of it (the value the DMA served) and
+// every firmware fault switch, in order, stamped with the Core 1 loop count.
+// 'st' prints the tail.  Built 2026-10-11 to settle whether a kernel read-back
+// of $FFC0 can return a task the kernel had already replaced.
+struct task_event { uint32_t when; uint8_t kind; uint8_t value; uint8_t in_force; uint8_t pad; };
+static constexpr uint32_t TASK_LOG_LEN = 32u;
+static volatile task_event task_log[TASK_LOG_LEN];
+static volatile uint32_t task_log_count = 0u;
+static inline void
+task_log_add(const uint8_t kind, const uint8_t value, const uint8_t in_force)
+{
+	const uint32_t i = task_log_count;
+	volatile task_event &e = task_log[i % TASK_LOG_LEN];
+	e.when = core1_loop_count;
+	e.kind = kind;
+	e.value = value;
+	e.in_force = in_force;
+	task_log_count = i + 1u;
+}
 #if DIAG_ON
 static volatile uint32_t core1_write_ring_count = 0u;
 static volatile uint8_t core1_last_write_loc = 0u;
@@ -1249,6 +1270,7 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 			// before the handler runs.
 			if (eirq == INTERRUPT_NMI && dat_fault_nmi_pending) {
 				dat_fault_nmi_pending = false;
+				task_log_add('F', 0u, MC6809.task_get());
 				const uint8_t supervisor = MC6809.task_change(0u);
 				reg[SYSTEM_TASK] = supervisor;
 				task_pins_update(supervisor);
@@ -1786,6 +1808,8 @@ __time_critical_func(dma_bus_read_irq_handler())
 		} else if (loc == SYSTEM_TIMER_STATUS) {
 			// Reading the timer status register acknowledges the IRQ.
 			system_tick.acknowledge();
+		} else if (loc == SYSTEM_TASK) {
+			task_log_add('R', reg[SYSTEM_TASK], MC6809.task_get());
 		} else if (loc == SYSTEM_DAT_FAULT) {
 			// Reading the fault register clears the fault and the R/!W
 			// latched with it — the DMA has already handed the pre-clear byte
@@ -2037,6 +2061,7 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 	// instruction picks up an incorrect read. I.e., these need to be _fast_.
 	if (wloc == SYSTEM_TASK) {
 		const uint8_t old_task = MC6809.task_get();
+		task_log_add('W', wval, old_task);
 		const uint8_t new_task = MC6809.task_change(wval);
 		if (old_task != 0u && new_task != 0u && new_task != old_task) {
 			task_write_odd_count++;
@@ -4201,6 +4226,16 @@ status_print(const status_snapshot_t *s)
 		printf("   <- last was task %u -> %u!",
 		       s->task_write_odd_from, s->task_write_odd_to);
 	printf("\n");
+	{
+		// Task register event log, copied without locking (diagnostic).
+		const uint32_t n = task_log_count;
+		const uint32_t shown = n < TASK_LOG_LEN ? n : TASK_LOG_LEN;
+		printf("  Task log: %" PRIu32 " events; last %" PRIu32 " (W val<-in force: guest write; R served/in force: guest read-back; F: fault switch):\n", n, shown);
+		for (uint32_t k = n - shown; k < n; ++k) {
+			const volatile task_event &e = task_log[k % TASK_LOG_LEN];
+			printf("    #%" PRIu32 " @%" PRIu32 " %c %02X/%02X\n", k, e.when, e.kind, e.value, e.in_force);
+		}
+	}
 
 	// 3. LIC / RTI (DEBUG only)
 #ifdef DEBUG
