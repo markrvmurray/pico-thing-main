@@ -34,6 +34,7 @@ all: $(ASSIST09_TARGETS) \
      test_send.s19 test_send.bin \
      flowtest.s19 flowtest.bin \
      acia_torture.s19 acia_torture.bin tick_torture.s19 tick_torture.bin \
+     wt_trig.s19 wt_isr.s19 \
      hello.srec hello.raw disk_test.srec disk_test.raw \
      disk_write_test.srec disk_write_test.raw \
      diskload.srec diskload.raw dat_torture.srec dat_torture.raw \

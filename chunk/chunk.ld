@@ -6,6 +6,9 @@ section CONSTANT
 section BSSTART
 section bss
 section BSSEND
+section FIXED load E100
+section FIXEDDATA load E200
+section FIXEDISR load E300
 section SYSVECTORS load FD00
 section DAT_RAM load FE00
 section IO_DEVICES load FF00
