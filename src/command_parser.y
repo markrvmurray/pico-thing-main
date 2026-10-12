@@ -826,10 +826,14 @@ stop_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * freq <freqMHz>
+ * freq [ <freqMHz> ]   - no argument reports the E/Q clock
  * ----------------------------------------------------------------------- */
 freq_cmd:
-	  TOK_FREQ TOK_FLOAT {
+	  TOK_FREQ {
+		/* bare "fq": report the guest's E/Q clock */
+		result->tag = CMD_FREQ_QUERY;
+	}
+	| TOK_FREQ TOK_FLOAT {
 		if ($2 < 0.8f || $2 > 3.0f) {
 			printf("Frequency %.2f out of range [0.8 .. 3.0]\n", (double)$2);
 			YYERROR;

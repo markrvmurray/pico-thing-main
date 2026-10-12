@@ -1057,6 +1057,13 @@ TEST_CASE("freq command", "[parser][freq]")
 	using Catch::Matchers::WithinRel;
 	parsed_cmd_t cmd;
 
+	SECTION("bare freq reports the clock")
+	{
+		REQUIRE(parse("freq", &cmd));
+		CHECK(cmd.tag == CMD_FREQ_QUERY);
+		REQUIRE(parse("fq", &cmd));
+		CHECK(cmd.tag == CMD_FREQ_QUERY);
+	}
 	SECTION("freq 1.0 (floating-point token)")
 	{
 		REQUIRE(parse("freq 1.0", &cmd));

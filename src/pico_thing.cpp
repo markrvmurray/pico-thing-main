@@ -4454,6 +4454,43 @@ status_print(const status_snapshot_t *s)
 	printf("Tick:  Enabled: %-3s  IRQ Pending: %-3s\n",
 	       s->tick_enabled ? "yes" : "no",
 	       s->tick_irq_pending ? "yes" : "no");
+	// Interrupt bookkeeping that is Core 1's, not any one device's: it sat
+	// under the console ACIA only because the first of these counters was
+	// added there.
+	printf("Interrupts:\n");
+	// A GATED-OFF COUNTER PRINTS "off", NEVER 0.  Three times in one session
+	// an absent or zeroed count was read as a fault - this console "Status"
+	// column, st's "Read IRQ" after the address filter, and the LIC count -
+	// so a zero here has to mean zero.
+#if DIAG_ON
+	printf("  IRQ taken %" PRIu32 " times; /IRQ asserted %" PRIu32
+	       " E cycles (%.1f cycles per taken interrupt)\n",
+	       irq_vectors, pend_irq_cycles,
+	       irq_vectors ? (double) pend_irq_cycles / (double) irq_vectors
+			   : 0.0);
+#else
+	printf("  IRQ taken %" PRIu32 " times; /IRQ asserted: off"
+	       " (build with -D PICO_THING_DIAG=1)\n", irq_vectors);
+#endif
+#if DIAG_ON
+	printf("  /IRQ: loop raised %" PRIu32 ", dropped %" PRIu32 " at the"
+	       " data read, %" PRIu32 " at the vector fetch\n",
+	       irq_loop_assert, irq_isr_deassert, irq_ack_deassert);
+#else
+	printf("  /IRQ: where it was raised and dropped is off"
+	       " (build with -D PICO_THING_DIAG=1)\n");
+#endif
+#if DIAG_ON
+	printf("  Armed byte: %" PRIu32 " time%s a live source found it clear for two passes%s\n",
+	       q_armed_missed, q_armed_missed == 1u ? "" : "s",
+	       q_armed_missed ? "  *** A WRITER IS MISSING q_rising_arm() ***" : "");
+	printf("  NMI-work byte: %" PRIu32 " time%s a live source found it clear for two passes%s\n",
+	       nmi_work_missed, nmi_work_missed == 1u ? "" : "s",
+	       nmi_work_missed ? "  *** A WRITER IS MISSING loop_nmi_work = 1 ***" : "");
+#else
+	printf("  Armed byte audit: off (build with -D PICO_THING_DIAG=1)\n");
+	printf("  NMI-work byte audit: off (build with -D PICO_THING_DIAG=1)\n");
+#endif
 	printf("Core 1:\n");
 	// READ IRQ AND "Last Read" ONLY SEE $FFC0-$FFCF NOW, and a zero in that
 	// column is normal rather than broken.  The read program's address filter
@@ -4537,39 +4574,6 @@ status_print(const status_snapshot_t *s)
 #if !DIAG_ON
 	printf("    (Status column is OFF, not zero - build with"
 	       " -D PICO_THING_DIAG=1)\n");
-#endif
-	// A GATED-OFF COUNTER PRINTS "off", NEVER 0.  Three times in one session
-	// an absent or zeroed count was read as a fault - this console "Status"
-	// column, st's "Read IRQ" after the address filter, and the LIC count -
-	// so a zero here has to mean zero.
-#if DIAG_ON
-	printf("    IRQ taken %" PRIu32 " times; /IRQ asserted %" PRIu32
-	       " E cycles (%.1f cycles per taken interrupt)\n",
-	       irq_vectors, pend_irq_cycles,
-	       irq_vectors ? (double) pend_irq_cycles / (double) irq_vectors
-			   : 0.0);
-#else
-	printf("    IRQ taken %" PRIu32 " times; /IRQ asserted: off"
-	       " (build with -D PICO_THING_DIAG=1)\n", irq_vectors);
-#endif
-#if DIAG_ON
-	printf("    /IRQ: loop raised %" PRIu32 ", dropped %" PRIu32 " at the"
-	       " data read, %" PRIu32 " at the vector fetch\n",
-	       irq_loop_assert, irq_isr_deassert, irq_ack_deassert);
-#else
-	printf("    /IRQ: where it was raised and dropped is off"
-	       " (build with -D PICO_THING_DIAG=1)\n");
-#endif
-#if DIAG_ON
-	printf("    Armed byte: %" PRIu32 " time%s a live source found it clear for two passes%s\n",
-	       q_armed_missed, q_armed_missed == 1u ? "" : "s",
-	       q_armed_missed ? "  *** A WRITER IS MISSING q_rising_arm() ***" : "");
-	printf("    NMI-work byte: %" PRIu32 " time%s a live source found it clear for two passes%s\n",
-	       nmi_work_missed, nmi_work_missed == 1u ? "" : "s",
-	       nmi_work_missed ? "  *** A WRITER IS MISSING loop_nmi_work = 1 ***" : "");
-#else
-	printf("    Armed byte audit: off (build with -D PICO_THING_DIAG=1)\n");
-	printf("    NMI-work byte audit: off (build with -D PICO_THING_DIAG=1)\n");
 #endif
 	printf("  Aux         %02X  %6u  %6u  %7u  %7u  %7u  %7u\n",
 	       s->aux_acia.interrupt_status,
@@ -6444,6 +6448,21 @@ status_done:
 		printf("NMI vector restored to %04X\n", break_saved_nmi_vector);
 		break_active = INTERRUPT_NONE;
 		break;
+
+	case CMD_FREQ_QUERY: {
+		// What the clock program is actually dividing by: the PIO divider
+		// keeps 8 fractional bits, so the delivered E differs slightly from
+		// the requested one at most settings.
+		const float requested = MC6809.get_e_frequency();
+		const float sys_hz = static_cast<float>(clock_get_hz(clk_sys));
+		const float div = sys_hz / (4.0f * requested * 1.0e6f);
+		const float div_pio = roundf(div * 256.0f) / 256.0f;
+		const float actual = sys_hz / (4.0f * div_pio) / 1.0e6f;
+		printf("E/Q clock: %.1f MHz requested, %.4f MHz delivered"
+		       " (clk_sys %u kHz / 4 / %.4f)\n",
+		       requested, actual, clock_get_hz(clk_sys) / 1000u, div_pio);
+		break;
+	}
 
 	case CMD_FREQ:
 		if (!MC6809.assert_powered())

@@ -76,6 +76,7 @@ typedef enum cmd_tag {
 	CMD_STOP_STOP,
 
 	CMD_FREQ,
+	CMD_FREQ_QUERY,
 
 	CMD_USB,
 
