@@ -1017,3 +1017,146 @@ TEST_CASE("a status register changed behind the ACIA's back is corrected") {
 
 	CHECK(status().tdre == 1);
 }
+
+// -----------------------------------------------------------------------
+// Host bytes and the interrupt recompute (Core 1 loop audit, finding 6)
+// -----------------------------------------------------------------------
+//
+// In the firmware has_interrupt() runs on every Q-rising edge per ACIA and
+// answers from its cache unless something marked the state dirty.  Host bytes
+// used to mark it dirty every time, so under DriveWire every byte the host
+// moved cost a full recompute.  A host byte can only change the IRQ line, or
+// the status byte, at a transition: the first byte that can be staged into an
+// empty RX register, the TX queue dropping from full (TDRE back), and the TX
+// queue dropping to the CTS threshold (CTS back).  These tests pin the counts
+// and prove the IRQ line and status still follow the transitions exactly.
+
+// Host bytes arriving while the RX register already holds one cannot change
+// anything until the guest reads it: one recompute for the staged byte, none
+// for the rest of the burst.
+TEST_CASE("host bytes queued behind a full RX register do not recompute") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_control(uart, 0x80u);			// rx_irq on
+	(void)uart.has_interrupt();			// cache the quiet state
+	const uint32_t before = uart.recompute_count();
+
+	for (uint i = 0; i < 100; i++) {
+		uart.host_transmit(static_cast<uint8_t>(i));
+		(void)uart.has_interrupt();		// one Q-rising per byte
+	}
+	const uint32_t cost = uart.recompute_count() - before;
+	INFO("recomputes for 100 host bytes into a full register: " << cost);
+	CHECK(cost == 1);
+	CHECK(status().rdrf == 1);
+	CHECK(status().irq == 1);
+	CHECK(registers::peek(CONSOLE_RX_DATA) == 0);	// the first byte, still staged
+}
+
+// Every byte the guest reads opens the register for the next one, so a
+// read-stage-read sequence recomputes once per byte delivered, and the IRQ
+// line follows RDRF through each of them.
+TEST_CASE("each guest read stages the next host byte with one recompute") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_control(uart, 0x80u);			// rx_irq on
+	for (uint i = 0; i < 8; i++)
+		uart.host_transmit(static_cast<uint8_t>('a' + i));
+	(void)uart.has_interrupt();			// stages 'a'
+	REQUIRE(status().rdrf == 1);
+	REQUIRE(status().irq == 1);
+
+	for (uint i = 0; i < 8; i++) {
+		CHECK(registers::peek(CONSOLE_RX_DATA) == static_cast<uint8_t>('a' + i));
+		const uint32_t before = uart.recompute_count();
+		uart.rx_read_fast_path();		// read ISR: RDRF and IRQ drop at once
+		CHECK(status().rdrf == 0);
+		CHECK(status().irq == 0);
+		uart.guest_receive();			// loop follow-up: stages the next byte
+		(void)uart.has_interrupt();
+		CHECK(uart.recompute_count() - before == 1);
+		if (i < 7) {
+			CHECK(status().rdrf == 1);
+			CHECK(status().irq == 1);
+		} else {
+			CHECK(status().rdrf == 0);
+			CHECK(status().irq == 0);
+		}
+	}
+}
+
+// RIE off: the bytes still stage and RDRF still follows them, but the IRQ
+// line never rises; turning RIE on later raises it for the byte already
+// staged, through the control write's own dirtying.
+TEST_CASE("RDRF staging without rx_irq never raises IRQ until rx_irq is set") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_control(uart, 0x00u);
+	uart.host_transmit('x');
+	CHECK(uart.has_interrupt() == INTERRUPT_NONE);
+	CHECK(status().rdrf == 1);
+	CHECK(status().irq == 0);
+	uart_control(uart, 0x80u);			// rx_irq on
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
+	CHECK(status().irq == 1);
+}
+
+// Draining a full TX queue recomputes only where TDRE and CTS change:
+// once when the queue stops being full, once when it drops to the CTS
+// threshold.  The IRQ line (tx_irq on) and TDRE follow both transitions.
+TEST_CASE("draining the TX queue recomputes only at the TDRE and CTS transitions") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	uart_control(uart, 0x20u);			// tx_irq on
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);	// empty: TDRE, TX IRQ
+	for (uint i = 0; i < CONSOLE_QUEUE_LEN - 1; i++)
+		uart_write(uart, static_cast<uint8_t>(i));	// fill to full
+	CHECK(uart.has_interrupt() == INTERRUPT_NONE);	// full: no TDRE, CTS off
+	REQUIRE(status().tdre == 0);
+	REQUIRE(status().cts == 1);
+	const uint32_t before = uart.recompute_count();
+
+	uint32_t irq_rises = 0u;
+	for (uint i = 0; i < CONSOLE_QUEUE_LEN - 1; i++) {
+		const interrupt was = uart.has_interrupt();
+		(void)uart.host_receive();
+		const interrupt now = uart.has_interrupt();	// one Q-rising per byte
+		if (was == INTERRUPT_NONE && now == INTERRUPT_IRQ)
+			irq_rises++;
+		const uint level = uart.host_receive_level_avail();
+		// TDRE is back once there is room, but CTS holds the TX IRQ off
+		// until the level is at the threshold.
+		CHECK(status().tdre == ((level <= mc6850::CTS_THRESHOLD) ? 1 : 0));
+		CHECK(status().cts == ((level > mc6850::CTS_THRESHOLD) ? 1 : 0));
+	}
+	const uint32_t cost = uart.recompute_count() - before;
+	INFO("recomputes for draining " << (CONSOLE_QUEUE_LEN - 1) << " bytes: " << cost);
+	CHECK(cost == 2);
+	CHECK(irq_rises == 1);
+	CHECK(uart.has_interrupt() == INTERRUPT_IRQ);
+	CHECK(status().tdre == 1);
+	CHECK(status().cts == 0);
+}
+
+// A guest write landing while the host drains must still take TDRE down
+// and bring it back: the write's own dirtying covers it, whatever the host
+// side decided.
+TEST_CASE("a guest write between host drains still cycles TDRE") {
+	registers::clear();
+	mc6850 uart(CONSOLE_CONTROL, CONSOLE_TX_DATA);
+	for (uint i = 0; i < 10; i++)
+		uart_write(uart, static_cast<uint8_t>(i));
+	(void)uart.has_interrupt();
+	(void)uart.host_receive();
+	(void)uart.has_interrupt();
+	registers::write(CONSOLE_TX_DATA) = static_cast<uint8_t>('Z');
+	uart.write_received();
+	CHECK(status().tdre == 0);
+	uart.guest_transmit('Z');
+	(void)uart.has_interrupt();
+	CHECK(status().tdre == 1);
+	(void)uart.host_receive();
+	(void)uart.has_interrupt();
+	CHECK(status().tdre == 1);
+}
+

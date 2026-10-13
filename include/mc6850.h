@@ -171,6 +171,10 @@ private:
 	volatile uint32_t n_rts_drop = 0u;	// guest_receive() with RTS deasserted
 	volatile uint32_t n_staged = 0u;	// a byte moved queue -> RX register
 	volatile uint32_t n_cts_change = 0u;	// set_host_cts() actually changed it
+	// How often has_interrupt_recompute() ran.  Always maintained, so st can
+	// print a real number: under DriveWire it should move with interrupt-
+	// relevant transitions, not with host bytes (Core 1 loop audit, finding 6).
+	volatile uint32_t n_recompute = 0u;
 	[[nodiscard]] uint8_t status_byte() const;
 	void sync_status();
 	void sync_transmit();
@@ -195,10 +199,46 @@ public:
 	uint receive_level() { return tx.get_level(); }
 	bool host_transmit_avail() { return !tx.is_empty(); }
 	bool host_receive_avail() { return !tx.is_empty(); }
-	// Draining can bring the queue back under CTS_THRESHOLD, so it marks the
-	// state dirty: has_interrupt() has usually cached CTS already.
-	uint8_t host_receive() { const uint8_t ch = tx.get(); irq_dirty = true; return ch; }
-	void host_transmit(const uint8_t ch) { rx.put(ch); irq_dirty = true; }
+	// HOST BYTES MARK THE STATE DIRTY ONLY AT A TRANSITION.  Core 0 moves a
+	// byte here for every byte DriveWire sends or receives, and each dirty
+	// mark costs Core 1 a full has_interrupt_recompute() on its next pass -
+	// under a DriveWire boot that was one recompute per byte per ACIA (Core 1
+	// loop audit 2026-10-10, finding 6).  But a host byte can only change the
+	// status byte or the IRQ line at three points, and nowhere else:
+	//
+	//   draining: TDRE comes back when the TX queue stops being FULL, and
+	//   CTS comes back when the level drops TO the threshold (cts_deasserted
+	//   is level > CTS_THRESHOLD).  One get() lowers the level by one, so
+	//   the get that crosses either line sees exactly that level afterwards.
+	//   Rising through either line is the guest's doing (guest_transmit),
+	//   which marks dirty itself.
+	//
+	//   arriving: a byte can be staged only into an EMPTY RX register.  While
+	//   receive_buffer_full says the register holds a byte, the new one just
+	//   queues; whatever later empties the register (rx_read_fast_path,
+	//   guest_receive, reset) marks dirty itself and the recompute stages
+	//   the next byte then.
+	//
+	// The reads of receive_buffer_full and the level race Core 1, and every
+	// race is benign: if Core 1 changes the thing we tested, the path that
+	// changed it set irq_dirty; if it only moved the level past our line,
+	// the line was still crossed by the byte that crossed it.  What this must
+	// never do is skip a mark that nothing else would make, and the only
+	// changes a host byte makes alone are the three above.
+	uint8_t host_receive()
+	{
+		const uint8_t ch = tx.get();
+		const uint16_t level = tx.get_level();
+		if (level == CTS_THRESHOLD || level == CONSOLE_QUEUE_LEN - 2u)
+			irq_dirty = true;
+		return ch;
+	}
+	void host_transmit(const uint8_t ch)
+	{
+		rx.put(ch);
+		if (!receive_buffer_full)
+			irq_dirty = true;
+	}
 
 	[[nodiscard]] uint8_t interrupt_status() const
 	{
@@ -226,16 +266,17 @@ public:
 	}
 	[[nodiscard]] bool is_rts_deasserted() const { return rts_deasserted; }
 	struct rdrf_why {
-		uint32_t reset, rx_read, rts_drop, staged, cts_change;
+		uint32_t reset, rx_read, rts_drop, staged, cts_change, recomputes;
 	};
 	// Diagnostics only: the RDRF accounting that st prints.  Core 0 writes
 	// zeros under Core 1's increments; a lost count is harmless here.
-	void stats_clear() { n_reset = n_rx_read = n_rts_drop = n_staged = n_cts_change = 0u; }
+	void stats_clear() { n_reset = n_rx_read = n_rts_drop = n_staged = n_cts_change = n_recompute = 0u; }
 	// Core 1 ONLY (see the note in reset()): drop the input the guest never
 	// read and the output the host never took.  Both are Core 1's stores.
 	void flush_queues_from_core1() { rx.discard_unread(); tx.abandon_unsent(); }
 	[[nodiscard]] rdrf_why why_rdrf() const
-		{ return { n_reset, n_rx_read, n_rts_drop, n_staged, n_cts_change }; }
+		{ return { n_reset, n_rx_read, n_rts_drop, n_staged, n_cts_change, n_recompute }; }
+	[[nodiscard]] uint32_t recompute_count() const { return n_recompute; }
 	void set_host_cts(bool deasserted);
 	[[nodiscard]] uint16_t get_ctl_offset() const { return ctl_offset; }
 	[[nodiscard]] uint16_t get_data_offset() const { return data_offset; }

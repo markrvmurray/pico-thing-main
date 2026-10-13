@@ -3923,8 +3923,9 @@ status_print_rdrf(const char *name, const mc6850::rdrf_why &w)
 {
 	printf("    %-7s RDRF: staged %" PRIu32 "  cleared by: guest-read %" PRIu32
 	       "  RTS-drop %" PRIu32 "  reset %" PRIu32 "   host-CTS changes %"
-	       PRIu32 "\n",
-	       name, w.staged, w.rx_read, w.rts_drop, w.reset, w.cts_change);
+	       PRIu32 "   recomputes %" PRIu32 "\n",
+	       name, w.staged, w.rx_read, w.rts_drop, w.reset, w.cts_change,
+	       w.recomputes);
 }
 
 static void

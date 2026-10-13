@@ -375,6 +375,7 @@ mc6850::has_interrupt_recompute()
 	// The caller has already found irq_dirty set; see the inline half in
 	// mc6850.h.
 	irq_dirty = false;
+	n_recompute++;
 
 	// Absorb TX queue state refresh (formerly update_task/sync_transmit).
 	// One read of the queue's indices, not two: see get_level_space().
