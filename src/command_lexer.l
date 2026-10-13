@@ -147,6 +147,13 @@ match_command_keyword(const char *text)
 [Dd][Rr][Ii][Vv][Ee][Ww][Ii][Rr][Ee]|[Dd][Ww] { return TOK_DRIVEWIRE; }
 [Oo][Nn]                            { return TOK_ON; }
 [Oo][Ff][Ff]                        { return TOK_OFF; }
+[Ss][Tt][Aa][Tt][Ss]                { return TOK_STATS; }
+[Ss][Tt][Aa][Tt][Ii][Ss][Tt][Ii][Cc][Ss] { return TOK_STATS; }
+[Pp][Ee][Rr][Ii][Pp][Hh][Ee][Rr][Aa][Ll][Ss] { return TOK_PERIPHERALS; }
+[Vv][Ee][Cc][Tt][Oo][Rr][Ss]        { return TOK_VECTORS; }
+[Rr][Uu][Nn]0                       { return TOK_RUN0; }
+[Cc][Oo][Rr][Ee]1                   { return TOK_CORE1; }
+[Rr][Ee][Bb][Oo][Oo][Tt]            { return TOK_REBOOT; }
 
 	/* ---- Loop types (exact, CASE-SENSITIVE per original behaviour) ---- */
 "rw"|"RW"                           { return TOK_RW; }

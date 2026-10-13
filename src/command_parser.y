@@ -177,6 +177,12 @@ static int _t_count;
 %token TOK_ON
 %token TOK_OFF
 %token TOK_FLOW
+%token TOK_STATS
+%token TOK_PERIPHERALS
+%token TOK_VECTORS
+%token TOK_RUN0
+%token TOK_CORE1
+%token TOK_REBOOT
 
 /* Loop access types */
 %token TOK_r
@@ -266,8 +272,20 @@ status_cmd:
 	}
 	;
 
+/* -----------------------------------------------------------------------
+ * reset [ statistics | peripherals | vectors | run0 | core1 | reboot ]
+ *   Graded, weakest first, each level including the ones above it.  Bare
+ *   "reset" keeps its old meaning: the peripherals level.
+ * ----------------------------------------------------------------------- */
 reset_cmd:
-	TOK_RESET   { result->tag = CMD_RESET; }
+	  TOK_RESET                 { result->tag = CMD_RESET; }
+	| TOK_RESET TOK_STATS       { result->tag = CMD_RESET_STATS; }
+	| TOK_RESET TOK_PERIPHERALS { result->tag = CMD_RESET; }
+	| TOK_RESET TOK_VECTORS     { result->tag = CMD_RESET_VECTORS; }
+	| TOK_RESET TOK_RUN0        { result->tag = CMD_RESET_RUN0; }
+	| TOK_RESET TOK_RUN         { result->tag = CMD_RESET_RUN0; }
+	| TOK_RESET TOK_CORE1       { result->tag = CMD_RESET_CORE1; }
+	| TOK_RESET TOK_REBOOT      { result->tag = CMD_RESET_REBOOT; }
 	;
 
 /* -----------------------------------------------------------------------

@@ -30,6 +30,7 @@
 #include "hardware/regs/sysinfo.h"
 #include "hardware/sync.h"
 #include "hardware/vreg.h"
+#include "hardware/watchdog.h"
 #include "bsp/board_api.h"
 
 #include "tusb.h"
@@ -357,6 +358,11 @@ static volatile bool q_rising_edge = false;
 // next; the counters underneath stay the exact handshake.
 static volatile uint8_t loop_nmi_work = 0u;
 static volatile uint8_t loop_work = 0u;
+// `reset core1`: Core 0 asks, Core 1's loop performs (core1_reset_perform),
+// because the state involved is Core 1's to write.  Checked only on a pass
+// that has work (loop_work set by the requester), so the quiet pass pays
+// nothing.
+static volatile bool core1_reset_request = false;
 static volatile uint8_t console_write_pending = 0u;
 static volatile bool core1_initialised = false;
 
@@ -4725,6 +4731,52 @@ status_json(const status_snapshot_t *s)
 static bool set_power();
 static void reset_power();
 
+// `reset statistics`: every counter st prints goes to zero, nothing
+// operational changes.  Core 0 stores zeros under Core 1's increments; a
+// count lost in that race is a diagnostic, not state, so no masking.
+static void
+statistics_clear()
+{
+#if ISR_COST_ON
+	isr_cost_reset();
+#endif
+	irq_vectors = 0u;
+	pend_irq_cycles = 0u;
+	write_ring_overflow = 0u;
+	core1_isr_count = 0u;
+#if DIAG_ON
+	irq_loop_assert = 0u;
+	irq_isr_deassert = 0u;
+	irq_ack_deassert = 0u;
+	q_armed_missed = 0u;
+	nmi_work_missed = 0u;
+	write_addr_ring_worst = 0u;
+	write_addr_ring_coalesced = 0u;
+	write_addr_ring_overflow = 0u;
+	core1_qrise_count = 0u;
+	core1_irq_assert_count = 0u;
+	core1_write_ring_count = 0u;
+	core1_last_write_loc = 0u;
+#endif
+	copy_buffer_disagreements = 0u;
+	task_write_odd_count = 0u;
+	task_write_odd_from = 0u;
+	task_write_odd_to = 0u;
+	task_log_count = 0u;
+	fast_serial.stats_clear();
+	aux_serial.stats_clear();
+#ifdef DEBUG
+	ACIA_CONTROL_COUNT = 0u;
+	ACIA_TX_DATA_COUNT = 0u;
+	ACIA_RX_DATA_COUNT = 0u;
+	CONSOLE_STATUS_READS = 0u;
+	AUX_ACIA_CONTROL_COUNT = 0u;
+	AUX_ACIA_TX_DATA_COUNT = 0u;
+	AUX_ACIA_STATUS_COUNT = 0u;
+	AUX_ACIA_RX_DATA_COUNT = 0u;
+#endif
+}
+
 void
 process_command(char *buf)
 {
@@ -4777,7 +4829,18 @@ process_command(char *buf)
 		"  run [n] [!]        (ru)  run snippet n; ! leaves the CPU running\n"
 		"  go [addr]                start the CPU, optionally at addr\n"
 		"  stop [halt|restart](sp)  stop, or halt, or stop-and-restart\n"
-		"  reset              (rs)  pulse !RESET\n"
+		"  reset [level]      (rs)  reset firmware state; levels weakest first,\n"
+		"                           each including the ones before it:\n"
+		"                             statistics  st's counters only (stats)\n"
+		"                             peripherals registers, devices, tick timer\n"
+		"                                         (the default)\n"
+		"                             vectors     + every vector at the SYNC snippet\n"
+		"                             run0        + task 0 and the identity DAT\n"
+		"                                         (run also works; CPU stopped)\n"
+		"                             core1       + Core 1's rings, interrupt state,\n"
+		"                                         step gate, DAT-fault latch, read\n"
+		"                                         SM and ACIA queues (CPU stopped)\n"
+		"                             reboot      watchdog-reset the Pico\n"
 		"  freq <MHz>         (fq)  set the E clock, %.1f to %.1f\n"
 		"  task [n]           (ta)  show or set the task register\n"
 		"  power [on|off]     (pw)  external power enable\n"
@@ -4805,8 +4868,8 @@ process_command(char *buf)
 		"                           vector is taken, or by trace stop\n"
 		"  trace stop         (tr)  freeze a running ring\n"
 		"  break [addr|r]     (br)  breakpoint; r resumes\n"
-		"  irq <0-8>          (ir)  interrupt tests; 7 is NMIBlock latency,\n"
-		"                           8 is the DAT fault path\n"
+		"  irq <0-9>          (ir)  interrupt tests; 7 is NMIBlock latency,\n"
+		"                           8 is the DAT fault path, 9 single-steps\n"
 		"  loop <type> <addr> (lo)  hammer addr for scope work.  The type is\n"
 		"                           CASE-SENSITIVE: lower case is a byte access,\n"
 		"                           upper case a word:\n"
@@ -4850,11 +4913,75 @@ status_done:
 		break;
 	}
 
+	case CMD_RESET_STATS:
+		statistics_clear();
+		printf("reset: statistics - every st counter zeroed, nothing else touched\n");
+		break;
+
 	case CMD_RESET:
 		if (!MC6809.assert_powered())
 			break;
+		statistics_clear();
 		peripheral_clear(false);
+		printf("reset: peripherals - statistics, registers, devices, tick timer\n");
 		break;
+
+	case CMD_RESET_VECTORS:
+		if (!MC6809.assert_powered())
+			break;
+		statistics_clear();
+		peripheral_clear(true);
+		printf("reset: vectors - peripherals, and every vector at the SYNC snippet\n");
+		break;
+
+	case CMD_RESET_RUN0:
+		if (!MC6809.assert_stopped())
+			break;
+		statistics_clear();
+		peripheral_clear(false);
+		task_pins_update(MC6809.task_change(0u));
+		snippet_copy(DAT_INIT);
+		if (!MC6809.start_with_timeout(1000u)) {
+			printf("reset: run0 - DAT_INIT failed, CPU did not respond\n");
+			break;
+		}
+		printf("reset: run0 - peripherals, task 0, identity DAT\n");
+		break;
+
+	case CMD_RESET_CORE1: {
+		if (!MC6809.assert_stopped())
+			break;
+		statistics_clear();
+		peripheral_clear(false);
+		// The trace is Core 0's to release (trace off does this already).
+		MC6809.trace_clear();
+		// Everything else is Core 1's: ask, and wait for the loop to act.
+		core1_reset_request = true;
+		loop_work = 1u;
+		uint32_t waited = 0u;
+		while (core1_reset_request && ++waited <= 100u)
+			sleep_ms(1u);
+		if (core1_reset_request) {
+			printf("reset: core1 - Core 1 did not act within 100 ms; is it running?\n");
+			break;
+		}
+		task_pins_update(MC6809.task_change(0u));
+		snippet_copy(DAT_INIT);
+		if (!MC6809.start_with_timeout(1000u)) {
+			printf("reset: core1 - DAT_INIT failed, CPU did not respond\n");
+			break;
+		}
+		printf("reset: core1 - run0, trace released, write path drained, interrupts"
+		       " cleared, step and fault state idle, read chain re-primed, ACIA queues flushed\n");
+		break;
+	}
+
+	case CMD_RESET_REBOOT:
+		printf("reset: reboot - watchdog reset of the Pico now\n");
+		sleep_ms(20u);			// let the line out of the UART
+		watchdog_reboot(0u, 0u, 0u);
+		for (;;)
+			tight_loop_contents();
 
 	case CMD_EXAMINE_DAT: {
 		constexpr uint16_t start = 0xFD00u;
@@ -6915,6 +7042,86 @@ interrupt_pins_update()
 	}
 }
 
+// `reset core1`, performed ON CORE 1 at the loop's request point: as much of
+// Core 1's state as can be cleared without a reboot, with the guest stopped
+// (the handler insists) so no bus cycle is in flight.  Each item mirrors
+// what power-off/power-on or the start-up code does to the same thing; what
+// is NOT here needs a reboot (`reset reboot`).
+static void
+core1_reset_perform()
+{
+	const uint32_t saved = save_and_disable_interrupts();
+
+	// The write path: drop every queued follow-up and resync the drain
+	// pointers to the DMA heads, so nothing stale is applied later.
+	write_ring_tail = write_ring_head;
+	write_addr_ring_tail = write_addr_ring_head();
+
+	// Interrupt state: nothing pending, nothing retired, pins released.
+	// pending_interrupts is cleared BEFORE the pin update so the update
+	// sees a change against int_pins_held and drives the deassert.
+	pending_interrupts = 0u;
+	irq_sources = 0u;
+	irq_retired = 0u;
+	nmi_request_done = nmi_request_count;
+	nmi_hold_passes = 0u;
+	loop_nmi_work = 0u;
+	watchpoint_nmi_pending = false;
+	dat_fault_nmi_request = false;
+	interrupt_pins_update();
+
+	// The step machinery, as the step test's own bail-out leaves it.
+	step_state = STEP_IDLE;
+	step_request = false;
+	step_active = false;
+	step_logging = false;
+	step_arm_cycles = 0u;
+
+	// DAT fault: the mask down, the registers clear, the sampler re-armed
+	// (the same sequence as the per-run setup callback).
+	dat_fault_block_countdown = 0u;
+	dat_fault_nmi_pending = false;
+	gpio_put(GPIO_NMI_BLOCK, false);
+	reg[SYSTEM_DAT_FAULT] = static_cast<uint8_t>(0u);
+	reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(0u);
+	if (bus_fault.sm >= 0) {
+		pio_sm_clear_fifos(bus_fault.pio, static_cast<uint>(bus_fault.sm));
+		pio_interrupt_clear(bus_fault.pio, BUS_FAULT_PIO_IRQ);
+		pio_set_irq0_source_enabled(bus_fault.pio, BUS_FAULT_PIO_IRQ_SOURCE, true);
+	}
+
+	// The sticky PIO FIFO flags on both bus state machines.
+	piodma_read.pio->fdebug = PIO_FDEBUG_RXSTALL_BITS | PIO_FDEBUG_TXSTALL_BITS
+				| PIO_FDEBUG_RXUNDER_BITS | PIO_FDEBUG_TXOVER_BITS;
+	piodma_write.pio->fdebug = PIO_FDEBUG_RXSTALL_BITS | PIO_FDEBUG_TXSTALL_BITS
+				 | PIO_FDEBUG_RXUNDER_BITS | PIO_FDEBUG_TXOVER_BITS;
+
+	// The read chain, re-primed from scratch: the SM back at its first
+	// instruction (the pull of the register-array base), both DMA channels
+	// aborted and the address channel re-armed, exactly as at start-up.  A
+	// chain left half way - an address pushed and never answered - would
+	// otherwise serve the next read with a stale byte.
+	dma_channel_abort(piodma_read.address_channel);
+	dma_channel_abort(piodma_read.data_channel);
+	pio_sm_set_enabled(piodma_read.pio, piodma_read.sm, false);
+	pio_sm_clear_fifos(piodma_read.pio, piodma_read.sm);
+	pio_sm_restart(piodma_read.pio, piodma_read.sm);
+	pio_sm_exec(piodma_read.pio, piodma_read.sm,
+		    pio_encode_jmp(static_cast<uint>(piodma_read.offset)));
+	pio_interrupt_clear(piodma_read.pio, READ_DEVICE_PIO_IRQ);
+	dma_channel_start(piodma_read.address_channel);
+	pio_sm_put(piodma_read.pio, piodma_read.sm, registers::read_address() >> 6);
+	pio_sm_set_enabled(piodma_read.pio, piodma_read.sm, true);
+
+	// The ACIA queues: unread input and untaken output dropped, which
+	// only Core 1 may do (see mc6850::reset()).
+	fast_serial.flush_queues_from_core1();
+	aux_serial.flush_queues_from_core1();
+
+	core1_reset_request = false;
+	restore_interrupts(saved);
+}
+
 static void
 __no_inline_not_in_flash_func(main_core1)()
 {
@@ -7284,6 +7491,8 @@ __no_inline_not_in_flash_func(main_core1)()
 		if (loop_work == 0u)
 			continue;
 		loop_work = 0u;				// BEFORE the drains
+		if (core1_reset_request)
+			core1_reset_perform();
 		while (write_ring_tail != write_ring_head) {
 			const uint8_t t = write_ring_tail;
 			const uint8_t written_location = write_ring[t].location;

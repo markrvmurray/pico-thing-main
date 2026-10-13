@@ -72,6 +72,74 @@ TEST_CASE("Simple no-argument commands", "[parser]")
 }
 
 // ============================================================
+//  reset levels
+// ============================================================
+
+TEST_CASE("reset levels", "[parser][reset]")
+{
+	parsed_cmd_t cmd;
+
+	SECTION("bare reset is the peripherals level")
+	{
+		REQUIRE(parse("reset", &cmd));
+		CHECK(cmd.tag == CMD_RESET);
+		REQUIRE(parse("reset peripherals", &cmd));
+		CHECK(cmd.tag == CMD_RESET);
+		REQUIRE(parse("rs PERIPHERALS", &cmd));
+		CHECK(cmd.tag == CMD_RESET);
+	}
+	SECTION("statistics, long and short")
+	{
+		REQUIRE(parse("reset statistics", &cmd));
+		CHECK(cmd.tag == CMD_RESET_STATS);
+		REQUIRE(parse("rs stats", &cmd));
+		CHECK(cmd.tag == CMD_RESET_STATS);
+	}
+	SECTION("vectors")
+	{
+		REQUIRE(parse("reset vectors", &cmd));
+		CHECK(cmd.tag == CMD_RESET_VECTORS);
+		REQUIRE(parse("rs Vectors", &cmd));
+		CHECK(cmd.tag == CMD_RESET_VECTORS);
+	}
+	SECTION("run0, also spelt run")
+	{
+		REQUIRE(parse("reset run0", &cmd));
+		CHECK(cmd.tag == CMD_RESET_RUN0);
+		REQUIRE(parse("rs run", &cmd));
+		CHECK(cmd.tag == CMD_RESET_RUN0);
+	}
+	SECTION("core1")
+	{
+		REQUIRE(parse("reset core1", &cmd));
+		CHECK(cmd.tag == CMD_RESET_CORE1);
+		REQUIRE(parse("rs CORE1", &cmd));
+		CHECK(cmd.tag == CMD_RESET_CORE1);
+	}
+	SECTION("reboot")
+	{
+		REQUIRE(parse("reset reboot", &cmd));
+		CHECK(cmd.tag == CMD_RESET_REBOOT);
+		REQUIRE(parse("rs reboot", &cmd));
+		CHECK(cmd.tag == CMD_RESET_REBOOT);
+	}
+	SECTION("an unknown level is a syntax error")
+	{
+		CHECK_FALSE(parse("reset everything", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+		CHECK_FALSE(parse("reset 1", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+	SECTION("the level words are not commands on their own")
+	{
+		CHECK_FALSE(parse("reboot", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+		CHECK_FALSE(parse("core1", &cmd));
+		CHECK(cmd.tag == CMD_SYNTAX_ERROR);
+	}
+}
+
+// ============================================================
 //  Fixed 2-letter mnemonic matching
 //  Each command accepts its full name OR exactly its registered alias.
 // ============================================================

@@ -228,6 +228,12 @@ public:
 	struct rdrf_why {
 		uint32_t reset, rx_read, rts_drop, staged, cts_change;
 	};
+	// Diagnostics only: the RDRF accounting that st prints.  Core 0 writes
+	// zeros under Core 1's increments; a lost count is harmless here.
+	void stats_clear() { n_reset = n_rx_read = n_rts_drop = n_staged = n_cts_change = 0u; }
+	// Core 1 ONLY (see the note in reset()): drop the input the guest never
+	// read and the output the host never took.  Both are Core 1's stores.
+	void flush_queues_from_core1() { rx.discard_unread(); tx.abandon_unsent(); }
 	[[nodiscard]] rdrf_why why_rdrf() const
 		{ return { n_reset, n_rx_read, n_rts_drop, n_staged, n_cts_change }; }
 	void set_host_cts(bool deasserted);

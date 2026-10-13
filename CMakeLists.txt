@@ -415,6 +415,7 @@ target_link_libraries(pico-thing
 	hardware_irq
 	hardware_pio
 	hardware_vreg
+	hardware_watchdog
 	tinyusb_device
 	tinyusb_board
 )
