@@ -1384,6 +1384,16 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 		reg[REGISTER_SNIPPET + 14] = static_cast<uint8_t>(0x00);
 		system_tick.arm_countdown(step_arm_cycles);
 		step_arm_cycles = 0u;
+		// Restart the edge log here too, or `irq 9`'s count pass prints
+		// whatever the previous run's LIC pass left in it.  The logging
+		// above has already run for this pass, so count it as 1, as
+		// the LIC path does for its release pass.
+		if (step_active) {
+			step_pass = 1u;
+			step_edges = 0u;
+			step_armed_edge = 0u;
+			step_logging = true;
+		}
 	}
 	// E-cycle countdown NMI timer: $FFC8 bits 5:1 are a 5-bit count,
 	// decremented here once per Q-rising, and the pass it reaches zero
@@ -5923,6 +5933,13 @@ status_done:
 			// guest is reset, and reset is what lowers it.
 			reg[REGISTER_VECTOR_NMI_OFFSET] = REGISTER_SNIPPET;
 			task_pins_update(MC6809.task_change(0u));
+			// And put back the DAT entries the cases marked unavailable,
+			// as ramtest and synctest do.  Leaving them was how `irq 9`
+			// came to read all-$FF frames: its stack at $DFFx is task 0
+			// page 6, which this test leaves unmapped.
+			snippet_copy(DAT_INIT);
+			if (!MC6809.start_with_timeout(4u))
+				printf("  restoring the identity DAT failed\n");
 			printf("DAT fault test: %s\n\n", all_pass ? "ALL PASS" : "FAIL");
 			break;
 		} else {
