@@ -183,17 +183,20 @@ target_sources(pico-thing
 		${BISON_CmdParser_OUTPUTS}
 )
 
-# Board revision selects the GPIO map.  Both revisions carry the same signals:
+# Board revision selects the GPIO map.  All revisions carry the same signals:
 # version 1 puts TASK[4:0], TASK0 and the power enable on GPIO 40-46 with the
 # DAT fault signals on 32-36, version 2 puts the task pins on 32-37, the power
-# enable on 40, the fault signals on 41-45 and the 5V ADC on 46.  Flashing the
-# wrong one drives outputs into outputs, so pass -DPICO_THING_BOARD_VERSION=1
-# when building for one of the older boards.
-set(PICO_THING_BOARD_VERSION 2 CACHE STRING "Pico-Thing board revision (1 or 2)")
-set_property(CACHE PICO_THING_BOARD_VERSION PROPERTY STRINGS 1 2)
-if(NOT PICO_THING_BOARD_VERSION MATCHES "^[12]$")
+# enable on 40, the fault signals on 41-45 and the 5V ADC on 46.  Version 3
+# keeps every 5 V input on the 5 V-tolerant GPIO 0-39: A13-A15 and FAULT on
+# 23-26, TASK0 and TASK[4:0] on 31-36, the power enable on 37, !RESET on 39,
+# the interrupt outputs on 40-43, the UART on 44/45 and the 5V ADC on 46.
+# Flashing the wrong one drives outputs into outputs, so pass
+# -DPICO_THING_BOARD_VERSION=N to match the board.
+set(PICO_THING_BOARD_VERSION 2 CACHE STRING "Pico-Thing board revision (1, 2 or 3)")
+set_property(CACHE PICO_THING_BOARD_VERSION PROPERTY STRINGS 1 2 3)
+if(NOT PICO_THING_BOARD_VERSION MATCHES "^[123]$")
 	message(FATAL_ERROR
-		"PICO_THING_BOARD_VERSION must be 1 or 2, not '${PICO_THING_BOARD_VERSION}'")
+		"PICO_THING_BOARD_VERSION must be 1, 2 or 3, not '${PICO_THING_BOARD_VERSION}'")
 endif()
 message(STATUS "Pico-Thing board version ${PICO_THING_BOARD_VERSION}")
 

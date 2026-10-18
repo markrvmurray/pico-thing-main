@@ -9,8 +9,9 @@
 % c-sdk {
 
 #include "mc6809.h"
-// GPIO_TASK_BASE moves with the board revision, and pioasm has no
-// conditionals, so it comes from the pin map rather than a .define here.
+// The task pins move with the board revision, and pioasm has no
+// conditionals, so TASK_OUTPUT_BASE comes from the pin map rather than a
+// .define here.
 // The task program sets its pin base at runtime, so nothing in the
 // instruction stream depends on it.
 #include "pico_thing.h"
@@ -371,10 +372,12 @@ mc6809_bus_write_program_deinit(PIO pio, uint sm)
 
 
 ; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and outputs it to
-; the six consecutive pins at GPIO_TASK_BASE (TASK[4:0] + TASK0), which is
-; 40-45 on a version 1 board and 32-37 on version 2.
+; the six consecutive pins at TASK_OUTPUT_BASE (TASK[4:0] + TASK0), which is
+; 40-45 on a version 1 board, 32-37 on version 2 and 31-36 on version 3.
 ; Runs at full system clock (320 MHz, no divider).
-; Bit layout: [5]=TASK0 (active-high when task==0), [4:0]=task number.
+; Bit layout: task_output_word() - [5]=TASK0 (active-high when task==0),
+; [4:0]=task number; on version 3, where TASK0 is the bottom pin,
+; [5:1]=task number, [0]=TASK0.
 .program	task_output
 
 .wrap_target
@@ -388,14 +391,14 @@ static inline void
 task_output_program_init(PIO pio, uint sm, uint offset)
 {
 	for (uint i = 0; i < 6; i++)
-		pio_gpio_init(pio, GPIO_TASK_BASE + i);
-	pio_sm_set_consecutive_pindirs(pio, sm, GPIO_TASK_BASE, 6, true);
+		pio_gpio_init(pio, TASK_OUTPUT_BASE + i);
+	pio_sm_set_consecutive_pindirs(pio, sm, TASK_OUTPUT_BASE, 6, true);
 	pio_sm_config c = task_output_program_get_default_config(offset);
-	sm_config_set_out_pins(&c, GPIO_TASK_BASE, 6);
+	sm_config_set_out_pins(&c, TASK_OUTPUT_BASE, 6);
 	sm_config_set_out_shift(&c, true, false, 32);	// Right shift, no autopull
 	pio_sm_init(pio, sm, offset, &c);
-	// Pre-load task 0: TASK0=1, TASK[4:0]=0 → bit pattern 0b100000
-	pio_sm_put(pio, sm, (1u << 5));
+	// Pre-load task 0: TASK0=1, TASK[4:0]=0
+	pio_sm_put(pio, sm, task_output_word(0u));
 	// pio_sm_set_enabled(pio, sm, false);  // We'll start this when DMA, the IRQ's and the second core get going.
 }
 
@@ -405,9 +408,9 @@ task_output_program_deinit(PIO pio, uint sm)
 	pio_sm_set_enabled(pio, sm, false);
 	// Task pins low then hi-Z
 	for (uint i = 0; i < 6; i++) {
-		gpio_put(GPIO_TASK_BASE + i, false);
-		gpio_set_dir(GPIO_TASK_BASE + i, GPIO_IN);
-		gpio_set_function(GPIO_TASK_BASE + i, GPIO_FUNC_SIO);
+		gpio_put(TASK_OUTPUT_BASE + i, false);
+		gpio_set_dir(TASK_OUTPUT_BASE + i, GPIO_IN);
+		gpio_set_function(TASK_OUTPUT_BASE + i, GPIO_FUNC_SIO);
 	}
 	pio_sm_unclaim(pio, sm);
 }
@@ -596,6 +599,12 @@ int_pins_program_deinit(PIO pio, uint sm, uint pin_base)
 ; IRQ handshake rather than a second edge wait.  The extra couple of
 ; clocks of lag do not matter: everything in the high word is stable
 ; for the whole cycle.
+;
+; The sample is the WHOLE window, 32 pins from bus_fault_program_init()'s
+; base: on versions 1 and 2 that is GPIO 32-47 in the low half (the window
+; wraps, so GPIO 16-31 fill the top half, unused); on version 3, where the
+; page bits and FAULT moved to GPIO 23-26, it is GPIO 16-47, so the task
+; pins and the page are still one coherent sample.
 .program bus_fault
 .wrap_target
 next_cycle:
@@ -603,7 +612,7 @@ next_cycle:
 	jmp	pin got_fault		; An unallocated RAM block has been addressed
 	jmp	next_cycle		; All is well
 got_fault:
-	in	pins 16			; grab the address/page bits A13-A15
+	in	pins 32			; grab the task pins and the page bits A13-A15
 	irq	set 3			; Signal the Pico
 .wrap
 
@@ -614,8 +623,8 @@ static inline void
 bus_fault_program_init(PIO pio, uint sm, uint offset, uint trigger_pin)
 {
 	pio_sm_config c = bus_fault_program_get_default_config(offset);
-	sm_config_set_in_pins(&c, 32);			// sample GPIO 32-47
-	sm_config_set_in_shift(&c, false, true, 16);	// shift left, autopush at 16
+	sm_config_set_in_pins(&c, BUS_FAULT_SAMPLE_BASE);
+	sm_config_set_in_shift(&c, false, true, 32);	// shift left, autopush at 32
 	sm_config_set_jmp_pin(&c, trigger_pin);
 	pio_sm_init(pio, sm, offset, &c);
 }

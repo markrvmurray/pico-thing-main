@@ -15,18 +15,23 @@ extern volatile bool verbose;
 
 #include "hardware/pio.h"
 
-// Board revision. Both revisions carry the same signals, on different pins:
+// Board revision. All revisions carry the same signals, on different pins:
 // version 1 puts the task pins and the power enable at the bottom of the GPIO
 // range and the DAT fault signals above them, version 2 the other way round.
-// Set from CMake with -DPICO_THING_BOARD_VERSION=1 to build for the older
-// board; anything that includes this header without the build system (the
-// unit tests) gets version 2.
+// Version 3 moves every 5 V input into GPIO 0-39, the RP2350B's 5 V-tolerant
+// pads: versions 1 and 2 put A13-A15 and FAULT on pins that are not (on
+// version 2 the ADC pins 40-47), and the clamp current wrecked the ADC
+// reference and, probably, the guest.  So on version 3 A13-A15 and FAULT
+// sit in the low word beside the bus, the interrupt outputs - pulled up to
+// 3.3 V, never 5 V - move up to the ADC pins, and the UART to 44/45.
+// Set from CMake with -DPICO_THING_BOARD_VERSION=N; anything that includes
+// this header without the build system (the unit tests) gets version 2.
 #ifndef PICO_THING_BOARD_VERSION
 #define PICO_THING_BOARD_VERSION 2
 #endif
 
-#if PICO_THING_BOARD_VERSION != 1 && PICO_THING_BOARD_VERSION != 2
-#error "PICO_THING_BOARD_VERSION must be 1 or 2"
+#if PICO_THING_BOARD_VERSION < 1 || PICO_THING_BOARD_VERSION > 3
+#error "PICO_THING_BOARD_VERSION must be 1, 2 or 3"
 #endif
 
 // === Pin map ===
@@ -47,6 +52,49 @@ enum {
 	GPIO_LIC = 21,  // [Y] [i]  LIC
 	GPIO_AVMA = 22, // [Y] [i]  AVMA
 
+#if PICO_THING_BOARD_VERSION >= 3
+	// Medium - per-instruction timing.  5 V inputs, so they must stay on
+	// the 5 V-tolerant pads; they land in the low word with the bus.
+	GPIO_A_HI_BASE = 23,       // [Y] [i]  Address bus A13-A15, the DAT page of a fault
+	GPIO_FAULT = 26,           // [Y] [i]  Attempt to read or write unassigned memory
+
+	// Fast/timing-critical - GPIO Bank0 - will be removed when debugging is done
+	//	GPIO_TRACE_RD = 27,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
+	//	GPIO_TRACE_WR = 28,	// [Y] [o]  PIO side-set temporary debugging output pins for the scope
+
+	// Cycle-speed, non-critical temporary output, set by hand inside ISRs - will be removed when debugging is done
+	GPIO_TRACE_C = 29,         // [Y] [o]  Temporary debugging output pins for the scope
+	GPIO_TRACE_D = 30,         // [Y] [o]  Temporary debugging output pins for the scope
+
+	// Slow - guest instruction-level timing.  TASK0 (Root) sits BELOW
+	// TASK[4:0] on this board, so the task word is laid out the other way
+	// round - see task_output_word().
+	GPIO_TASK_0 = 31,          // [Y] [o]  TASK0, set when the task number is zero
+	GPIO_TASK_BASE = 32,       // [Y] [o]  TASK[4:0], five pins
+
+	// Slow - set at a leisurely pace at human-user speeds
+	GPIO_POWER = 37,           // [Y] [o]  External power enable
+
+	// Medium - per-instruction timing
+	GPIO_NMI_BLOCK = 38,       // [Y] [o]  Prevent DAT Fault NMI
+
+	// Slow - set at a leisurely pace at human-user speeds
+	GPIO_RESET = 39, // [Y] [o]  !RESET
+
+	// Asynchronous, at cycle speed.  On the ADC pins, which are not 5 V
+	// tolerant: safe only because the pull-ups (R102-R105) go to 3.3 V.
+	GPIO_HALT = 40, // [Y] [o]  !HALT
+	GPIO_NMI = 41,  // [Y] [o*] !NMI
+	GPIO_FIRQ = 42, // [Y] [o*] !FIRQ
+	GPIO_IRQ = 43,  // [Y] [o*] !IRQ
+
+	// UART0 on its plain function (F2) here, not the AUX one 30/31 need
+	GPIO_UART_TX = 44, // [Y] [o]  RP2xxx UART Tx
+	GPIO_UART_RX = 45, // [Y] [i]  RP2xxx UART Rx
+
+	GPIO_POWER_ADC = 46,       // [Y] [i]  ADC on the 5V line, divided by 2
+	// GPIO 47 is the PSRAM !CS on the PGA2350
+#else
 	// Asynchronous, at cycle speed
 	GPIO_HALT = 23, // [Y] [o]  !HALT
 	GPIO_NMI = 24,  // [Y] [o*] !NMI
@@ -64,7 +112,7 @@ enum {
 	GPIO_UART_TX = 30, // [Y] [o]  RP2xxx UART Tx
 	GPIO_UART_RX = 31, // [Y] [i]  RP2xxx UART Rx
 
-#if PICO_THING_BOARD_VERSION >= 2
+#if PICO_THING_BOARD_VERSION == 2
 	// Slow - guest instruction-level timing
 	GPIO_TASK_BASE = 32,       // [Y] [o]  TASK[4:0], five pins
 	GPIO_TASK_0 = 37,          // [Y] [o]  TASK0, set when the task number is zero
@@ -106,6 +154,7 @@ enum {
 	// Used by the PSRAM !CS on the PGA2350. Bummer.
 	// GPIO_POWER_ADC = 47,    // [N] [i]  ADC connected to the 5V line, divided by 2
 #endif
+#endif
 };
 
 
@@ -139,6 +188,13 @@ union bus_pins {
 		uint32_t CS : 1;
 		uint32_t BS_BA : 2;
 		uint32_t BUSY_LIC_AVMA : 3;
+#if PICO_THING_BOARD_VERSION >= 3
+		uint32_t A_HI : 3;	// 23-25, A13-A15
+		uint32_t FAULT : 1;	// 26
+		uint32_t TRACE_RW : 2;	// 27-28
+		uint32_t TRACE_CD : 2;	// 29-30
+		uint32_t TASK0 : 1;	// 31
+#else
 		uint32_t HALT : 1;
 		uint32_t NMI : 1;
 		uint32_t FIRQ : 1;
@@ -146,6 +202,7 @@ union bus_pins {
 		uint32_t TRACE_RW : 2;
 		uint32_t RESET : 1;
 		uint32_t UART : 2;
+#endif
 	} bits;
 	uint32_t word;
 };
@@ -184,7 +241,18 @@ union bus_pins {
 
 union high_bus_pins {
 	struct {
-#if PICO_THING_BOARD_VERSION >= 2
+#if PICO_THING_BOARD_VERSION >= 3
+		uint32_t TASK : 5;	// 32-36
+		uint32_t POWER : 1;	// 37
+		uint32_t NMI_BLOCK : 1;	// 38
+		uint32_t RESET : 1;	// 39
+		uint32_t HALT : 1;	// 40
+		uint32_t NMI : 1;	// 41
+		uint32_t FIRQ : 1;	// 42
+		uint32_t IRQ : 1;	// 43
+		uint32_t UART : 2;	// 44-45
+		uint32_t POWER_ADC : 1;	// 46
+#elif PICO_THING_BOARD_VERSION == 2
 		uint32_t TASK : 5;	// 32-36
 		uint32_t TASK0 : 1;	// 37
 		uint32_t TRACE_C : 1;	// 38
@@ -208,6 +276,28 @@ union high_bus_pins {
 	} bits;
 	uint32_t word;
 };
+
+// The signals that change halves between board revisions.  A trace row is a
+// (bus_pins, high_bus_pins) pair; these read a signal from whichever half it
+// is in on the board being built for, so a decoder never needs its own #if.
+// Interrupt and !HALT bits are the raw active-low pin levels.
+#if PICO_THING_BOARD_VERSION >= 3
+static inline bool row_halt(bus_pins, high_bus_pins hp) { return hp.bits.HALT; }
+static inline bool row_nmi(bus_pins, high_bus_pins hp) { return hp.bits.NMI; }
+static inline bool row_firq(bus_pins, high_bus_pins hp) { return hp.bits.FIRQ; }
+static inline bool row_irq(bus_pins, high_bus_pins hp) { return hp.bits.IRQ; }
+static inline bool row_task0(bus_pins bp, high_bus_pins) { return bp.bits.TASK0; }
+static inline unsigned row_a_hi(bus_pins bp, high_bus_pins) { return bp.bits.A_HI; }
+static inline bool row_fault(bus_pins bp, high_bus_pins) { return bp.bits.FAULT; }
+#else
+static inline bool row_halt(bus_pins bp, high_bus_pins) { return bp.bits.HALT; }
+static inline bool row_nmi(bus_pins bp, high_bus_pins) { return bp.bits.NMI; }
+static inline bool row_firq(bus_pins bp, high_bus_pins) { return bp.bits.FIRQ; }
+static inline bool row_irq(bus_pins bp, high_bus_pins) { return bp.bits.IRQ; }
+static inline bool row_task0(bus_pins, high_bus_pins hp) { return hp.bits.TASK0; }
+static inline unsigned row_a_hi(bus_pins, high_bus_pins hp) { return hp.bits.A_HI; }
+static inline bool row_fault(bus_pins, high_bus_pins hp) { return hp.bits.FAULT; }
+#endif
 
 // Chunks are like snippets, except they are too big for snippet space, so they go into RAM
 #define	CHUNK_ADDRESS	uint16_t(0x0130u)
@@ -247,6 +337,27 @@ union high_bus_pins {
 // Task register bits
 #define NUM_TASK_PINS		(5u)
 #define	TASK_PINS_MASK		((1u << NUM_TASK_PINS) - 1u)
+
+// The six task pins are consecutive, so task_output drives them with one
+// "out pins 6" - but TASK0 (Root, high when the task is zero) is the top pin
+// on versions 1 and 2 and the BOTTOM one on version 3.
+#if PICO_THING_BOARD_VERSION >= 3
+#define	TASK_OUTPUT_BASE	GPIO_TASK_0
+#define	BUS_FAULT_SAMPLE_BASE	16u	// GPIO 16-47: the page and FAULT are at 23-26
+static inline uint32_t
+task_output_word(uint8_t task)
+{
+	return (static_cast<uint32_t>(task & TASK_PINS_MASK) << 1) | ((task == 0u) ? 1u : 0u);
+}
+#else
+#define	TASK_OUTPUT_BASE	GPIO_TASK_BASE
+#define	BUS_FAULT_SAMPLE_BASE	32u	// GPIO 32-47, then 16-31 as the window wraps
+static inline uint32_t
+task_output_word(uint8_t task)
+{
+	return task | ((task == 0u) ? (1u << NUM_TASK_PINS) : 0u);
+}
+#endif
 
 // System registers relative to REGISTER_DEVICES
 #define SYSTEM_TASK		uint16_t(0x00u)

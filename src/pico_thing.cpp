@@ -8,6 +8,7 @@
 
 #include <cctype>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 //#include <cstring>
 //#include <cstdlib>
@@ -181,7 +182,7 @@ volatile bool verbose = false;
 #define TRACE_LO_PIO	pio1		// bus trace, GPIO 0-31 (moved from pio0 2026-10-11 to make room for the read SM's AVMA gate; pio1 = clock 4 + write 22 + this 5 = 31 words)
 #define TRACE_HI_PIO	pio2		// bus trace, GPIO 32-47
 #define BUS_FAULT_PIO	pio2		// DAT fault sampler, needs GPIO_FAULT
-#define INT_PINS_PIO	pio2		// !NMI/!FIRQ/!IRQ driver, GPIO 24-26
+#define INT_PINS_PIO	pio2		// !NMI/!FIRQ/!IRQ driver, GPIO 24-26 (41-43 on version 3)
 
 //                                    pio             sm  off  addr data  irq
 static pio_dma pio_clock     = { BUS_CLOCK_PIO,       -1, -1,  -1,  -1, IO_IRQ_BANK0 };
@@ -197,8 +198,7 @@ static pio_dma int_pins      = { INT_PINS_PIO,        -1, -1,  -1,  -1, -1 };
 static inline void
 task_pins_update(uint8_t task)
 {
-	uint32_t pio_word = task | ((task == 0u) ? (1u << NUM_TASK_PINS) : 0u);
-	pio_sm_put(task_output.pio, task_output.sm, pio_word);
+	pio_sm_put(task_output.pio, task_output.sm, task_output_word(task));
 }
 
 // task_stack is now inside mc6809 class (mc6809::task_stack[])
@@ -761,8 +761,13 @@ trace_hw_acquire()
 	trace_hi.sm = hi_sm;
 	// Default trigger pin is !NMI; any pin 0-31 will do, since only the low
 	// half ever sees it.  The high half follows via the IRQ handshake.
+	// Version 3 moved !NMI to GPIO 41, outside the low half's window, so
+	// it falls back to !CS.  Nothing sets trace_hw_triggered today, so the
+	// trigger is never used - but a pin the PIO cannot see would wrap to
+	// GPIO 9 (D0) without complaint.
+	constexpr uint trace_trigger_pin = (GPIO_NMI < 32) ? GPIO_NMI : GPIO_CS;
 	bus_capture_lo_program_init(trace_lo.pio, trace_lo.sm,
-				    static_cast<uint>(trace_lo.offset), GPIO_NMI);
+				    static_cast<uint>(trace_lo.offset), trace_trigger_pin);
 	bus_capture_hi_program_init(trace_hi.pio, trace_hi.sm,
 				    static_cast<uint>(trace_hi.offset));
 	// THE DMA CONFIGURATION HAS TO BE REDONE HERE, not once at setup: both
@@ -1511,10 +1516,21 @@ __time_critical_func(gpio_q_irq_handler())
 		// for one fewer SIO read on a path that runs every E cycle.  The
 		// input register reflects the pad even for an output pin, so
 		// reading our own !RESET back is sound.
+#if PICO_THING_BOARD_VERSION >= 3
+		// Version 3 moved !RESET to GPIO 39, out of the low word, so this
+		// costs the one extra SIO load the comment above avoids.
+		static_assert(GPIO_RESET == 39,
+			      "union high_bus_pins' RESET bit is GPIO 39; if the pin "
+			      "moves, the bitfield has to move with it");
+		high_bus_pins reset_pins{};
+		reset_pins.word = sio_hw->gpio_hi_in;
+		const bool reset_now = !reset_pins.bits.RESET;
+#else
 		static_assert(GPIO_RESET == 29,
 			      "union bus_pins' RESET bit is bit 29; if the pin "
 			      "moves, the bitfield has to move with it");
 		const bool reset_now = !bus_pins.bits.RESET;
+#endif
 #if DIAG_ON
 		// Diagnostic only: st's LIC display and the stall warning.
 		// start_with_timeout() verdicts on run_state == RS_SYNCED and
@@ -1621,19 +1637,36 @@ __time_critical_func(pio_bus_fault_irq_handler())
 	// if the guest faulted again before this ran, and first-fault-wins
 	// applies to the sample exactly as it does to the record.  Draining the
 	// rest also means no stale word is left to be read as the next fault.
-	high_bus_pins high_pins{};
+	//
+	// The sample is 32 pins from BUS_FAULT_SAMPLE_BASE.  Versions 1 and 2:
+	// GPIO 32-47 in the low half, which is high_bus_pins as it stands.
+	// Version 3: GPIO 16-47, so the top half is high_bus_pins and the bottom
+	// half is the top of bus_pins, where the page and FAULT now live.
+	// Unpacked into the pair a trace row uses, so row_a_hi() reads either.
+	uint32_t word = 0u;
 	bool sampled = false;
 	while (!pio_sm_is_rx_fifo_empty(bus_fault.pio, static_cast<uint>(bus_fault.sm))) {
-		const uint32_t word = pio_sm_get(bus_fault.pio, static_cast<uint>(bus_fault.sm));
+		const uint32_t w = pio_sm_get(bus_fault.pio, static_cast<uint>(bus_fault.sm));
 		if (!sampled) {
-			high_pins.word = word;
+			word = w;
 			sampled = true;
 		}
 	}
-	// Belt and braces: the flag cannot be raised without the push that
-	// precedes it, but a live read beats recording nothing.
-	if (!sampled)
+	bus_pins low_pins{};
+	high_bus_pins high_pins{};
+	if (sampled) {
+#if PICO_THING_BOARD_VERSION >= 3
+		low_pins.word = word << 16;
+		high_pins.word = word >> 16;
+#else
+		high_pins.word = word;
+#endif
+	} else {
+		// Belt and braces: the flag cannot be raised without the push
+		// that precedes it, but a live read beats recording nothing.
+		low_pins.word = sio_hw->gpio_in;
 		high_pins.word = sio_hw->gpio_hi_in;
+	}
 
 	// First fault wins.  The countdown stands in for the mask until it
 	// expires, so a second fault inside the window cannot overwrite the
@@ -1685,7 +1718,7 @@ __time_critical_func(pio_bus_fault_irq_handler())
 	// MC6809.task.
 	reg[SYSTEM_DAT_FAULT_LOC] = static_cast<uint8_t>(
 		(high_pins.bits.TASK << DAT_FAULT_LOC_TASK_SHIFT)
-		| high_pins.bits.A_HI);
+		| row_a_hi(low_pins, high_pins));
 }
 
 // ISR for the R/!W bus read loop and DMA chain
@@ -6229,14 +6262,14 @@ status_done:
 			       have_bla ? (mir.bit.LIC  ? 'l' : '.') : '?',
 			       have_bla ? (mir.bit.AVMA ? 'v' : '.') : '?',
 			       differs ? '!' : '.',
-			       bp.bits.HALT ? '.' : 'H',	// active-low outputs: letter = asserted
-			       bp.bits.NMI  ? '.' : 'N',
-			       bp.bits.FIRQ ? '.' : 'F',
-			       bp.bits.IRQ  ? '.' : 'I',
+			       row_halt(bp, hp) ? '.' : 'H',	// active-low outputs: letter = asserted
+			       row_nmi(bp, hp)  ? '.' : 'N',
+			       row_firq(bp, hp) ? '.' : 'F',
+			       row_irq(bp, hp)  ? '.' : 'I',
 			       static_cast<unsigned>(hp.bits.TASK),
-			       hp.bits.TASK0 ? '0' : ' ',	// Root: task-zero flag to the DAT
-			       static_cast<unsigned>(hp.bits.A_HI),	// A15-A13, the DAT page
-			       hp.bits.FAULT ? 'F' : '.',
+			       row_task0(bp, hp) ? '0' : ' ',	// Root: task-zero flag to the DAT
+			       row_a_hi(bp, hp),		// A15-A13, the DAT page
+			       row_fault(bp, hp) ? 'F' : '.',
 			       hp.bits.NMI_BLOCK ? 'M' : '.');
 		}
 		if (ring)
