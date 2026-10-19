@@ -3701,9 +3701,9 @@ static constexpr float POWER_RAIL_DROP_VOLTS = PICO_THING_POWER_RAIL_DROP_VOLTS;
 // How far below its own slow baseline +5VP has to fall to count as low.  This
 // is the PRIMARY detector; POWER_RAIL_DROP_VOLTS above is only the backstop
 // for a baseline that never established.  Relative rather than absolute
-// because both ADC channels read 0.5 to 0.7V high whenever the Pico serves
-// the bus, and that inflation cancels in a difference but corrupts an
-// absolute threshold completely.  Set with
+// because a gain or offset error in the ADC cancels in a difference but
+// corrupts an absolute threshold; version 2 once read 0.5 to 0.7V high while
+// serving the bus, before its ADC-bank pins were clamped.  Set with
 // -DPICO_THING_POWER_RAIL_FALL_VOLTS=<volts>.
 #ifndef PICO_THING_POWER_RAIL_FALL_VOLTS
 #define PICO_THING_POWER_RAIL_FALL_VOLTS 0.40f
@@ -3760,7 +3760,6 @@ static volatile uint16_t die_raw = 0u;		// counts, internal temperature sensor
 // saturated a real sag is invisible until the rail falls over 20%.
 static constexpr uint16_t RAIL_CLIP_COUNTS = 4090u;
 static volatile bool rail_clipped = false;	// last sample was at full scale
-static volatile bool rail_floor_only = false;	// serving: floor judged, baseline frozen
 
 static volatile uint32_t rail_low_count = 0u;	// consecutive samples below the cutout
 static volatile float rail_baseline = 0.0f;	// slow average of a healthy +5VP
@@ -3769,27 +3768,17 @@ static volatile uint64_t rail_settle_until = 0u;	// us since boot; no judging be
 static volatile bool rail_sampled = false;	// at least one pass has run
 static volatile bool rail_collapsed = false;	// set here, acted on by the console loop
 
-// These readings are only true while the Pico is not serving the bus.
+// These readings hold in every run state.
 //
-// adcdump on the replacement version 2 board (September 2026) found both
-// channels right, to within a count or two, with the guest halted or
-// unpowered: 3158 counts on the supply, where the metered 5.0033V rail
-// predicts 3158, and 865 on the die, 39C.  Whenever the Pico answers bus
-// reads - the guest held in reset, running, or faulting - both read high:
-// the supply by 350 to 420 counts, 0.55 to 0.67V at the rail, and the die by
-// about 125 counts, which reads nearly 60 degrees colder than it is.  The
-// reference was metered at the same time and had not moved.
-//
-// That is a shift, not scatter, so the median of several samples once planned
-// here would not remove it.  Nor is it one converter offset: the channels move
-// by different amounts, and by how much depends on how closely the samples
-// follow one another.  It behaves like interference from serving the bus,
-// some of it reaching the converter inside the chip, and it grew as parts
-// were fitted.  The cause is not yet found.
-//
-// For the cutout this errs in the unsafe direction.  A high reading cannot
-// trip it falsely, but it can hide a real sag: while the bus is being served,
-// the rail may fall to about 3.4V before the reading drops below 4.0V.
+// Until October 2026 they did not: whenever the Pico answered bus reads both
+// channels read high - the supply by 350 to 420 counts, the die by about 125 -
+// and later the reference itself collapsed to ~2.03V.  The cause was version
+// 2 putting 5V signals (A13-A15, FAULT) on GPIO 41-45, which are in the ADC
+// bank and the only pins on the RP2350B that are NOT 5V tolerant.  With 1.5k
+// series resistors and Schottky clamps on those four lines, adcdump on
+// 2026-10-19 put all six states - reset, Pico R/W, RAM R/W, faulting, halted,
+// unpowered - within 3 counts on the supply and 2 on the die, every standard
+// deviation under 1.4 counts.  A board without the clamps still has the fault.
 static bool
 power_rail_monitor(repeating_timer *)
 {
@@ -3831,43 +3820,19 @@ power_rail_monitor(repeating_timer *)
 		rail_baseline,
 		rail_good_count,
 	};
-	// THREE TIERS, because the ADC is only calibrated in two run states.
-	//
 	// A clipped sample tells us nothing at all: 4095 reads as 6.49V, which is
-	// HIGH, so it would happily seed the baseline - and then the bus goes
-	// quiet, the reference recovers, the reading falls to a correct 5.00V and
-	// the relative detector sees a collapse that never happened.  That
-	// powered the board down twice on 2026-10-06.
+	// HIGH, so it would happily seed the baseline - and then the reference
+	// recovers, the reading falls to a correct 5.00V and the relative
+	// detector sees a collapse that never happened.  That powered the board
+	// down twice on 2026-10-06.  The clamps should make this unreachable; it
+	// stays because a board without them still clips.
 	//
-	// Short of clipping, a sample taken while the bus is being served is
-	// still inflated - 0.17 to 0.5V in September, far more since the
-	// reference fault of 2026-10-07 - and the inflation is NOT constant, so
-	// a baseline seeded from one makes the next quiet sample look like a
-	// collapse by the same mechanism.  So while the guest is running the
-	// baseline is FROZEN and only the absolute floor is judged.
-	//
-	// That is not a loss of protection, because there was none to lose: with
-	// the reading inflated by 10% a real sag to 4.5V reports 5.0V and is
-	// invisible.  The floor is kept because a TOTAL loss of +VDC drives the
-	// reading to zero, and a gain error cannot hide that.  Full judging
-	// resumes in the two states the calibration was derived in.
+	// Every other sample is judged in full, whatever the guest is doing.
 	rail_clipped = raw >= RAIL_CLIP_COUNTS;
-	const bool adc_calibrated = MC6809.is_halted() || MC6809.is_unpowered();
-	rail_floor_only = !rail_clipped && !adc_calibrated;
 
 	rail_judgement rj = { false, rail_low_count, rail_baseline,
 			      rail_good_count };
-	if (rail_floor_only) {
-		// fall_volts of zero disables the relative test by contract, so
-		// this judges the floor alone.  The debounce counter is kept, but
-		// the baseline and its good_count are deliberately NOT written
-		// back, which is what freezes them.
-		rail_limits floor_cfg = rail_cfg;
-		floor_cfg.fall_volts = 0.0f;
-		const rail_judgement floor_rj = rail_judge(rs, floor_cfg);
-		rj.trip = floor_rj.trip;
-		rail_low_count = floor_rj.low_count;
-	} else if (!rail_clipped) {
+	if (!rail_clipped) {
 		rj = rail_judge(rs, rail_cfg);
 		rail_low_count = rj.low_count;
 		rail_baseline = rj.baseline;
@@ -3997,7 +3962,6 @@ status_gather(status_snapshot_t *s)
 	s->rail_baseline = rail_baseline;
 	s->rail_good = rail_good_count;
 	s->rail_clipped = rail_clipped;
-	s->rail_floor_only = rail_floor_only;
 	s->busy_lic_avma = MC6809.get_busy_lic_avma();
 	// pio2 flag 1 is set by the clock at every E-falling and consumed by
 	// nothing since the BUSY/LIC/AVMA mirror went, so SET is now the expected
@@ -4153,18 +4117,6 @@ status_print(const status_snapshot_t *s)
 	       s->power ? "HIGH" : "low",
 	       !s->reset ? "high" : "LOW",
 	       !s->halt ? "high" : "LOW");
-	// Both ADC channels read high whenever the Pico is answering bus reads,
-	// and only RS_HALTED and RS_UNPOWERED have been measured against a
-	// meter - those are the two the calibration constants were derived from.
-	// Everything else serves the bus, where the supply reads 0.54 to 0.66V
-	// high depending on what the guest is doing and the die about 123 counts
-	// high, for reasons not yet understood.  Saying so beats printing -18C
-	// as though it were a temperature, which is a misreading I made myself
-	// before working out what the figures meant.
-	const bool adc_quiet = s->run_state == RS_HALTED
-			    || s->run_state == RS_UNPOWERED;
-	static constexpr const char *adc_warning =
-		"   <- the bus is being served; both ADC channels read high";
 #if PICO_THING_BOARD_VERSION >= 2
 	// The baseline as well as the sample: without it there is no way to see
 	// whether the relative detector is armed, which is what the bench test
@@ -4172,10 +4124,6 @@ status_print(const status_snapshot_t *s)
 	if (s->rail_clipped)
 		printf("  cutout DISABLED - supply channel at full scale, so the"
 		       " rail cannot be seen\n");
-	else if (s->rail_floor_only)
-		printf("  cutout FLOOR ONLY (%.2fV) - the bus is served, so the"
-		       " reading is inflated and the baseline is frozen\n",
-		       (double) POWER_RAIL_DROP_VOLTS);
 	else if (s->rail_baseline > 0.0f)
 		printf("  cutout baseline %.2fV (%" PRIu32 " good)%s\n",
 		       (double) s->rail_baseline, s->rail_good,
@@ -4183,13 +4131,11 @@ status_print(const status_snapshot_t *s)
 					   : ", still establishing");
 	else
 		printf("  cutout baseline not established - absolute floor only\n");
-	printf("PICO SUPPLY (+5VP): %.2fV (%u counts)%s\n",
-	       adc_rail_volts(s->voltage), s->voltage,
-	       adc_quiet ? "" : adc_warning);
+	printf("PICO SUPPLY (+5VP): %.2fV (%u counts)\n",
+	       adc_rail_volts(s->voltage), s->voltage);
 #endif
-	printf("PICO TEMPERATURE: %.1fC (%u counts)%s\n",
-	       adc_die_celsius(s->temperature), s->temperature,
-	       adc_quiet ? "" : adc_warning);
+	printf("PICO TEMPERATURE: %.1fC (%u counts)\n",
+	       adc_die_celsius(s->temperature), s->temperature);
 	// THE DIE SENSOR BOUNDS THE REFERENCE, which nothing else here can do.
 	//
 	// Every reading above is counts x ADC_VREF_VOLTS / 4096: a ratio against

@@ -31,10 +31,10 @@
  * spot, and the reason dropping /POWER (which disables U104 only) leaves the
  * Pico alive to report it.
  *
- * WHY RELATIVE RATHER THAN ABSOLUTE.  Both ADC channels read high whenever
- * the Pico serves the bus - 0.5 to 0.7V at this divider - so an absolute
- * threshold is comparing against a number inflated by an unknown amount.  The
- * inflation is near-constant while serving, so it CANCELS in a difference:
+ * WHY RELATIVE RATHER THAN ABSOLUTE.  An absolute threshold is only as good
+ * as the ADC's calibration, and version 2 once read 0.5 to 0.7V high at this
+ * divider whenever the Pico served the bus (5V injected into the ADC-bank
+ * pins, since clamped).  A near-constant error CANCELS in a difference:
  * tracking a slow baseline and tripping on a fall from it is immune to the
  * offset by construction.  The absolute floor stays as a backstop only.
  *

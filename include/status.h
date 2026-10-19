@@ -63,7 +63,6 @@ struct status_snapshot_t {
 	float    rail_baseline;	// the cutout's slow reference, 0 = not established
 	uint32_t rail_good;	// consecutive healthy samples behind it
 	bool     rail_clipped;	// supply channel at full scale: no measurement
-	bool     rail_floor_only;	// serving: absolute floor only, baseline frozen
 	uint32_t write_ring_overflow;	// dropped guest-write dispatches: real loss
 	uint32_t write_addr_worst;	// most ring entries one write interrupt drained
 	uint32_t write_addr_coalesced;	// writes that shared an interrupt with another
