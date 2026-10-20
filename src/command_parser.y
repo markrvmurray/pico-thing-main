@@ -458,17 +458,37 @@ byte_item:
  * we seed _byte_count = 0 at the start of each command that uses it. */
 
 /* -----------------------------------------------------------------------
- * loop { r | R | w | W | rw } <address>
+ * loop { r | R | w | W | rw } <address> [<run address>]
+ *
+ * With a run address the loop is copied into guest memory there and run from
+ * it, rather than from the snippet window.  Seven bytes are laid down, and
+ * they must end above DAT RAM at $FE00.
  * ----------------------------------------------------------------------- */
 loop_cmd:
+	  loop_head
+	| loop_head TOK_NUMBER {
+		uint32_t run = parse_hex($2);
+		if (run == UINT32_MAX || run + LOOP_CODE_LEN > 0xFE00u) {
+			printf("Invalid run address '%s' - the loop must end "
+			       "above $FE00\n", $2);
+			YYERROR;
+		}
+		result->loop.in_ram      = true;
+		result->loop.run_address = (uint16_t)run;
+	}
+	;
+
+loop_head:
 	TOK_LOOP loop_type TOK_NUMBER {
 		uint32_t addr = parse_hex($3);
 		if (addr == UINT32_MAX || addr > 0xFFFFu) {
 			printf("Invalid address '%s'\n", $3);
 			YYERROR;
 		}
-		result->tag          = CMD_LOOP;
-		result->loop.address = (uint16_t)addr;
+		result->tag              = CMD_LOOP;
+		result->loop.address     = (uint16_t)addr;
+		result->loop.in_ram      = false;
+		result->loop.run_address = 0u;
 		/* opcode already set by loop_type rule via result->loop.opcode */
 	}
 	;

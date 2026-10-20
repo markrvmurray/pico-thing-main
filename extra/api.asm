@@ -109,11 +109,12 @@ Sync	SYNC
 	SYNC
 
 * Looks good on the oscilloscope if the Pico2's PIO SM and DMA ISR are instrumented.
+* Interrupts are masked first, so the loop is the only thing on the bus.
+* The Pico patches the access at Loop+2: opcode, then the address.
 	ORG	START
-Loop	LDA	>SHARED
-	BRA	Loop
-	SYNC
-	SYNC
+Loop	ORCC	#$50
+L@0	LDA	>SHARED
+	BRA	L@0
 	SYNC
 	SYNC
 	SYNC

@@ -547,6 +547,35 @@ TEST_CASE("loop command", "[parser][loop]")
 		CHECK(cmd.loop.opcode  == 0x70);
 		CHECK(cmd.loop.address == 0xABCD);
 	}
+	SECTION("no run address - the loop runs in the snippet window")
+	{
+		REQUIRE(parse("lo r FDFF", &cmd));
+		CHECK(cmd.loop.address == 0xFDFF);
+		CHECK_FALSE(cmd.loop.in_ram);
+	}
+	SECTION("run address - the loop is copied there")
+	{
+		REQUIRE(parse("lo r FDFF 130", &cmd));
+		CHECK(cmd.tag              == CMD_LOOP);
+		CHECK(cmd.loop.opcode      == 0xB6);
+		CHECK(cmd.loop.address     == 0xFDFF);
+		CHECK(cmd.loop.in_ram);
+		CHECK(cmd.loop.run_address == 0x0130);
+	}
+	SECTION("run address - the last that ends above DAT RAM")
+	{
+		REQUIRE(parse("lo w 1000 FDF9", &cmd));
+		CHECK(cmd.loop.run_address == 0xFDF9);
+	}
+	SECTION("run address - reaching DAT RAM is rejected")
+	{
+		CHECK_FALSE(parse("lo w 1000 FDFA", &cmd));
+		CHECK_FALSE(parse("lo w 1000 FFE0", &cmd));
+	}
+	SECTION("run address - no third address")
+	{
+		CHECK_FALSE(parse("lo r 1000 130 140", &cmd));
+	}
 }
 
 // ============================================================

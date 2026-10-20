@@ -4817,7 +4817,10 @@ process_command(char *buf)
 		"  break [addr|r]     (br)  breakpoint; r resumes\n"
 		"  irq <0-9>          (ir)  interrupt tests; 7 is NMIBlock latency,\n"
 		"                           8 is the DAT fault path, 9 single-steps\n"
-		"  loop <type> <addr> (lo)  hammer addr for scope work.  The type is\n"
+		"  loop <type> <addr> [run]\n"
+		"                     (lo)  hammer addr for scope work, interrupts\n"
+		"                           masked.  The loop runs at $FFE0, or is\n"
+		"                           copied to run and runs there.  The type is\n"
 		"                           CASE-SENSITIVE: lower case is a byte access,\n"
 		"                           upper case a word:\n"
 		"                             r   LDA (read byte)    R   LDD (read word)\n"
@@ -5110,14 +5113,41 @@ status_done:
 		break;
 	}
 
-	case CMD_LOOP:
+	case CMD_LOOP: {
 		if (!MC6809.assert_powered())
 			break;
-		snippet_copy(LOOP_RW);
-		reg[REGISTER_SNIPPET_OFFSET + 0u] = cmd.loop.opcode;
-		reg[REGISTER_SNIPPET_OFFSET + 1u] = cmd.loop.address;
+		if (!cmd.loop.in_ram) {
+			// LOOP_RW masks interrupts with ORCC, then repeats the
+			// access at offset 2: opcode, then address.
+			snippet_copy(LOOP_RW);
+			reg[REGISTER_SNIPPET_OFFSET + 2u] = cmd.loop.opcode;
+			reg[REGISTER_SNIPPET_OFFSET + 3u] = cmd.loop.address;
+			MC6809.start();
+			break;
+		}
+		// The same loop, laid down in guest memory and run from there, so
+		// that its fetches go wherever that address maps rather than to
+		// the Pico's window.
+		const uint16_t run = cmd.loop.run_address;
+		const uint8_t code[LOOP_CODE_LEN] = {
+			0x1Au, 0x50u,				// ORCC #$50
+			cmd.loop.opcode,			// the access...
+			static_cast<uint8_t>(cmd.loop.address >> 8),
+			static_cast<uint8_t>(cmd.loop.address),	// ...and its address
+			0x20u, 0xFBu				// BRA back to the access
+		};
+		// copy() runs a snippet of its own, so it goes first and the
+		// reset vector is pointed at the loop after it.
+		if (!copy(OUTWARDS, LOOP_CODE_LEN, run, code)) {
+			printf("Could not write the loop at %04X\n", run);
+			break;
+		}
+		MC6809.stop();
+		sleep_ms(1u);
+		reg[REGISTER_VECTOR_RESET_OFFSET] = run;
 		MC6809.start();
 		break;
+	}
 
 	case CMD_SYNCTEST:
 		if (!MC6809.assert_stopped())
@@ -5276,7 +5306,7 @@ status_done:
 		// down and back up prints progress that would otherwise split the CSV.
 		//
 		// ADC_RAM_LOOP is the discriminator the other conditions cannot be.
-		// LOOP_RW is five bytes of LDA extended and BRA, and it runs at
+		// LOOP_RW is ORCC, then five bytes of LDA extended and BRA, and it runs at
 		// $FFE0 - inside the Pico's own window - so five of its eight cycles
 		// are opcode and operand fetches that the PICO answers, and only the
 		// data read reaches RAM.  Reset is the same story at one fetch per
@@ -5321,8 +5351,9 @@ status_done:
 		// $20D0 are both in ADC_BURST_PAGE, so one DAT entry maps the lot.
 		static constexpr uint16_t ADC_RAM_LOOP_ADDR = 0x2000u;
 		static const uint8_t adc_ram_loop[] = {
+			0x1Au, 0x50u,		// ORCC #$50, as LOOP_RW does
 			0xB6u, 0x20u, 0xD0u,	// LDA $20D0
-			0x20u, 0xFBu		// BRA -5, back to $2000
+			0x20u, 0xFBu		// BRA -5, back to $2002
 		};
 		enum : uint8_t {
 			ADC_RESET,		// guest held in reset
@@ -5385,8 +5416,8 @@ status_done:
 					sleep_ms(2u);	// let the loop get going before sampling
 				} else if (cond != ADC_RESET) {
 					snippet_copy(LOOP_RW);
-					reg[REGISTER_SNIPPET_OFFSET + 0u] = static_cast<uint8_t>(0xB6u);	// LDA extended
-					reg[REGISTER_SNIPPET_OFFSET + 1u] =
+					reg[REGISTER_SNIPPET_OFFSET + 2u] = static_cast<uint8_t>(0xB6u);	// LDA extended
+					reg[REGISTER_SNIPPET_OFFSET + 3u] =
 						static_cast<uint8_t>(ADC_BURST_PAGE << 5);
 					// Explicitly, not by leftover: the RAM condition above
 					// points this at RAM, and the next condition must not

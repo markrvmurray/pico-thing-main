@@ -13,6 +13,10 @@
 extern "C" {
 #endif
 
+/* The loop command's code when it runs from RAM: ORCC #$50, the access
+ * (opcode and a 16-bit address), BRA back to the access. */
+#define LOOP_CODE_LEN 7u
+
 typedef enum cmd_tag {
 	CMD_NONE = 0,
 	CMD_SYNTAX_ERROR,
@@ -122,6 +126,8 @@ typedef struct parsed_cmd {
 		struct {
 			uint8_t  opcode;
 			uint16_t address;
+			bool     in_ram;	/* run from run_address, not $FFE0 */
+			uint16_t run_address;
 		} loop;
 
 		/* CMD_VECTOR */
