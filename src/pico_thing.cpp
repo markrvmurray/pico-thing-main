@@ -2139,8 +2139,15 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		// Arm/disarm deferred to write ring handler (needs snippet_code[])
 	}
 	else if (wloc == SYSTEM_TRACE) {
-		// USim TraceCtl convention: non-zero arms a one-shot bus trace, zero stops.
-		if (wval)
+		// An armed ring is evidence: any write freezes it, so that guest
+		// code - DBGMON's PrintChar - can mark the moment things went
+		// wrong.  Once frozen, later writes are ignored rather than
+		// re-arming over the capture, because DBGMON goes on printing.
+		// Otherwise the USim TraceCtl convention: non-zero arms a
+		// one-shot bus trace, zero stops.
+		if (MC6809.trace_is_ring() && MC6809.trace_is_armed())
+			MC6809.trace_ring_freeze();
+		else if (wval)
 			MC6809.trace_arm();
 		else
 			MC6809.trace_stop();

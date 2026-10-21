@@ -13,7 +13,7 @@ VECTORS	EQU	$FFF0	CPU reset and interrupt vectors
 CHUNK	EQU	$0130
 
 TASK	EQU	DEVICE+$00
-TRACE	EQU	DEVICE+$0B	Bus trace control: non-zero arms a one-shot
+TRACE	EQU	DEVICE+$0B	Bus trace control: non-zero arms a one-shot; any write freezes a running ring
 DATFLT	EQU	DEVICE+$0C	DAT fault status; bit 7 is NMIBlock
 RTCADDR	EQU	$FF32	DS12885 index port; the data port is the next address
 ACIA	EQU	DEVICE+$04	Console MC6850: status (read) and control, then data
@@ -308,6 +308,7 @@ F@0	TFR	X,D
 DAT.Task            equ       $FFC0
 ACIA.Ctrl           equ       $FFC4
 ACIA.Data           equ       $FFC5
+SYS.Trace           equ       $FFCB
 
 ********************************************************************
 * Jump table - fixed entry points
@@ -320,7 +321,7 @@ JT.PCR              jmp       PrintCR
 JT.PReg             jmp       PrintRegs
 JT.IlOp             jmp       IllegalOp
 
-Version             fcb       1,0,0
+Version             fcb       1,1,0
 
 ********************************************************************
 * PrintChar - print character in A to ACIA
@@ -328,7 +329,13 @@ Version             fcb       1,0,0
 * Entry: A = character to print
 * Exit:  all registers preserved
 *
+* Every DBGMON path prints through here, and nothing calls DBGMON while
+* the guest is healthy, so the first character marks the moment it went
+* wrong.  The poke freezes a running trace ring there, before the print
+* itself outlasts the ring.
+*
 PrintChar           pshs      cc,a
+                    sta       >SYS.Trace freeze a running trace ring
 PChr.Wait           lda       >ACIA.Ctrl read ACIA status
                     bita      #$02      TDRE set?
                     beq       PChr.Wait no, wait
