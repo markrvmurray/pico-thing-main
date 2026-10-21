@@ -47,6 +47,8 @@ struct status_snapshot_t {
 	// GPIO pins
 	bool power, reset, halt, nmi, firq, irq;
 	uint16_t voltage, temperature;   // raw counts; voltage is 0 on version 1
+	uint16_t temperature_boot;       // raw counts, the die's first sample after reset
+	uint32_t temperature_boot_ms;    // when that was taken
 
 	// Pico silicon
 	uint8_t chip_revision;           // CHIP_ID.REVISION, raw

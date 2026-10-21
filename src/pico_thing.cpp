@@ -3747,6 +3747,16 @@ static repeating_timer rail_timer;
 static volatile uint16_t rail_raw = 0u;		// counts, external 5V through the divider
 static volatile uint16_t rail_trip_raw = 0u;	// the sample that opened the switch
 static volatile uint16_t die_raw = 0u;		// counts, internal temperature sensor
+// THE DIE BEFORE IT HAS WARMED ITSELF.  The sensor's 0.706V at 27C is a
+// typical figure and real parts spread tens of mV around it, so a per-board
+// correction needs the die at a KNOWN temperature - which, with no external
+// probe on it, means ambient after a long rest unpowered.  Within seconds of
+// running at full clock the die is warmer than the package, and calibrating
+// against a surface reading then would hide exactly the self-heating the
+// sensor is there to watch.  So this is taken once, as early as the ADC is
+// up, and never again.
+static uint16_t die_boot_raw = 0u;
+static uint32_t die_boot_ms = 0u;	// when, after reset
 // A SAMPLE AT FULL SCALE IS NOT A MEASUREMENT.  When the ADC reference sags
 // under bus switching (2026-10-06: 3.24V down to ~2.03V) this channel clips,
 // and a clipped 4095 reads as 6.49V - HIGH, so it happily seeds the baseline.
@@ -3930,6 +3940,8 @@ status_gather(status_snapshot_t *s)
 	s->voltage = 0u;           // no bus voltage divider on version 1
 #endif
 	s->temperature = die_raw;
+	s->temperature_boot = die_boot_raw;
+	s->temperature_boot_ms = die_boot_ms;
 
 	// The raw revision rather than rp2350_chip_version(), whose numbering
 	// does not follow the stepping names and which asserts on a foreign ID.
@@ -4136,6 +4148,9 @@ status_print(const status_snapshot_t *s)
 #endif
 	printf("PICO TEMPERATURE: %.1fC (%u counts)\n",
 	       adc_die_celsius(s->temperature), s->temperature);
+	printf("  die at boot: %.1fC (%u counts, %" PRIu32 "ms after reset)\n",
+	       adc_die_celsius(s->temperature_boot), s->temperature_boot,
+	       s->temperature_boot_ms);
 	// THE DIE SENSOR BOUNDS THE REFERENCE, which nothing else here can do.
 	//
 	// Every reading above is counts x ADC_VREF_VOLTS / 4096: a ratio against
@@ -4637,6 +4652,8 @@ status_json(const status_snapshot_t *s)
 #endif
 	printf(R"json(,"temperature":%.1f,"temperature_raw":%u)json",
 	       adc_die_celsius(s->temperature), s->temperature);
+	printf(R"json(,"temperature_boot_raw":%u,"temperature_boot_ms":%)json" PRIu32,
+	       s->temperature_boot, s->temperature_boot_ms);
 	if (const chip_stepping_t *stepping = chip_stepping(s->rom_version))
 		printf(R"json(,"chip_stepping":"%s")json", stepping->name);
 	else
@@ -8265,6 +8282,10 @@ main()
 	adc_gpio_init(GPIO_POWER_ADC);   // 5V divider, version 2 only
 #endif
 	adc_set_temp_sensor_enabled(true);
+	adc_select_input(NUM_ADC_CHANNELS - 1);
+	(void) adc_read();
+	die_boot_raw = adc_read();
+	die_boot_ms = to_ms_since_boot(get_absolute_time());
 	power_rail_monitor_start();
 	printf("Core0 supply monitor sampling every %" PRIu32 "ms\n", RAIL_MONITOR_MS);
 	usb_init();
