@@ -92,7 +92,10 @@ mc6809::setup(enum run_state rs)
 	for (auto &c : _count_irq_ack) c = 0u;
 	// If a one-shot trace is armed for this run, restart its fill cleanly.
 	// An interrupt-triggered config (trace_irq_trigger) persists across restarts.
-	if (trace_armed)
+	// A FROZEN ring is left alone: it holds the run that just went wrong, and
+	// re-arming it here would throw that away on the next snippet - which
+	// is exactly what examining memory after a crash runs.
+	if (trace_armed && !(trace_ring && trace_ring_frozen))
 		trace_arm();
 }
 
