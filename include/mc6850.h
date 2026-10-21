@@ -173,7 +173,7 @@ private:
 	volatile uint32_t n_cts_change = 0u;	// set_host_cts() actually changed it
 	// How often has_interrupt_recompute() ran.  Always maintained, so st can
 	// print a real number: under DriveWire it should move with interrupt-
-	// relevant transitions, not with host bytes (Core 1 loop audit, finding 6).
+	// relevant transitions, not with host bytes.
 	volatile uint32_t n_recompute = 0u;
 	[[nodiscard]] uint8_t status_byte() const;
 	void sync_status();
@@ -202,9 +202,9 @@ public:
 	// HOST BYTES MARK THE STATE DIRTY ONLY AT A TRANSITION.  Core 0 moves a
 	// byte here for every byte DriveWire sends or receives, and each dirty
 	// mark costs Core 1 a full has_interrupt_recompute() on its next pass -
-	// under a DriveWire boot that was one recompute per byte per ACIA (Core 1
-	// loop audit 2026-10-10, finding 6).  But a host byte can only change the
-	// status byte or the IRQ line at three points, and nowhere else:
+	// under a DriveWire boot that was one recompute per byte per ACIA.  But a
+	// host byte can only change the status byte or the IRQ line at three
+	// points, and nowhere else:
 	//
 	//   draining: TDRE comes back when the TX queue stops being FULL, and
 	//   CTS comes back when the level drops TO the threshold (cts_deasserted

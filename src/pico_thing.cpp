@@ -411,8 +411,8 @@ static constexpr uint8_t IRQ_SRC_TICK         = 1u << 2;
 static constexpr uint8_t IRQ_SRC_CONSOLE_CMD  = 1u << 3;
 static volatile uint8_t irq_sources = 0u;	// written by Core 1's loop only
 static volatile uint8_t irq_retired = 0u;	// written by the read ISR only
-// WHERE EACH /IRQ WENT UP AND CAME DOWN.  These three settled finding 21: the
-// read-ISR retirement alone gave 462 vectors taken for 308 assertions, and a
+// WHERE EACH /IRQ WENT UP AND CAME DOWN.  These three settled why
+// acia_torture's test 8 failed from 2.4 MHz: the read-ISR retirement alone gave 462 vectors taken for 308 assertions, and a
 // ratio above one is only possible if the guest re-enters on an assertion it
 // has already taken.  Adding the vector-fetch release took it to 330 taken for
 // 347 raised, with 330 of the retirements happening at the fetch - one per
@@ -1023,10 +1023,10 @@ struct isr_cost {
 };
 static volatile isr_cost q_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
 static volatile isr_cost read_cost = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
-// THE WRITE ISR, which was absent from isr_demand entirely until now - audit
-// finding 3.  Every figure that line printed was therefore too LOW by whatever
-// this path costs, while finding 2 (the instrument being in circuit) pushed it
-// the other way: the headline cap was wrong in both directions at once.
+// THE WRITE ISR, which was absent from isr_demand entirely until now.  Every
+// figure that line printed was therefore too LOW by whatever this path costs,
+// while the instrument being in circuit for every measurement pushed it the
+// other way: the headline cap was wrong in both directions at once.
 //
 // Worth having for its own sake now, not just completeness.  The write ISR is
 // MEASURED as the first thing to give way: coalesced write completions go 0 at
@@ -4336,8 +4336,8 @@ status_print(const status_snapshot_t *s)
 		// real work - 318 of 320 before and after - and look broken.  Its
 		// passes went from 754k to 116M over the same two changes while
 		// reporting the same utilisation, which is the giveaway.
-		// THE WRITE ISR IS NOW IN THE SUM - audit finding 3.  Scaled the
-		// same way as the read ISR: one Q pass per E cycle, so n/q_n is
+		// THE WRITE ISR IS NOW IN THE SUM.  Scaled the same way as the read
+		// ISR: one Q pass per E cycle, so n/q_n is
 		// each handler's entries per E cycle.  Until this term existed the
 		// figure was too low by exactly this much, and that is the half of
 		// the "wrong in both directions" headline that made it understate.

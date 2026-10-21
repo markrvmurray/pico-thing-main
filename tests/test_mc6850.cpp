@@ -1019,7 +1019,7 @@ TEST_CASE("a status register changed behind the ACIA's back is corrected") {
 }
 
 // -----------------------------------------------------------------------
-// Host bytes and the interrupt recompute (Core 1 loop audit, finding 6)
+// Host bytes and the interrupt recompute
 // -----------------------------------------------------------------------
 //
 // In the firmware has_interrupt() runs on every Q-rising edge per ACIA and
