@@ -8289,8 +8289,14 @@ main()
 	adc_gpio_init(GPIO_POWER_ADC);   // 5V divider, version 2 only
 #endif
 	adc_set_temp_sensor_enabled(true);
+	// Discard the converter's first conversions, as adcdump does: just
+	// after adc_init() with the sensor freshly enabled, the first boot
+	// sample read 852 counts against 860 settled - 3.7C hotter than the die
+	// a few minutes later, which cannot be right for a die still warming.
+	static constexpr uint32_t DIE_BOOT_WARMUP = 64u;
 	adc_select_input(NUM_ADC_CHANNELS - 1);
-	(void) adc_read();
+	for (uint32_t n = 0u; n < DIE_BOOT_WARMUP; n++)
+		(void) adc_read();
 	die_boot_raw = adc_read();
 	die_boot_ms = to_ms_since_boot(get_absolute_time());
 	power_rail_monitor_start();
