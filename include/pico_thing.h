@@ -410,10 +410,9 @@ task_output_word(uint8_t task)
 // handler can reach the DAT RAM.  The faulting instruction cannot be retried —
 // the 6809 takes NMI at an instruction boundary and the access has already
 // completed on garbage — so a fault is fatal to the process that caused it and
-// these registers are post-mortem evidence, not inputs to a repair.  The
-// faulting task is on the task stack by then, and apply_rti() restores it
-// unconditionally ~15 E-cycles after any RTI; an OS that terminates the
-// process has to sequence its task switch around that.
+// these registers are post-mortem evidence, not inputs to a repair.  Nothing
+// switches the task back after the handler's RTI: the OS selects the next
+// task itself.
 #define SYSTEM_DAT_FAULT	uint16_t(0x0Cu) // Read/Write ($FFCC)
 
 // Where the fault happened, latched with it: the task that was selected and

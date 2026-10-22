@@ -168,11 +168,14 @@ volatile bool verbose = false;
 // WHY THE BLOCKS ARE DIVIDED THIS WAY.  pio2's GPIO base is 16, so only the
 // three programs that need pins above 31 can live there and none of them can
 // see E or Q.  pio0 and pio1 keep base 0.  That makes pio0 and pio1 the only
-// homes for anything watching the bus, and pio0 is the scarce one: the read
-// program alone is 21 of its 32 words.
+// homes for anything watching the bus, and both are nearly full: the read
+// program, with its address filter and AVMA gate, is 30 of pio0's 32 words,
+// and pio1 holds the clock (4) and the write program (22), plus the trace's
+// low half (5) while a capture is armed - 31 of 32.
 //
-// The clock moved pio0 -> pio1 on 2026-10-07 for exactly that reason, freeing
-// 4 words for the address filter the per-cycle redesign needs.  It costs no
+// The clock moved pio0 -> pio1 on 2026-10-07 to free 4 words for the address
+// filter the per-cycle redesign needs, and the trace's low half followed it on
+// 2026-10-11 to make room for the AVMA gate.  It costs no
 // CPU wherever it sits - it is an autonomous state machine - so instruction
 // space is the only thing that decides.  Moving it DID require changing its
 // two "irq prev set" to "irq next set"; see the note on the program itself.
@@ -180,7 +183,7 @@ volatile bool verbose = false;
 #define BUS_READ_PIO	pio0		// guest reads of the register block
 #define BUS_WRITE_PIO	pio1		// guest writes to the register block
 #define TASK_OUTPUT_PIO	pio2		// task pins, GPIO base 16
-#define TRACE_LO_PIO	pio1		// bus trace, GPIO 0-31 (moved from pio0 2026-10-11 to make room for the read SM's AVMA gate; pio1 = clock 4 + write 22 + this 5 = 31 words)
+#define TRACE_LO_PIO	pio1		// bus trace, GPIO 0-31 (moved from pio0 2026-10-11 to make room for the read SM's AVMA gate; pio1 = clock 4 + write 22 + this 5 = 31 words while armed)
 #define TRACE_HI_PIO	pio2		// bus trace, GPIO 32-47
 #define BUS_FAULT_PIO	pio2		// DAT fault sampler, needs GPIO_FAULT
 #define INT_PINS_PIO	pio2		// !NMI/!FIRQ/!IRQ driver, GPIO 24-26 (41-43 on version 3)
@@ -587,10 +590,9 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 // E cycle and two DMA channels write straight into MC6809's buffers, so the
 // CPU does no per-cycle work at all.  The low half needs a GPIO-base-0 PIO
 // (it must see E on GPIO 0 and the whole bus) and the high half needs the
-// base-16 one, so they hand off with the RP2350 cross-block IRQ.  PREV/NEXT
-// wrap across the three blocks, so pio0's "prev" is pio2 — which matters,
-// because pio0 is the only base-0 block with room.  (pio1 was full to the word
-// until rti_detect's 13 were reclaimed; bus_write leaves 13 free there now.)
+// base-16 one, so they hand off with the RP2350 cross-block IRQ: the low half
+// lives on pio1, whose "next" is pio2.  Neither is resident while idle - see
+// trace_hw_acquire() - because pio1 has only 6 words spare without it.
 // PIO IRQ flags, which the instruction streams in pico_thing.pio raise and
 // this file consumes.  They are named here because the two sides are edited
 // independently and a silent mismatch is expensive: a renumbering on
@@ -600,13 +602,14 @@ static volatile uint32_t core1_isr_count = 0u;	// incremented in GPIO ISR
 //
 // Flags are per block.  pio1 and pio2 each have their own set of eight.
 //
-//   pio2 flag 0  mc6809_clock's "irq prev set 0", once per E cycle at Q-fall
-//                (prev from pio0 wraps to pio2), consumed by bus_fault's wait
-//   pio2 flag 1  mc6809_clock's "irq prev set 1", once per E cycle at E-fall,
+//   pio2 flag 0  mc6809_clock's "irq next set 0", once per E cycle at Q-fall
+//                (next from pio1 is pio2), consumed by bus_fault's wait
+//   pio2 flag 1  mc6809_clock's "irq next set 1", once per E cycle at E-fall,
 //                CONSUMED BY NOTHING since the BUSY/LIC/AVMA mirror was
 //                removed, so it simply stays set.  One waiter only if it is
 //                ever used again: a satisfied wait clears the flag
-//   pio2 flag 2  bus_capture_lo -> bus_capture_hi handshake, SM to SM
+//   pio2 flag 2  bus_capture_lo -> bus_capture_hi handshake, "irq next set 2"
+//                from pio1
 //   pio2 flag 3  bus_fault, the DAT fault signal to the CPU
 
 // Raised in pio0 by the read program when the guest reads $FFC0-$FFCF, which
@@ -906,24 +909,17 @@ trace_hw_freeze()
 
 // How many Q-risings to wait before raising NMIBlock after a fault.
 //
-// The GAL generates the fault NMI as a registered output clocked by Q:
-//
-//	NMI.D = MMU_dat & Last_Block & !NMIBlock;
-//
-// so raising the mask in the same handler pass that first sees the fault
-// removes the NMI's D term before the 6809 has had a full E cycle to sample
-// it, and the interrupt the fault was supposed to raise never arrives.  The
-// mask still has to go up - a guest dying of a bad pointer would otherwise
-// NMI-storm - but not until the NMI it is masking has been seen.
-//
-// The window has to outlast the instruction that faulted, not just one E
-// cycle.  The 6809 samples !NMI on Q-falling of the cycle before LIC and only
-// acts on it at an instruction boundary, so a mask that goes up two cycles
-// after the fault can still be up before the boundary arrives - and the
-// longest instructions run to about twenty cycles.  The default clears that
-// with room to spare.  Set from CMake with
-// -DPICO_THING_DAT_FAULT_BLOCK_DELAY=<cycles>; a wider window is also what
-// makes the fault NMI visible on a scope.
+// The delay was needed while the GAL generated the fault NMI as a registered
+// output, NMI.D = MMU_dat & Last_Block & !NMIBlock: raising the mask in the
+// same pass that saw the fault removed the D term before the 6809 had sampled
+// it.  U208 has since gone combinational (Fault = MMU_dat & Last_Block, NMI
+// held at 0, Q201 removed), and the Pico raises the NMI itself through
+// pending_interrupts, whose hold does not look at NMIBlock.  NMIBlock now
+// only stops the sampler below from latching a later fault, and the countdown
+// does that too while it runs, so the delay no longer has a hardware reason.
+// It is kept because it costs nothing, and a wider window still makes the
+// fault visible on a scope.  Set from CMake with
+// -DPICO_THING_DAT_FAULT_BLOCK_DELAY=<cycles>.
 #ifndef PICO_THING_DAT_FAULT_BLOCK_DELAY
 #define PICO_THING_DAT_FAULT_BLOCK_DELAY 32u
 #endif
@@ -1266,8 +1262,9 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 			// environment every NitrOS-9 handler runs in, so the risk
 			// is in the guest rather than here, and this is the only
 			// arrangement proven to boot an OS.  Asked and answered:
-			// leave it.  See also apply_rti(), where the matching
-			// decision not to restore the task lives.
+			// leave it.  Nothing restores the task afterwards either:
+			// the automatic restore after RTI went with the RTI
+			// detector on 2026-10-06 (see the note in mc6809.cpp).
 			//
 			// A DAT fault vectors through NMI, and its handler has to
 			// reach the DAT RAM to reclaim the dead process's pages —
@@ -1301,8 +1298,8 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 			break;
 		}
 	}
-	// Deferred NMIBlock assertion after a DAT fault, giving the NMI the
-	// GAL raised time to be seen before its D term is taken away.
+	// Deferred NMIBlock assertion after a DAT fault; see the note by
+	// DAT_FAULT_BLOCK_DELAY.
 	if (dat_fault_block_countdown > 0u && --dat_fault_block_countdown == 0u) {
 		gpio_put(GPIO_NMI_BLOCK, true);
 		reg[SYSTEM_DAT_FAULT] |= DAT_FAULT_NMI_BLOCK;
@@ -1458,7 +1455,7 @@ __time_critical_func(gpio_q_irq_handler())
 	// Q-RISING ONLY.  The falling edge used to be enabled as well, purely to
 	// poll GPIO_FAULT once per cycle - a million entries a second to read one
 	// pin.  The bus_fault state machine on pio2 does that sampling now,
-	// clocked by the clock program's "irq prev set 0" at the same Q-falling
+	// clocked by the clock program's "irq next set 0" at the same Q-falling
 	// phase, and raises an interrupt only when a fault is actually there.
 	//
 	// The event mask is still read and tested rather than assumed: this is a
@@ -1624,11 +1621,11 @@ __time_critical_func(gpio_q_irq_handler())
 // re-enters for ever.
 //
 // Deliberately NOT a re-test of the FAULT pin.  The sampler established the
-// fault at Q-falling, the point where the GAL's registered output and the live
-// bus pins both describe the same cycle; by the time this runs the pin may
+// fault at Q-falling, the point where the GAL's fault line has settled and the
+// live bus pins both describe the same cycle; by the time this runs the pin may
 // have gone low again, and a re-test would throw a real fault away.
 //
-// The task and page come from the sampler's own `in pins 16`, so they are the
+// The task and page come from the sampler's own `in pins 32`, so they are the
 // values at the fault rather than whatever the bus has moved on to.  R/!W
 // cannot: it is GPIO 2, outside pio2's base-16 window, so the direction bit is
 // read live here.  The record therefore has mixed provenance - page and task
@@ -1699,20 +1696,15 @@ __time_critical_func(pio_bus_fault_irq_handler())
 	// Tell the BUS_IRQ case that the NMI now on its way is a fault, so it
 	// can drop the guest into task 0 for the handler.
 	dat_fault_nmi_pending = true;
-	// And ask for that NMI rather than relying on the GAL's.
+	// And ask for that NMI.  The GAL no longer raises one (U208's NMI is
+	// held at 0): a registered NMI.D lasted only as long as the faulting
+	// access was on the bus, which put the whole pulse inside the faulting
+	// instruction's last cycle, and the 6809 samples !NMI on Q-falling of the
+	// cycle BEFORE the last one.
 	//
-	// The GAL raises one - NMI.D = MMU_dat & Last_Block & !NMIBlock - but it
-	// lasts only as long as the faulting access is on the bus, because the D
-	// term goes false the moment the access ends.  That puts the whole pulse
-	// inside the faulting instruction's own last cycle, and the 6809 samples
-	// !NMI on Q-falling of the cycle BEFORE the last one, so it arrives a
-	// cycle too late for the boundary it caused and is gone before the next.
-	//
-	// Going through pending_interrupts asserts from the next Q-rising and
-	// holds the pin from the Q-rising handler, which is the path the
-	// watchpoint and the irq tests already use.  This handler runs at the
-	// same priority as that one and on the same core, so neither can preempt
-	// the other part-way through this read-modify-write.
+	// interrupt_pins_update() takes the request on Core 1's next pass and
+	// holds !NMI for NMI_HOLD_PASSES, the path the watchpoint and the irq
+	// tests already use.
 	dat_fault_nmi_request = true;
 	loop_nmi_work = 1u;
 	// Nothing else writes bits 2-6.  The NMIBlock bit is not set here: it
@@ -7932,14 +7924,12 @@ bus_pio_dma_init()
 	printf("Core0 interrupt pin driver pio%u sm%d configured\n",
 	       PIO_NUM(int_pins.pio), int_pins.sm);
 
-	// SM pair: bus trace capture.  pio0 -> pio2 via "irq prev", which wraps
-	// across the three blocks.  pio1 would be the tidier neighbour but has
-	// no instruction memory left.
+	// SM pair: bus trace capture.  pio1 -> pio2 via "irq next set 2".
 	//
 	// NOTHING IS CLAIMED HERE ANY MORE - see trace_hw_acquire().  The programs
 	// and state machines are taken when a capture is armed and given back when
-	// it stops, so an idle board leaves 2 state machines and 7 instruction
-	// words free.  Only the two DMA channels are permanent, because they are
+	// it stops, so an idle board leaves a state machine and 5 instruction
+	// words free on pio1, and a state machine and 2 words on pio2.  Only the two DMA channels are permanent, because they are
 	// not the scarce resource and because the sample count lives in one of
 	// them.
 	//
@@ -7948,9 +7938,9 @@ bus_pio_dma_init()
 	// when someone asks for a capture.  A diagnostic that cannot arm is an
 	// inconvenience; a DAT fault sampler that cannot start is not.
 	// DAT fault sampler, on pio2 beside the trace's high half.  The SM is
-	// claimed rather than chosen: pio2 already runs task_output on sm0 and
-	// bus_capture_hi on sm1, and initialising one of those by hand would
-	// silently restart it with this program's configuration.
+	// claimed rather than chosen: pio2 already runs task_output and int_pins,
+	// and initialising one of those by hand would silently restart it with
+	// this program's configuration.
 	bus_fault.offset = pio_add_program(bus_fault.pio, &bus_fault_program);
 	if (bus_fault.offset < 0) {
 		printf("Core0 insufficient space for bus_fault program\n");
@@ -8019,9 +8009,9 @@ pio_shutdown()
 	irq_set_enabled(bus_fault.irq, false);
 	irq_remove_handler(bus_fault.irq, pio_bus_fault_irq_handler);
 
-	// --- Bus trace pair (pio0 low half + pio2 high half) ---
+	// --- Bus trace pair (pio1 low half + pio2 high half) ---
 	// Everything the trace takes has to go back, or a second power-on cannot
-	// rebuild it: pio0 holds clock(4) + read(21) + bus_capture_lo(5) = 30 of
+	// rebuild it: pio1 holds clock(4) + write(22) + bus_capture_lo(5) = 31 of
 	// its 32 words, so leaving the capture program resident leaves no room to
 	// add it again, and pio_add_program returns -1.  The state machines and
 	// the two fixed DMA channels leak the same way behind it.

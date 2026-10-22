@@ -71,12 +71,13 @@
 ; state machine, or discard that first sample.
 ;
 ; THE PHASE IS THE POINT.  That instruction is the one that drops Q while E is
-; still high, and Q-falling is where the DAT fault signal must be sampled: the
-; Fault line is a registered output of the DAT GAL clocked on Q-RISING, so
-; sampling at Q-rising would read it at the instant it changes, while the 6809
-; guarantees A0-A15, R/!W, BA and BS are stable from before Q rises until about
-; 20 ns after E falls.  Q-falling therefore sits in the middle of a window
-; where the registered signal and the live bus pins are both settled and both
+; still high, and Q-falling is where the DAT fault signal must be sampled.  The
+; Fault line is combinational in U208 since 2026-10-11 (it was registered on
+; Q-rising, which sampled the DAT RAM before its page was valid), so it needs
+; the DAT lookup to have settled - which at 2.5 MHz and above it has not by
+; Q-rising - while the 6809 guarantees A0-A15, R/!W, BA and BS are stable from
+; before Q rises until about 20 ns after E falls.  Q-falling therefore sits
+; where the fault line and the live bus pins are both settled and both
 ; describe the same cycle.
 ;
 ; THIS PROGRAM LIVES ON pio1, AND THE DIRECTION OF THOSE TICKS DEPENDS ON IT.
@@ -85,7 +86,7 @@
 ; where the same tick was reached with "irq PREV set" (prev from pio0 is also
 ; pio2).  It moved to free 4 of pio0's 32 words for the address filter that the
 ; per-cycle redesign needs: pio0 is the only base-0 block with room for the
-; read program, and clock + read + capture_lo had it at 30 of 32.
+; read program, which has since grown to 30 of its 32 words.
 ;
 ; So if this program is moved again, the ticks land in a different block WITHOUT
 ; A WORD OF WARNING - nothing fails to assemble, the sampler simply never runs.
@@ -432,10 +433,10 @@ task_output_program_deinit(PIO pio, uint sm)
 ; past it.  .wrap_target sits after the trigger, so it is consumed once and
 ; capture then free-runs until the DMA transfer count runs out.
 ;
-; Each sample also pokes IRQ 0 in the PREVIOUS PIO block, where the high half
-; is waiting.  PREV/NEXT wrap across the three blocks, so from pio0 that is
-; pio2 — which is what lets the low half live on pio0, the only base-0 block
-; with instruction memory to spare.  It also keeps the two halves in lockstep:
+; Each sample also sets flag 2 in the NEXT PIO block, where the high half is
+; waiting: this program lives on pio1, and next from pio1 is pio2.  (It was on
+; pio0, with "irq prev", until 2026-10-11, when the read program's AVMA gate
+; needed the room.)  The handshake also keeps the two halves in lockstep:
 ; every high sample is caused by a low one, so the arrays cannot drift apart.
 .program bus_capture_lo
 trigger:
@@ -608,7 +609,7 @@ int_pins_program_deinit(PIO pio, uint sm, uint pin_base)
 .program bus_fault
 .wrap_target
 next_cycle:
-	wait	1 irq 0			; set by the low half; satisfied wait clears it
+	wait	1 irq 0			; set by the clock at Q falling; satisfied wait clears it
 	jmp	pin got_fault		; An unallocated RAM block has been addressed
 	jmp	next_cycle		; All is well
 got_fault:
