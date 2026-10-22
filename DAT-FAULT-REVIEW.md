@@ -1,8 +1,35 @@
 # DAT fault mechanism — firmware vs. hardware design review
 
 Review of the firmware DAT fault implementation in this repo against the
-hardware design in `../pico-thing` (v2, in progress) and `../pico-thing-1.0`
-(the fabricated v1.0 board).
+hardware design in `../pico-thing` (v2) and `../pico-thing-1.0` (v1.0).
+When it was written v2 was still on paper; it has since been built, with the
+v1 kluge board's RAM decode incorporated as the final design, and v2 is the
+board now in use.
+
+## Since this review (updated 2026-10-22)
+
+The findings below are kept as written, with dated notes where the design has
+moved on.  In short:
+
+- **U208's Fault is combinational and the GAL no longer raises NMI**
+  (2026-10-11).  The registered `Fault.D`, clocked on Q rising, sampled the
+  DAT RAM's page output before it was valid: at 2.5 MHz and above a DAT RAM
+  that had been deselected read as page `$FF`, so it faulted spuriously.  U208
+  now has `Fault = MMU_dat & Last_Block;` and `NMI = 'b'0;`, and Q201 (the
+  PN2222A that pulled `~NMI` for the GAL) is removed.
+- **The Pico raises the fault NMI itself**, through `pending_interrupts`, and
+  NMIBlock is now enforced only by the Pico; no GAL equation reads it.
+- **The fault is sampled by a PIO state machine** (`bus_fault`, on pio2) at Q
+  falling.  Its one `in pins` takes FAULT, the task pins and A13-A15 in the
+  same instant, which is L1's option 2 done in the Pico rather than the GAL.
+- **The bus trace records GPIO 32-47** alongside GPIO 0-31, so Fault, NMIBlock,
+  the task pins and A13-A15 are all visible in it.
+- **The automatic task restore is gone.**  It was driven by the RTI opcode
+  detector, removed on 2026-10-06; nothing restores the task after a fault
+  NMI, so L6 no longer applies.
+- **v2's FAULT and A13-A15 (GPIO 41, 43-45) are on the RP2350B's ADC pins,
+  which are not 5 V tolerant.**  Clamped on the v2 board on 2026-10-19; v3
+  moves them to GPIO 23-26.
 
 Sources compared:
 
@@ -32,21 +59,15 @@ Design limitations:
 - [x] **L2** — ~~Task 0 has no memory protection, and `$FFCC` bit 0 is described wrongly for that case~~ — **fixed**
 - [x] **L3** — ~~No lost-fault indicator; a second fault silently overwrites the first~~ — **fixed, first-fault-wins**
 - [x] **L4** — ~~The page field can only ever hold 0-6; block 7 cannot fault~~ — **documented, and repurposed as a check on L1**
-- [ ] **L5** — NMIBlock write-to-effect latency is asserted but unmeasured — *blocked on hardware*
-- [ ] **L6** — The automatic task restore assumes every interrupt resumes what it interrupted; a fault never does
+- [x] **L5** — ~~NMIBlock write-to-effect latency is asserted but unmeasured~~ — **no longer a GAL path**; what is left is Pico-internal
+- [x] **L6** — ~~The automatic task restore assumes every interrupt resumes what it interrupted~~ — **moot, the restore was removed**
 
-L5 and the hardware half of L1 (does the DAT lookup settle before Q rises?) are
-bench measurements on the same signal path, and both need the kluge board
-before anything can be measured. Neither is a firmware edit.
+The hardware half of L1 (does the DAT lookup settle before Q rises?) has been
+answered on the v2 board: **it does not**, at 2.5 MHz and above.  That was the
+spurious-fault race described at the top, fixed in U208 on 2026-10-11.
 
-L6 is not blocked on hardware — it is a design question about how the fault
-handler exits, and can be settled whenever the kernel side is written.
-
-A useful piece of preparation, should it be wanted before the board exists:
-`trace_capture()` takes `gpio_get_all()`, which is GPIO 0-31 only, so `Fault`,
-`NMIBlock` and A13-A15 are all invisible to the bus trace on both board
-revisions. Widening the trace to carry the high word as well would make both
-measurements possible in firmware rather than only on a scope.
+The trace has been widened as this section once suggested: each row now carries
+GPIO 32-47 as well as GPIO 0-31.
 
 ## What already matches
 
@@ -57,14 +78,17 @@ No action needed on these; recorded so they are not re-litigated.
   what the firmware assumes.
 - A13/A14/A15 land on GPIO 43/44/45 ascending on the v2 board, so the `A_HI`
   bitfield reads directly as the page number with A15 as its most significant
-  bit. No reversal needed.
+  bit. No reversal needed.  (Those pins are the ones that are not 5 V
+  tolerant; see the top of this file.)
 - The DAT index the doc derives for its worked example, `(25 << 3) | 4 = $CC`,
   is exactly what `SYSTEM_DAT_FAULT_LOC` produces.
-- The GAL raises NMI itself (`NMI.D` on U208), so the firmware is correct to
-  latch only and never assert NMI for a fault.
+- ~~The GAL raises NMI itself (`NMI.D` on U208), so the firmware is correct to
+  latch only and never assert NMI for a fault.~~ **Superseded 2026-10-11:**
+  U208's NMI output is `'b'0` and the Pico asserts the fault NMI.
 - `ASSERT_NMI` / `DEASSERT_NMI` toggle pin direction rather than driving a
-  level (`include/mc6809.h:34`), which wired-ORs correctly with the PN2222A
-  that pulls `~NMI` low from the GAL side. No contention.
+  level (`include/mc6809.h:34`), so `~NMI` stays open-drain.  The PN2222A it
+  once wire-ORed with (Q201) has been removed, so the Pico is now the only
+  driver.
 - The v2 board pin map matches the firmware's version 2 map exactly, apart
   from D2 below.
 
@@ -182,7 +206,16 @@ and the NMIBlock masking bit.
 
 ### L1 — FIXED
 
-**Resolution:** the sampler moved from the Q-rising branch to the Q-falling
+**Update 2026-10-22:** the sampler is now the `bus_fault` PIO state machine on
+pio2, not an ISR branch.  It waits for Q falling and takes FAULT, the task pins
+and A13-A15 in one `in pins`, so the whole record comes from one instant; the
+ISR (`pio_bus_fault_irq_handler`) only unpacks it.  R/!W is still read live in
+the ISR, because GPIO 2 is outside pio2's pin window.  The hardware half below
+was answered on the board: the DAT lookup does **not** settle before Q rising
+at 2.5 MHz and above, and U208's Fault is now combinational (see the top of this
+file).
+
+**Resolution (original):** the sampler moved from the Q-rising branch to the Q-falling
 branch of `gpio_clock_eq_irq_handler`. Confirmed by MRVM that the 6809
 guarantees BA, BS, R/!W and A0-A15 stable from before Q rises until ~20 ns
 after E falls, so Q-falling sits mid-window: the GAL's registered outputs have
@@ -236,7 +269,13 @@ Option 2 also fixes it for any future consumer of the fault signals.
 
 ### L2 — FIXED
 
-**Resolution:** two halves.
+**Update 2026-10-22:** the GAL equations quoted below are out of date: U208 now
+has a combinational `Fault = MMU_dat & Last_Block;` and `NMI = 'b'0;`, and the
+Pico raises the fault NMI.  The task-0 switch at the NMI vector fetch still
+stands.  The sentence about `apply_rti()` does not: the automatic restore was
+removed with the RTI detector, so nothing restores the faulting task (see L6).
+
+**Resolution (original):** two halves.
 
 *Hardware (MRVM, done).* `!Root` came out of `NMI.D` in
 `MC6809_RAM_GLUE_2.PLD`, so every task including Task 0 raises an NMI on an
@@ -311,6 +350,12 @@ re-arms by writing zero to `$FFCC`.
 The NMI for the first fault is unaffected: the GAL captures `NMI.D` at
 Q-rising, before the Pico asserts NMIBlock at Q-falling of the same cycle.
 
+**Update 2026-10-22:** the paragraph above describes the registered GAL NMI,
+which no longer exists.  The Pico now raises the NMI itself as it latches the
+fault, and turns off the sampler's interrupt until the guest clears `$FFCC`.
+NMIBlock goes up `DAT_FAULT_BLOCK_DELAY` (32) Q-risings later.  First-fault-wins
+is unchanged.
+
 Consequence to watch, recorded under L2: a Task 0 fault latches and sets
 NMIBlock but raises no NMI, so nothing prompts the kernel to read the
 registers and the mechanism stays disarmed until something polls `$FFCC`.
@@ -341,8 +386,7 @@ a block 0-6 access — so if `$FFCD` ever reports page 7, the two came from
 
 That is a free, always-on consistency check on exactly the failure this review
 could not otherwise detect: the silently mislabelled location described under
-L1, whose remaining hardware half (does the DAT lookup settle before Q rises?)
-is still open. Page 7 is the observable symptom. Anything watching for it —
+L1.  (L1's hardware half has since been answered; see L1.) Page 7 is the observable symptom. Anything watching for it —
 guest-side assertion, or a DEBUG counter in the sampler surfaced through the
 status display — gives that open question a way to answer itself on real
 hardware rather than from datasheet timing.
@@ -358,7 +402,16 @@ Original finding follows.
 Harmless, but the 3-bit page field in `$FFCD` never uses its full range, and
 the register documentation implies 0-7.
 
-### L5 — NMIBlock write-to-effect latency is unmeasured
+### L5 — no longer a GAL path
+
+**Update 2026-10-22:** U208 no longer reads NMIBlock (its NMI output is
+`'b'0`), so the GAL-side latency below no longer exists.  NMIBlock is now
+enforced by the Pico: the fault ISR ignores a sample whose NMIBlock pin was
+high.  What is left is the delay from the guest's write to `$FFCC` to the
+write ISR raising the pin, all inside the Pico and measurable with the bus
+trace, which now records the NMIBlock pin.
+
+Original finding follows.
 
 The firmware sets `GPIO_NMI_BLOCK` in the write DMA ISR
 (`src/pico_thing.cpp:448`), which fires around E-fall. The GAL samples
@@ -373,7 +426,15 @@ ISR delays the write handler.
 Measure it on the scope, or move the NMIBlock pin write somewhere with a
 guaranteed deadline.
 
-### L6 — The task restore assumes every interrupt resumes what it interrupted
+### L6 — MOOT, the restore was removed
+
+**Update 2026-10-22:** the automatic task restore was driven by the RTI opcode
+detector, which was removed on 2026-10-06 to free PIO space.  Nothing restores
+the task after any interrupt now.  A fault NMI still switches the guest to
+task 0 at the vector fetch, and from there the handler owns the task register
+outright, with no countdown to race.
+
+Original finding follows.
 
 Raised by MRVM: **a fault NMI can never be resumed.** The MC6809E recognises
 NMI only at an instruction boundary and has no bus-error or abort mechanism, so
