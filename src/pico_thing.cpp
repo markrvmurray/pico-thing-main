@@ -575,11 +575,15 @@ static volatile uint32_t core1_irq_assert_count = 0u;
 #endif
 static volatile uint32_t core1_loop_count = 0u;
 
-// Task register event log (always on - the events are rare).  Every guest
-// write to SYSTEM_TASK, every guest READ of it (the value the DMA served) and
-// every firmware fault switch, in order, stamped with the Core 1 loop count.
-// 'st' prints the tail.  Built 2026-10-11 to settle whether a kernel read-back
-// of $FFC0 can return a task the kernel had already replaced.
+// Task register event log.  Every guest write to SYSTEM_TASK, every guest READ
+// of it (the value the DMA served) and every firmware fault switch, in order,
+// stamped with the Core 1 loop count.  'st' prints the tail.  Built 2026-10-11
+// to settle whether a kernel read-back of $FFC0 can return a task the kernel
+// had already replaced; the hangs behind that question turned out to be
+// electrical, so it is a diagnostic now.  The events are not rare - NitrOS-9
+// writes $FFC0 on every interrupt entry - and without DIAG task_log_add() is
+// empty, so the calls cost nothing.
+#if DIAG_ON
 struct task_event { uint32_t when; uint8_t kind; uint8_t value; uint8_t in_force; uint8_t pad; };
 static constexpr uint32_t TASK_LOG_LEN = 32u;
 static volatile task_event task_log[TASK_LOG_LEN];
@@ -595,6 +599,12 @@ task_log_add(const uint8_t kind, const uint8_t value, const uint8_t in_force)
 	e.in_force = in_force;
 	task_log_count = i + 1u;
 }
+#else
+static inline void
+task_log_add(const uint8_t, const uint8_t, const uint8_t)
+{
+}
+#endif
 #if DIAG_ON
 static volatile uint32_t core1_write_ring_count = 0u;
 static volatile uint8_t core1_last_write_loc = 0u;
@@ -4253,6 +4263,7 @@ status_print(const status_snapshot_t *s)
 		printf("   <- last was task %u -> %u!",
 		       s->task_write_odd_from, s->task_write_odd_to);
 	printf("\n");
+#if DIAG_ON
 	{
 		// Task register event log, copied without locking (diagnostic).
 		const uint32_t n = task_log_count;
@@ -4263,6 +4274,9 @@ status_print(const status_snapshot_t *s)
 			printf("    #%" PRIu32 " @%" PRIu32 " %c %02X/%02X\n", k, e.when, e.kind, e.value, e.in_force);
 		}
 	}
+#else
+	printf("  Task log: off (build with -D PICO_THING_DIAG=1)\n");
+#endif
 
 	// 3. LIC / RTI (DEBUG only)
 #ifdef DEBUG
@@ -4742,7 +4756,9 @@ statistics_clear()
 	task_write_odd_count = 0u;
 	task_write_odd_from = 0u;
 	task_write_odd_to = 0u;
+#if DIAG_ON
 	task_log_count = 0u;
+#endif
 	fast_serial.stats_clear();
 	aux_serial.stats_clear();
 #ifdef DEBUG
