@@ -354,7 +354,7 @@ message(STATUS "Pico-Thing ISR cost instrument: ${PICO_THING_ISR_COST}")
 # on paths that run every E cycle, for a signal nobody needs unless they have
 # probes on the board.
 set(PICO_THING_TRAP_TRIGGER 0 CACHE STRING
-	"1: pulse GPIO_TRACE_D for ~50 ns when the guest takes the HD6309 trap vector ($FFF0) - a scope trigger for the misread fetch ~15 E cycles earlier; costs nothing otherwise")
+	"1: pulse GPIO_TRACE_D for ~50 ns when the guest takes the HD6309 trap vector ($FFF0) - a scope trigger for the misread fetch ~15 E cycles earlier - or the SWI vector, and on the guest write that freezes an armed trace ring; costs nothing otherwise")
 message(STATUS "Pico-Thing trap trigger: ${PICO_THING_TRAP_TRIGGER}")
 set(PICO_THING_TESTPOINTS 0 CACHE STRING
 	"1 = drive the GPIO scope marker pins from the ISRs, 0 = do not")

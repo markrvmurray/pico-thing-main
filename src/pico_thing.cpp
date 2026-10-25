@@ -86,7 +86,22 @@
 // caused the trap is ~15 E cycles earlier (the 12-byte push comes first), so
 // the scope wants ~10 us of pre-trigger at 2.5 MHz.  Costs nothing on any
 // cycle that is not a trap vector fetch; off by default.
+//
+// The same pulse marks the SWI vector fetch, for RAM filled with SWI so that
+// a misread opcode traps at once, and the guest write that freezes an armed
+// trace ring, which DBGMON makes on its first character.  A single-shot
+// scope keeps whichever comes first.
 #define TRAP_TRIGGER_ON (PICO_THING_TRAP_TRIGGER != 0)
+#if TRAP_TRIGGER_ON
+static __force_inline void
+trap_trigger_pulse()
+{
+	gpio_put(GPIO_TRACE_D, true);
+	for (unsigned i = 0u; i < 16u; i++)
+		__asm volatile("nop");
+	gpio_put(GPIO_TRACE_D, false);
+}
+#endif
 #ifndef PICO_THING_TESTPOINTS
 #define PICO_THING_TESTPOINTS 0	// match CMake's default
 #endif
@@ -1188,13 +1203,10 @@ __time_critical_func(q_rising_slow_path)(const uint8_t bla, const uint8_t addres
 			if (eirq <= INTERRUPT_RESET)
 				MC6809.trace_irq_event(eirq);	// arm trace if this vector is a configured trigger
 #if TRAP_TRIGGER_ON
-			// Scope trigger on the trap vector, see PICO_THING_TRAP_TRIGGER.
-			if (eirq == INTERRUPT_ILLEGAL) {
-				gpio_put(GPIO_TRACE_D, true);
-				for (unsigned i = 0u; i < 16u; i++)
-					__asm volatile("nop");
-				gpio_put(GPIO_TRACE_D, false);
-			}
+			// Scope trigger on the trap and SWI vectors, see
+			// PICO_THING_TRAP_TRIGGER.
+			if (eirq == INTERRUPT_ILLEGAL || eirq == INTERRUPT_SWI)
+				trap_trigger_pulse();
 #endif
 			// Both the break command and the watchpoint point the NMI
 			// vector at the BREAK snippet, and the vector fetch is the
@@ -2137,8 +2149,13 @@ __time_critical_func(bus_write_followup)(const uint8_t wloc, const uint8_t wval)
 		// re-arming over the capture, because DBGMON goes on printing.
 		// Otherwise the USim TraceCtl convention: non-zero arms a
 		// one-shot bus trace, zero stops.
-		if (MC6809.trace_is_ring() && MC6809.trace_is_armed())
+		if (MC6809.trace_is_ring() && MC6809.trace_is_armed()) {
+#if TRAP_TRIGGER_ON
+			if (!MC6809.trace_ring_is_frozen())
+				trap_trigger_pulse();
+#endif
 			MC6809.trace_ring_freeze();
+		}
 		else if (wval)
 			MC6809.trace_arm();
 		else
