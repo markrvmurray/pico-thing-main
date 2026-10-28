@@ -116,6 +116,7 @@ static int      _vec_count;
 /* Time fields */
 static int _t_year, _t_month, _t_day, _t_hour, _t_minute, _t_second;
 static int _t_count;
+static uint8_t _ni_device, _ni_cpu_mode;
 %}
 
 /* -----------------------------------------------------------------------
@@ -183,6 +184,7 @@ static int _t_count;
 %token TOK_RUN0
 %token TOK_CORE1
 %token TOK_REBOOT
+%token TOK_AUTO
 
 /* Loop access types */
 %token TOK_r
@@ -968,20 +970,38 @@ srecord_cmd:
 	;
 
 /* -----------------------------------------------------------------------
- * nitros9 [ ide | drivewire (dw) ]
+ * nitros9 [ ide | drivewire (dw) ] [ auto | 6809 | 6309 ]
+ * The CPU word becomes REL's CPU-mode byte at $0136: auto (0) lets REL
+ * pick native mode on an HD6309 and 6809 mode on an MC6809; 6309 (3)
+ * forces native mode; 6809 (8) keeps an HD6309 in 6809 mode, which a
+ * 6809 image needs on the HD63C09.
  * ----------------------------------------------------------------------- */
 nitros9_cmd:
-	  TOK_NITROS9 {
-		result->tag = CMD_NITROS9;
-		result->nitros9.boot_device = 0; /* IDE default */
+	TOK_NITROS9 nitros9_device nitros9_cpu {
+		result->tag                 = CMD_NITROS9;
+		result->nitros9.boot_device = _ni_device;
+		result->nitros9.cpu_mode    = _ni_cpu_mode;
 	}
-	| TOK_NITROS9 TOK_IDE {
-		result->tag = CMD_NITROS9;
-		result->nitros9.boot_device = 0;
-	}
-	| TOK_NITROS9 TOK_DRIVEWIRE {
-		result->tag = CMD_NITROS9;
-		result->nitros9.boot_device = 1;
+	;
+
+nitros9_device:
+	  /* empty */   { _ni_device = 0; /* IDE default */ }
+	| TOK_IDE       { _ni_device = 0; }
+	| TOK_DRIVEWIRE { _ni_device = 1; }
+	;
+
+nitros9_cpu:
+	  /* empty */   { _ni_cpu_mode = 0; /* auto default */ }
+	| TOK_AUTO      { _ni_cpu_mode = 0; }
+	| TOK_NUMBER {
+		if (strcmp($1, "6809") == 0)
+			_ni_cpu_mode = 8;
+		else if (strcmp($1, "6309") == 0)
+			_ni_cpu_mode = 3;
+		else {
+			printf("Unknown CPU '%s' (expected auto, 6809 or 6309)\n", $1);
+			YYERROR;
+		}
 	}
 	;
 

@@ -4884,7 +4884,9 @@ process_command(char *buf)
 		"  usb [args]         (ub)  USB console control\n"
 		"  flow               (fl)  show both CDC ports' flow control\n"
 		"  flow <1|2> on|off        honour that port's host RTS, or ignore it\n"
-		"  nitros9 [ide|drivewire]  (ni)  boot NitrOS-9; drivewire is also dw\n"
+		"  nitros9 [ide|drivewire] [auto|6809|6309]  (ni)\n"
+		"                           boot NitrOS-9; drivewire is also dw; 6809\n"
+		"                           keeps an HD6309 in 6809 mode for a 6809 image\n"
 		"  help               (h)   this text\n"
 		"\nAn S-record pasted at the prompt is loaded directly.\n\n",
 		static_cast<double>(GUEST_CLK_MIN), static_cast<double>(GUEST_CLK_MAX),
@@ -6813,8 +6815,13 @@ status_done:
 		uint8_t bdev = cmd.nitros9.boot_device;
 		if (!copy(OUTWARDS, 1u, 0x0132u, &bdev))
 			break;
+		/* Set CPU-mode byte at $0136 (0 = auto, 3 = 6309 native, 8 = 6809) */
+		uint8_t cpu_mode = cmd.nitros9.cpu_mode;
+		if (!copy(OUTWARDS, 1u, 0x0136u, &cpu_mode))
+			break;
 		reg[REGISTER_VECTOR_RESET_OFFSET] = CHUNK_ADDRESS;
-		printf("Booting NitrOS-9 (%s)\n", bdev ? "DriveWire" : "IDE");
+		printf("Booting NitrOS-9 (%s, %s)\n", bdev ? "DriveWire" : "IDE",
+		       cpu_mode == 8u ? "6809 mode" : cpu_mode == 3u ? "6309 native" : "CPU auto");
 		MC6809.start();
 		break;
 	}

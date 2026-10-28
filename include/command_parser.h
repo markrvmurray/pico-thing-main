@@ -209,6 +209,7 @@ typedef struct parsed_cmd {
 		/* CMD_NITROS9 */
 		struct {
 			uint8_t boot_device; /* 0 = IDE, 1 = DriveWire */
+			uint8_t cpu_mode;    /* REL's $0136: 0 = auto, 3 = 6309 native, 8 = 6809 */
 		} nitros9;
 
 		/* CMD_STATUS */

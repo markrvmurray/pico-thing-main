@@ -1402,6 +1402,42 @@ TEST_CASE("Unknown or empty input produces syntax error", "[parser][error]")
 		REQUIRE(parse("ni DW", &cmd));
 		CHECK(cmd.nitros9.boot_device == 1);
 	}
+	SECTION("nitros9 CPU mode defaults to auto")
+	{
+		REQUIRE(parse("ni dw", &cmd));
+		CHECK(cmd.nitros9.cpu_mode == 0);
+	}
+	SECTION("nitros9 auto")
+	{
+		REQUIRE(parse("ni ide AUTO", &cmd));
+		CHECK(cmd.nitros9.boot_device == 0);
+		CHECK(cmd.nitros9.cpu_mode == 0);
+	}
+	SECTION("nitros9 6809 keeps an HD6309 in 6809 mode")
+	{
+		REQUIRE(parse("ni dw 6809", &cmd));
+		CHECK(cmd.nitros9.boot_device == 1);
+		CHECK(cmd.nitros9.cpu_mode == 8);
+	}
+	SECTION("nitros9 6309 forces native mode")
+	{
+		REQUIRE(parse("ni ide 6309", &cmd));
+		CHECK(cmd.nitros9.cpu_mode == 3);
+	}
+	SECTION("nitros9 CPU without a device boots IDE")
+	{
+		REQUIRE(parse("nitros9 6809", &cmd));
+		CHECK(cmd.nitros9.boot_device == 0);
+		CHECK(cmd.nitros9.cpu_mode == 8);
+	}
+	SECTION("nitros9 rejects an unknown CPU")
+	{
+		CHECK_FALSE(parse("ni dw 6800", &cmd));
+	}
+	SECTION("nitros9 rejects the CPU before the device")
+	{
+		CHECK_FALSE(parse("ni 6809 dw", &cmd));
+	}
 	SECTION("trace with length only starts at row 0")
 	{
 		REQUIRE(parse("trace 40", &cmd));

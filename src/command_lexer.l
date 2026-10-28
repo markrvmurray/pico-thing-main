@@ -154,6 +154,7 @@ match_command_keyword(const char *text)
 [Rr][Uu][Nn]0                       { return TOK_RUN0; }
 [Cc][Oo][Rr][Ee]1                   { return TOK_CORE1; }
 [Rr][Ee][Bb][Oo][Oo][Tt]            { return TOK_REBOOT; }
+[Aa][Uu][Tt][Oo]                    { return TOK_AUTO; }
 
 	/* ---- Loop types (exact, CASE-SENSITIVE per original behaviour) ---- */
 "rw"|"RW"                           { return TOK_RW; }
