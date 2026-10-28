@@ -40,3 +40,14 @@ cmake-*
 # committed by accident and then showed as modified on every run.
 __pycache__/
 *.pyc
+
+### 6809 chunks
+# What chunk/Makefile builds (its clean target removes the same set);
+# .obj, .o and .a are already ignored above.
+chunk/*.bin
+chunk/*.lst
+chunk/*.map
+chunk/*.link
+chunk/*.s19
+chunk/*.srec
+chunk/*.raw
