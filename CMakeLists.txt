@@ -23,7 +23,7 @@ endif()
 find_package(FLEX  REQUIRED)
 find_package(BISON 3.0 REQUIRED)
 
-project(pico-thing C CXX ASM)
+project(pico-thing-main C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -68,7 +68,7 @@ BISON_TARGET(CmdParser
 
 ADD_FLEX_BISON_DEPENDENCY(CmdLexer CmdParser)
 
-add_executable(pico-thing
+add_executable(${PROJECT_NAME}
 		src/pico_thing.cpp
 		src/registers.cpp
 		src/mc6809.cpp
@@ -81,13 +81,13 @@ add_executable(pico-thing
 )
 
 # Include both the project headers and generated ones
-target_include_directories(pico-thing
+target_include_directories(${PROJECT_NAME}
 	PRIVATE
 	${CMAKE_CURRENT_LIST_DIR}/include
 	${CMAKE_CURRENT_BINARY_DIR}
 )
 
-pico_generate_pio_header(pico-thing ${CMAKE_CURRENT_LIST_DIR}/src/pico_thing.pio)
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/src/pico_thing.pio)
 
 # ----- Embedded 6809 chunk blobs -----
 # Binary blobs embedded into the snippet area by extra/api.asm via INCLUDEBIN.
@@ -176,7 +176,7 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/api.inc
 )
 
 set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/api.inc PROPERTIES GENERATED TRUE)
-target_sources(pico-thing
+target_sources(${PROJECT_NAME}
 	PRIVATE
 		${CMAKE_CURRENT_BINARY_DIR}/api.inc
 		${FLEX_CmdLexer_OUTPUTS}
@@ -385,7 +385,7 @@ message(STATUS "Pico-Thing clk_adc ${PICO_THING_ADC_CLK_KHZ} kHz")
 
 # Core 1 stack is 0x800 (2 KiB) by default — too small for three nested
 # ISR levels (DMA prio-0 → GPIO prio-1 → thread) with FPU lazy stacking.
-target_compile_definitions(pico-thing PRIVATE
+target_compile_definitions(${PROJECT_NAME} PRIVATE
 	PICO_CORE1_STACK_SIZE=0x1000
 	PICO_THING_BOARD_VERSION=${PICO_THING_BOARD_VERSION}
 	PICO_THING_POWER_RAIL_MIN_VOLTS=${PICO_THING_POWER_RAIL_MIN_VOLTS}f
@@ -405,7 +405,7 @@ target_compile_definitions(pico-thing PRIVATE
 	PICO_THING_ADC_CLK_KHZ=${PICO_THING_ADC_CLK_KHZ}u
 )
 
-target_link_libraries(pico-thing
+target_link_libraries(${PROJECT_NAME}
 	pico_stdlib
 	pico_multicore
 	pico_aon_timer
@@ -420,8 +420,8 @@ target_link_libraries(pico-thing
 	tinyusb_board
 )
 
-pico_enable_stdio_usb(pico-thing 0)
-pico_enable_stdio_uart(pico-thing 1)
+pico_enable_stdio_usb(${PROJECT_NAME} 0)
+pico_enable_stdio_uart(${PROJECT_NAME} 1)
 
 # Link-time optimisation, across OUR translation units only - the SDK's static
 # libraries are built without it and link normally alongside.
@@ -444,17 +444,17 @@ pico_enable_stdio_uart(pico-thing 1)
 # survive, or the per-cycle paths start running from XIP flash and everything
 # measured here becomes meaningless:
 #
-#   llvm-objdump -t pico-thing.elf | grep _Z18gpio_q_irq_handlerv
+#   llvm-objdump -t pico-thing-main.elf | grep _Z18gpio_q_irq_handlerv
 #
 # should show it in .data, not .text.
 option(PICO_THING_LTO "Link-time optimisation across the project's own sources" OFF)
 if(PICO_THING_LTO)
 	message(STATUS "Pico-Thing LTO: ThinLTO enabled")
-	target_compile_options(pico-thing PRIVATE -flto=thin)
-	target_link_options(pico-thing PRIVATE -flto=thin)
+	target_compile_options(${PROJECT_NAME} PRIVATE -flto=thin)
+	target_link_options(${PROJECT_NAME} PRIVATE -flto=thin)
 else()
 	message(STATUS "Pico-Thing LTO: off")
 endif()
 
-pico_add_extra_outputs(pico-thing)
-pico_set_binary_type(pico-thing copy_to_ram)
+pico_add_extra_outputs(${PROJECT_NAME})
+pico_set_binary_type(${PROJECT_NAME} copy_to_ram)

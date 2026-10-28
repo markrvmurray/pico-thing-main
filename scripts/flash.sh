@@ -3,7 +3,7 @@
 # Flash (and optionally reset) the main board's RP2350 over SWD via OpenOCD.
 #
 # Usage:  scripts/flash.sh [BUILD_DIR] [ACTION]
-#   BUILD_DIR  build tree holding pico-thing.elf (default: build)
+#   BUILD_DIR  build tree holding pico-thing-main.elf (default: build)
 #   ACTION     flash      program + verify + reset, then run   (default)
 #              noreset    program + verify only; power-cycle yourself
 #              reset      no programming, just reset and run
@@ -25,7 +25,7 @@ case "${1:-}" in
 		exit 1 ;;
 esac
 ACTION="${1:-flash}"
-ELF="$BUILD_DIR/pico-thing.elf"
+ELF="$BUILD_DIR/pico-thing-main.elf"
 CFG="$PWD/pico.cfg"
 
 command -v openocd >/dev/null || { echo "error: openocd not found" >&2; exit 1; }
