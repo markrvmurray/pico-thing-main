@@ -21,7 +21,7 @@ If more than one debug probe is attached, `probe_main.cfg` pins the session to t
 serial number, then sources `pico.cfg`. It resolves that with `find`, so it needs OpenOCD's search path to include the
 project root (`-s .`); as a CLion board-config, point at `pico.cfg` directly instead.
 
-This repository contains the svd file. You can use this file to see the current value of registers:
+The Pico SDK's `src/rp2350/hardware_regs/RP2350.svd` lets the debugger's Peripherals view show the registers:
 ![svd](docs/svd.png)
 
 
