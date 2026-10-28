@@ -6,7 +6,7 @@ firmware cannot answer about itself: every ADC reading is a ratio against the
 reference, so a bad reference makes the board's own numbers wrong in exactly
 the way that hides the fault.  An outside meter has no such problem.
 
-    P=/Users/markmurray/Documents/PICO/venv/bin/python
+    P=/Users/markmurray/GitHub/PICO/venv/bin/python
     $P scripts/dmm.py --scan                       which meter is on which port
     $P scripts/dmm.py --meter MY51050035:PIN53 \
                       --meter MY49410013:TP110 --duration 30

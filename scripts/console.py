@@ -6,7 +6,7 @@ a serial console into another machine entirely - and not the video board's
 probe either.  The port is found by the probe's adapter serial, because the
 device node moves when things are replugged.
 
-    P=/Users/markmurray/Documents/PICO/venv/bin/python
+    P=/Users/markmurray/GitHub/PICO/venv/bin/python
     $P scripts/console.py --listen 5            read only, writes nothing
     $P scripts/console.py --ping                one CR, identify the device
     $P scripts/console.py st flow               identify, then run commands
@@ -16,7 +16,7 @@ Needs the bench venv for pyserial.  Invoke it with that absolute interpreter
 path and no "cd ... &&" prefix, so it matches a narrow Claude Code permission
 rule of the form:
 
-    "Bash(/Users/markmurray/Documents/PICO/venv/bin/python scripts/console.py:*)"
+    "Bash(/Users/markmurray/GitHub/PICO/venv/bin/python scripts/console.py:*)"
 
 Safety: the ONLY byte sent before the device is identified is a single CR, and
 if the reply carries no Pico-Thing signature nothing further is sent.  That

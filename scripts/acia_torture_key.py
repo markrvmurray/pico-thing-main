@@ -7,7 +7,7 @@ load the S-records, open the guest's port, start the suite, press the key test
 PASSED", so it serves as a regression gate after any change to the ACIA, the
 bus service path or the interrupt plumbing.
 
-    P=/Users/markmurray/Documents/PICO/venv/bin/python
+    P=/Users/markmurray/GitHub/PICO/venv/bin/python
     $P scripts/acia_torture_key.py                  the whole recipe
     $P scripts/acia_torture_key.py --watch-only     drive the console yourself
     $P scripts/acia_torture_key.py --power          power the guest on first

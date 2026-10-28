@@ -9,9 +9,9 @@ against a fake port, not the real tud_cdc_n_* wrappers.
 
 Run it with the bench venv, which has pyserial:
 
-    ~/Documents/PICO/venv/bin/python scripts/flowtest.py --list
-    ~/Documents/PICO/venv/bin/python scripts/flowtest.py --port /dev/cu.usbmodem68091 rts
-    ~/Documents/PICO/venv/bin/python scripts/flowtest.py --port /dev/cu.usbmodem68091 plain
+    ~/GitHub/PICO/venv/bin/python scripts/flowtest.py --list
+    ~/GitHub/PICO/venv/bin/python scripts/flowtest.py --port /dev/cu.usbmodem68091 rts
+    ~/GitHub/PICO/venv/bin/python scripts/flowtest.py --port /dev/cu.usbmodem68091 plain
 
 The node name identifies the port without guessing: macOS builds it as
 usbmodem<iSerialNumber><bInterfaceNumber>, the serial number is "6809", and the
@@ -28,7 +28,7 @@ try:
     import serial
     import serial.tools.list_ports as list_ports
 except ImportError:
-    sys.exit("pyserial not found - run with ~/Documents/PICO/venv/bin/python")
+    sys.exit("pyserial not found - run with ~/GitHub/PICO/venv/bin/python")
 
 VID, PID = 0xCAFE, 0x4001
 TOTAL = 8192			# must match FT_TOTAL in chunk/flowtest.asm
