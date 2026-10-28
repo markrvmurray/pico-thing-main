@@ -17,9 +17,9 @@ picoprobe guide you can start debugging but, first you need to create an openocd
 OpenOCD plugin, only accepts one single file. This means we can't add separate files for `board` and `interface` like what you see in the pico documentation.
 The solution to this is to create a custom file and then source all required files. `pico.cfg` serves as our config.
 
-If more than one debug probe is attached, `probe_main.cfg` pins the session to the probe wired to the main Pico by
-serial number, then sources `pico.cfg`. It resolves that with `find`, so it needs OpenOCD's search path to include the
-project root (`-s .`); as a CLion board-config, point at `pico.cfg` directly instead.
+`pico.cfg` is pinned by adapter serial to the probe wired to the main Pico, so with the video board's probe also
+attached it can never pick that one. It is self-contained, so use it as CLion's board config, with
+`scripts/flash.sh`, or as `openocd -f pico.cfg` from anywhere. It is the only OpenOCD config in this repo.
 
 The Pico SDK's `src/rp2350/hardware_regs/RP2350.svd` lets the debugger's Peripherals view show the registers:
 ![svd](docs/svd.png)

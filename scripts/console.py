@@ -39,7 +39,7 @@ from serial.tools import list_ports
 # was the VIDEO board's probe, where it had been the main board's earlier the
 # same day.  Talking to the wrong one is not harmless - the video board has its
 # own session - so the port is found by matching the adapter serial, which does
-# not move.  probe_main.cfg pins flashing by the same serial.
+# not move.  pico.cfg pins flashing by the same serial.
 MAIN_PROBE_SERIAL = "E6647C7403512C2E"	# main board; prompt ">>> "
 VIDEO_PROBE_SERIAL = "E6633861A3266938"	# video board; prompt "==> " - NOT this one
 
