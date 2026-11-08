@@ -144,7 +144,7 @@ extern void            cmd_yy_reset_str_pool(void);
 // The owner has had 360 MHz reliable and 400 MHz with unreliable starts on a
 // different RP2350B module.
 #ifndef SYS_CLK_DEFAULT
-#define SYS_CLK_DEFAULT 320000000
+#define SYS_CLK_DEFAULT 360000000	// match CMake's default
 #endif
 
 // The ADC clock, in kHz.  48000 is what the SDK sets and what everything here
