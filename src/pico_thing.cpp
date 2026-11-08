@@ -460,13 +460,13 @@ static volatile uint32_t nmi_work_missed = 0u;	// the same for loop_nmi_work
 static uint32_t nmi_work_miss_run = 0u;
 #endif
 
-// Single-stepping (TODO 1b).  Both halves of a step MUST happen in the same
-// Q-rising pass: clearing the BREAK snippet's spin byte so the guest falls
-// through to its RTI, and arming the countdown that will bring it straight
-// back.  Driven from Core 0 instead, the two writes are about a millisecond
-// apart - a thousand E cycles, some hundreds of instructions of a tight loop -
-// and what comes back is not a step at all.  Hence the request flag: Core 0
-// asks, the handler does it atomically.
+// Single-stepping.  Both halves of a step MUST happen in the same Q-rising
+// pass: clearing the BREAK snippet's spin byte so the guest falls through
+// to its RTI, and arming the countdown that will bring it straight back.
+// Driven from Core 0 instead, the two writes are about a millisecond apart -
+// a thousand E cycles, some hundreds of instructions of a tight loop - and
+// what comes back is not a step at all.  Hence the request flag: Core 0 asks,
+// the handler does it atomically.
 static volatile uint8_t step_arm_cycles = 0u;	// non-zero: release and arm now
 static volatile bool step_active = false;	// restore the spin on NMI entry
 
@@ -5809,11 +5809,11 @@ status_done:
 			MC6809.trace_stop();
 			break;
 		} else if (hexnum == 9) {
-			// Single step (TODO 1b), composed from parts that already
-			// work: the countdown NMI re-enabled in f1b36b7, the BREAK
-			// snippet's copy of the stacked frame, break_vector_fetched
-			// for "the NMI was taken", and break_frame_settled() for
-			// "the copy has finished".
+			// Single step, composed from parts that already work: the
+			// countdown NMI re-enabled in f1b36b7, the BREAK snippet's
+			// copy of the stacked frame, break_vector_fetched for "the
+			// NMI was taken", and break_frame_settled() for "the copy
+			// has finished".
 			//
 			// The target is a FOUR-instruction loop of three different
 			// lengths, and the stepping is judged by whether each stacked
@@ -7580,7 +7580,7 @@ __no_inline_not_in_flash_func(main_core1)()
 				break;
 
 			case SYSTEM_SUBREQUEST:
-				// TODO: MarkM - implement finer-grained sysreqs
+				// Nothing to do: the request handler reads it (REQUEST_FLOAT)
 				break;
 
 			case SYSTEM_WATCHPOINT:
