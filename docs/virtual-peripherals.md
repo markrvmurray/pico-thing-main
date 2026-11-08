@@ -2,7 +2,7 @@
 
 ## 1. System Context
 
-The Pico2 (RP2350) runs at 320 MHz and emulates peripheral devices for an external MC6809E CPU. The 6809 accesses peripherals through a 64-byte register window at guest addresses `$FFC0–$FFFF`. The Pico maps these to two 64-byte arrays: `read_registers[]` (what the 6809 reads) and `write_registers[]` (what the 6809 writes). Reads and writes to the same guest address can go to different host-side buffers.
+The Pico2 (RP2350) runs at 360 MHz by default (`PICO_THING_SYS_CLK_HZ`) and emulates peripheral devices for an external MC6809E CPU. The 6809 accesses peripherals through a 64-byte register window at guest addresses `$FFC0–$FFFF`. The Pico maps these to two 64-byte arrays: `read_registers[]` (what the 6809 reads) and `write_registers[]` (what the 6809 writes). Reads and writes to the same guest address can go to different host-side buffers.
 
 All register offsets below are relative to `$FFC0` (the base of the 64-byte window). Guest address = `$FFC0 + offset`.
 
@@ -56,20 +56,20 @@ Two instances exist: `fast_serial` (console) and `aux_serial` (auxiliary). Regis
 
 | Instance | Offset | Guest Addr | Read | Write |
 |----------|--------|-----------|------|-------|
-| Console  | `0x03` | `$FFC3` | Status Register | Control Register |
-| Console  | `0x04` | `$FFC4` | RX Data Register | TX Data Register |
-| Auxiliary| `0x05` | `$FFC5` | Status Register | Control Register |
-| Auxiliary| `0x06` | `$FFC6` | RX Data Register | TX Data Register |
+| Console  | `0x04` | `$FFC4` | Status Register | Control Register |
+| Console  | `0x05` | `$FFC5` | RX Data Register | TX Data Register |
+| Auxiliary| `0x06` | `$FFC6` | Status Register | Control Register |
+| Auxiliary| `0x07` | `$FFC7` | RX Data Register | TX Data Register |
 
 ### Data Structures
 
-**`mc6850_control` union** (written by 6809 to `$FFC3`):
+**`mc6850_control` union** (written by 6809 to `$FFC4`, or `$FFC6` for the auxiliary):
 - `divide_select` (bits 1:0) — `0b11` = master reset; `0b10` = ÷64 (repurposed as queue loopback mode)
 - `word_select` (bits 4:2) — word length/parity (stored but not used in emulation)
 - `tx_irq` (bits 6:5) — `0b01` = TX IRQ enabled; `0b10` = RTS deasserted; `0b11` = close loopback mode
 - `rx_irq` (bit 7) — `1` = RX IRQ enabled
 
-**`mc6850_status` union** (read by 6809 from `$FFC3`):
+**`mc6850_status` union** (read by 6809 from `$FFC4`, or `$FFC6` for the auxiliary):
 - `rdrf` (bit 0) — Receive Data Register Full
 - `tdre` (bit 1) — Transmit Data Register Empty
 - `dcd` (bit 2) — always 0
@@ -129,7 +129,7 @@ IRQ  = assert_receive_irq || assert_transmit_irq
 ### TX Data Flow (6809 → Host)
 
 ```
-6809 writes $FFC4          DMA write ISR              for(;;) loop              Core 0
+6809 writes $FFC5          DMA write ISR              for(;;) loop              Core 0
 ────────────────           ──────────────             ────────────              ──────
 STA UARTTX ──────────────→ write_received():          (drain write ring)        host_receive():
                            tx_write_pending=true       guest_transmit():         tx.get() → byte
@@ -146,7 +146,7 @@ STA UARTTX ──────────────→ write_received():      
 ```
 Core 0                    for(;;) loop                                    DMA read ISR
 ──────                    ────────────                                    ────────────
-host_transmit():          has_interrupt() [every Q-rising]:               6809 reads $FFC4:
+host_transmit():          has_interrupt() [every Q-rising]:               6809 reads $FFC5:
 rx.put(byte) ──→          if !receive_buffer_full && rx.has_bytes():       rx_read_fast_path():
                             reg[CONSOLE_RX_DATA] = rx.get()                receive_buffer_full=false
                             receive_buffer_full = true                     assert_receive_irq=false
@@ -178,7 +178,7 @@ Every state-changing method sets `irq_dirty = true`. This ensures the next `has_
 
 ### `rx_read_fast_path()` and PEND_IRQ Clearing
 
-When the 6809 reads `$FFC4` (CONSOLE_RX_DATA), the DMA read ISR calls `rx_read_fast_path()` which immediately clears `receive_buffer_full` and `assert_receive_irq`, then rebuilds the status register. It also clears `PEND_IRQ` from `pending_interrupts` so the next Q-rising ISR deasserts `/IRQ`. Without this, the 6809 would see a stale `/IRQ` assertion for one or more cycles after acknowledging the interrupt.
+When the 6809 reads `$FFC5` (CONSOLE_RX_DATA), the DMA read ISR calls `rx_read_fast_path()` which immediately clears `receive_buffer_full` and `assert_receive_irq`, then rebuilds the status register. It also clears `PEND_IRQ` from `pending_interrupts` so the next Q-rising ISR deasserts `/IRQ`. Without this, the 6809 would see a stale `/IRQ` assertion for one or more cycles after acknowledging the interrupt.
 
 ### Control Register Processing and Write Ring Ordering
 
@@ -214,7 +214,7 @@ A minimal 50 Hz tick timer using the Pico SDK's hardware timer alarm, implemente
 | `0x08` | `$FFC8` | — | Control (bit 0: IRQ enable; bits 5–1: NMI countdown) |
 | `0x09` | `$FFC9` | Status (bit 7: IRQ pending; cleared on read) | — |
 
-Two registers, down from eight. All other offsets in the `$FFC8–$FFCF` range are unused.
+Two registers, down from eight. The rest of `$FFC8–$FFCF` belongs to other devices: `$FFCA` is the vector watchpoint, `$FFCB` the bus trace control, and `$FFCC`/`$FFCD` the DAT fault and its (task, block). `$FFCE`–`$FFCF` are unused.
 
 #### Control Register Bit Layout
 
