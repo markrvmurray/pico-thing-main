@@ -375,7 +375,7 @@ mc6809_bus_write_program_deinit(PIO pio, uint sm)
 ; Atomic TASK pin driver. Pulls a 6-bit word from TX FIFO and outputs it to
 ; the six consecutive pins at TASK_OUTPUT_BASE (TASK[4:0] + TASK0), which is
 ; 40-45 on a version 1 board, 32-37 on version 2 and 31-36 on version 3.
-; Runs at full system clock (320 MHz, no divider).
+; Runs at full system clock (clk_sys, no divider).
 ; Bit layout: task_output_word() - [5]=TASK0 (active-high when task==0),
 ; [4:0]=task number; on version 3, where TASK0 is the bottom pin,
 ; [5:1]=task number, [0]=TASK0.

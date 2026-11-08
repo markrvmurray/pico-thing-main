@@ -271,12 +271,12 @@ set(PICO_THING_CONSOLE_BAUD 115200 CACHE STRING
 message(STATUS "Pico-Thing UART console ${PICO_THING_CONSOLE_BAUD} baud")
 
 # How fast the Pico itself runs, which is what caps the guest's E clock: the
-# per-cycle work measured ~226 clk_sys cycles per E cycle, so the ceiling is
-# this number divided by that - about 1.4 MHz at 320 MHz.  The regulator is
-# already at VREG_VOLTAGE_1_30 before the clock is raised, and the raise is
-# attempted with panic=false so an unachievable target falls back instead of
-# hanging.  NOT adjusted here: the QMI divider for XIP flash, so a high enough
-# clk_sys puts the flash clock out of spec.
+# ceiling is this number divided by the clk_sys cycles the per-cycle work
+# needs per E cycle.  The regulator is already at PICO_THING_VREG (below)
+# before the clock is raised, and the raise is attempted with panic=false so
+# an unachievable target falls back instead of hanging.  NOT adjusted here:
+# the QMI divider for XIP flash, so a high enough clk_sys puts the flash clock
+# out of spec.
 set(PICO_THING_SYS_CLK_HZ 360000000 CACHE STRING
 	"clk_sys in Hz; the default 360000000 pairs with VREG_VOLTAGE_1_50 (die 40-42C); 320000000 at VREG_VOLTAGE_1_30 is the conservative pair; 400000000 at VREG_VOLTAGE_2_00 works but the die climbs past 55C in minutes")
 message(STATUS "Pico-Thing clk_sys ${PICO_THING_SYS_CLK_HZ} Hz")

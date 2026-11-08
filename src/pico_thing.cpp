@@ -130,12 +130,12 @@ extern void            cmd_yy_reset_str_pool(void);
 //
 // Overridable from the build, because the ceiling on the guest's E clock is
 // now set by how many clk_sys cycles the per-cycle work needs, not by the
-// 6809: with the HD63C09E fitted the demand measured ~226 cycles per E cycle,
-// which is ~1.4 MHz at 320 MHz and scales directly with this number.
+// 6809, and that ceiling scales directly with this number.  The default comes
+// from CMake, 360 MHz; another clock is a separate build tree:
 //
-//     cmake -D PICO_THING_SYS_CLK_HZ=360000000 ...
+//     cmake -D PICO_THING_SYS_CLK_HZ=320000000 ...
 //
-// The regulator is already at VREG_VOLTAGE_1_30 before this is applied, and
+// The regulator is already at PICO_THING_VREG before this is applied, and
 // set_sys_clock_hz() is called with panic=false so an unachievable target
 // falls back rather than hanging.  What this does NOT touch is the QMI
 // divider for XIP flash, so at a high enough clk_sys the flash clock goes out
