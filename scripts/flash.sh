@@ -3,7 +3,10 @@
 # Flash (and optionally reset) the main board's RP2350 over SWD via OpenOCD.
 #
 # Usage:  scripts/flash.sh [BUILD_DIR] [ACTION]
-#   BUILD_DIR  build tree holding pico-thing-main.elf (default: build)
+#   BUILD_DIR  build tree holding pico-thing-main.elf
+#              (default: cmake-build-relwithdebinfo-atfe-23, the CLion tree
+#              that is normally flashed -- RelWithDebInfo, ATfE; build it in
+#              CLion first, this script never builds)
 #   ACTION     flash      program + verify + reset, then run   (default)
 #              noreset    program + verify only; power-cycle yourself
 #              reset      no programming, just reset and run
@@ -16,7 +19,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
 
-BUILD_DIR="${1:-build}"
+BUILD_DIR="${1:-cmake-build-relwithdebinfo-atfe-23}"
 shift || true
 case "${1:-}" in
 	main) shift ;;                # old probe argument, now implied
