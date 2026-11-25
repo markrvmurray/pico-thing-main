@@ -1,6 +1,6 @@
-# I/O mode: irq (interrupt-driven, default) or poll (polled).
-#   make IO=poll hello.srec    — build hello with polled I/O
-#   make IO=irq  dl.s19        — build dl with IRQ-driven I/O (default)
+# I/O mode: poll (polled, default) or irq (interrupt-driven).
+#   make IO=poll hello.srec    — build hello with polled I/O (default)
+#   make IO=irq  dl.s19        — build dl with IRQ-driven I/O
 IO ?= poll
 ifeq ($(IO),poll)
 IO_OBJ := io_noirq.obj
