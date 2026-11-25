@@ -1,3 +1,20 @@
+# pico-thing-main
+
+Firmware for the Pico-Thing's main RP2350 (a Pimoroni PGA2350): the bus
+supervisor for a real MC6809E / HD6309. It provides the 6809's RAM and DAT
+memory management, the dual ACIAs and the other on-board peripherals, using
+PIO state machines and DMA on the 6809's bus.
+
+Related repositories:
+
+- [pico-thing-video](https://github.com/markrvmurray/pico-thing-video): the
+  second RP2350 on the bus, for DVI video, USB keyboard and mouse, and sound.
+- [usim, branch `pico-thing`](https://github.com/markrvmurray/usim/tree/pico-thing):
+  the simulator; `usim09pt` emulates the whole Pico-Thing.
+
+The rest of this file is the CLion template this project started from, kept
+for its debugging and serial-console setup.
+
 ### CLion Raspberry Pi pico template project
 
 Project template for pico board. It uses picoprobe and openocd for debugging.
